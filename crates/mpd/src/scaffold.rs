@@ -28,8 +28,8 @@ Run `mpd status` to see the current phase and `mpd next` for the next step.\n";
 pub struct InitReport {
     /// Directories/files created.
     pub created: Vec<String>,
-    /// Whether the git hook was installed.
-    pub hook_installed: bool,
+    /// Repo-relative path where the git hook was installed, if any.
+    pub hook_path: Option<String>,
     /// A note if the hook could not be installed.
     pub hook_note: Option<String>,
 }
@@ -94,7 +94,8 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
 
     // git hook.
     match githooks::install(root) {
-        Ok(installed) => report.hook_installed = installed,
+        Ok(Some(path)) => report.hook_path = Some(display_rel(root, &path)),
+        Ok(None) => {}
         Err(e) => report.hook_note = Some(e.to_string()),
     }
     Ok(report)

@@ -68,15 +68,16 @@ pub fn is_git_repo(root: &Path) -> bool {
     git_output(root, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
 }
 
-/// Install the pre-commit hook. Returns `Ok(false)` (no-op) when `root` is not a
-/// git repo. Refuses to clobber a non-mpd hook, returning an error instead.
-pub fn install(root: &Path) -> io::Result<bool> {
+/// Install the pre-commit hook, returning the path it was written to. Returns
+/// `Ok(None)` (no-op) when `root` is not a git repo. Refuses to clobber a
+/// non-mpd hook, returning an error instead.
+pub fn install(root: &Path) -> io::Result<Option<PathBuf>> {
     if !is_git_repo(root) {
-        return Ok(false);
+        return Ok(None);
     }
     let dir = match hooks_dir(root) {
         Some(d) => d,
-        None => return Ok(false),
+        None => return Ok(None),
     };
     std::fs::create_dir_all(&dir)?;
     let hook = dir.join("pre-commit");
@@ -94,7 +95,7 @@ pub fn install(root: &Path) -> io::Result<bool> {
     }
     std::fs::write(&hook, PRE_COMMIT)?;
     make_executable(&hook)?;
-    Ok(true)
+    Ok(Some(hook))
 }
 
 /// Whether the mpd pre-commit hook is installed.

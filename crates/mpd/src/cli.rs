@@ -193,8 +193,8 @@ fn cmd_init(test: Option<String>) -> CmdResult {
             println!("  + {c}");
         }
     }
-    if report.hook_installed {
-        println!("  + .git/hooks/pre-commit (gate installed)");
+    if let Some(path) = &report.hook_path {
+        println!("  + {path} (pre-commit gate installed)");
     } else if let Some(note) = &report.hook_note {
         println!("  ! pre-commit hook: {note}");
     } else {
