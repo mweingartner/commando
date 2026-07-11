@@ -6,7 +6,41 @@
 //! change. The hook shells out to `mpd check --staged`.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Run a git command in `root`, returning trimmed stdout on success.
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Resolve the hooks directory git actually uses — honoring `core.hooksPath`
+/// and worktree/common-dir layout (so a worktree or submodule, where `.git` is
+/// a file, still resolves correctly).
+fn hooks_dir(root: &Path) -> Option<PathBuf> {
+    let resolve = |p: String| -> PathBuf {
+        let path = PathBuf::from(&p);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    };
+    if let Some(hp) = git_output(root, &["config", "--get", "core.hooksPath"]) {
+        if !hp.is_empty() {
+            return Some(resolve(hp));
+        }
+    }
+    git_output(root, &["rev-parse", "--git-path", "hooks"]).map(resolve)
+}
 
 /// The `pre-commit` hook script. `MPD_GATE_SKIP=1` bypasses one commit.
 pub const PRE_COMMIT: &str = r#"#!/bin/sh
@@ -27,9 +61,10 @@ fi
 exit 0
 "#;
 
-/// Whether `root` is a git working tree with a hooks directory.
+/// Whether `root` is inside a git working tree (worktrees and submodules
+/// included — `.git` may be a gitlink file, not a directory).
 pub fn is_git_repo(root: &Path) -> bool {
-    root.join(".git").is_dir()
+    git_output(root, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
 }
 
 /// Install the pre-commit hook. Returns `Ok(false)` (no-op) when `root` is not a
@@ -38,9 +73,12 @@ pub fn install(root: &Path) -> io::Result<bool> {
     if !is_git_repo(root) {
         return Ok(false);
     }
-    let hooks_dir = root.join(".git").join("hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
-    let hook = hooks_dir.join("pre-commit");
+    let dir = match hooks_dir(root) {
+        Some(d) => d,
+        None => return Ok(false),
+    };
+    std::fs::create_dir_all(&dir)?;
+    let hook = dir.join("pre-commit");
     if hook.exists() {
         let existing = std::fs::read_to_string(&hook).unwrap_or_default();
         if !existing.contains("mpd pre-commit gate") {
@@ -60,8 +98,9 @@ pub fn install(root: &Path) -> io::Result<bool> {
 
 /// Whether the mpd pre-commit hook is installed.
 pub fn is_installed(root: &Path) -> bool {
-    let hook = root.join(".git").join("hooks").join("pre-commit");
-    std::fs::read_to_string(hook)
+    hooks_dir(root)
+        .map(|d| d.join("pre-commit"))
+        .and_then(|h| std::fs::read_to_string(h).ok())
         .map(|s| s.contains("mpd pre-commit gate"))
         .unwrap_or(false)
 }

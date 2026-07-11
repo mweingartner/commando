@@ -419,6 +419,51 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
 }
 
 #[test]
+fn init_detects_worktree_and_installs_hook() {
+    // Regression: a git worktree's `.git` is a gitlink FILE, not a directory.
+    // mpd must still detect the repo and resolve the (shared) hooks dir.
+    let sb = Sandbox::new("wt-main");
+    run("git", &["config", "user.email", "t@example.com"], &sb.dir);
+    run("git", &["config", "user.name", "T"], &sb.dir);
+    sb.write("README.md", "hi\n");
+    run("git", &["add", "README.md"], &sb.dir);
+    run("git", &["commit", "-q", "-m", "init"], &sb.dir);
+
+    let wt = sb.dir.join("wt");
+    run(
+        "git",
+        &["worktree", "add", "--detach", wt.to_str().unwrap(), "HEAD"],
+        &sb.dir,
+    );
+    assert!(
+        wt.join(".git").is_file(),
+        "a worktree's .git is expected to be a gitlink file"
+    );
+
+    let init = Command::new(env!("CARGO_BIN_EXE_mpd"))
+        .args(["init"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "init failed in worktree");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_mpd"))
+        .args(["doctor", "--json"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(
+        v["git_repo"], true,
+        "worktree must be detected as a git repo"
+    );
+    assert_eq!(
+        v["pre_commit_hook"], true,
+        "hook must install via the git-resolved hooks dir"
+    );
+}
+
+#[test]
 fn change_flag_rejects_path_traversal() {
     let sb = Sandbox::new("cli-traversal");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
