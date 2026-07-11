@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# The gate ledger (.mpd/state/) and config (.mpd/config.json) are intentionally
+# tracked — they are the durable gate record. But the current-change pointer is
+# per-developer transient state, so it is ignored (and, being untracked, cannot
+# be used as a shared path-traversal vector).
+.mpd/current
+.mpd/tmp/
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Secrets (defense in depth; mpd also blocks these at commit)
+.env
+*.p8
+*.pem

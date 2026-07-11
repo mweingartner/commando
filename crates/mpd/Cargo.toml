@@ -1,0 +1,23 @@
+[package]
+name = "mpd"
+description = "Model-Paired Development: an adversarial-gate overlay over the OpenSpec format."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mpd"
+path = "src/main.rs"
+
+[dependencies]
+openspec-core = { path = "../openspec-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
