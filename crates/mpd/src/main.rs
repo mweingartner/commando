@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod allowlist;
 mod checks;
 mod cli;
 mod config;

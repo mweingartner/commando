@@ -86,7 +86,8 @@ enum Command {
         /// Scan only staged files (used by the pre-commit hook).
         #[arg(long)]
         staged: bool,
-        /// Suppress success output.
+        /// Suppress "everything is fine" output. Never silences allowlist
+        /// suppression reporting or failures.
         #[arg(long)]
         quiet: bool,
     },
@@ -361,15 +362,21 @@ fn cmd_gate(
         if phase.requires_secret_scan() {
             let files = checks::git_tracked_files(&root);
             let report = checks::scan_secrets(&files);
-            if !report.clean() {
-                for f in &report.findings {
+            let scanner = report.scanner;
+            let (findings, suppressed) =
+                crate::allowlist::Allowlist::load(&root).filter(report.findings, &root);
+            if suppressed > 0 {
+                println!("  {suppressed} secret finding(s) suppressed by allowlist.");
+            }
+            if !findings.is_empty() {
+                for f in &findings {
                     eprintln!("  secret: {}:{} [{}]", f.path, f.line, f.rule);
                 }
                 return Ok(gate_blocked(&format!(
                     "{} gate refused: {} secret finding(s) via {}",
                     phase.label(),
-                    report.findings.len(),
-                    report.scanner
+                    findings.len(),
+                    scanner
                 )));
             }
             // Additionally run external best-of-breed scanners when installed
@@ -385,7 +392,7 @@ fn cmd_gate(
                     external.ran.join(", ")
                 )));
             }
-            let mut scanners = vec![report.scanner.to_string()];
+            let mut scanners = vec![scanner.to_string()];
             scanners.extend(external.ran.iter().cloned());
             let summary = checks_summary.get_or_insert_with(CheckSummary::default);
             summary.secrets_clean = Some(true);
@@ -441,16 +448,23 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
         checks::git_tracked_files(&root)
     };
     let report = checks::scan_secrets(&files);
+    let scanner = report.scanner;
+    let (findings, suppressed) =
+        crate::allowlist::Allowlist::load(&root).filter(report.findings, &root);
     let mut failed = false;
 
-    if !report.clean() {
+    // Suppression reporting is a security signal — never silenced by --quiet.
+    if suppressed > 0 {
+        println!("Secret scan: {suppressed} finding(s) suppressed by allowlist.");
+    }
+    if !findings.is_empty() {
         failed = true;
         eprintln!(
             "Secret scan ({}) found {} finding(s):",
-            report.scanner,
-            report.findings.len()
+            scanner,
+            findings.len()
         );
-        for f in &report.findings {
+        for f in &findings {
             let loc = if f.line == 0 {
                 f.path.clone()
             } else {
@@ -460,24 +474,27 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
         }
     }
 
-    // External scanners (gitleaks / Semgrep) when installed.
-    let external = checks::run_external_scanners(&root);
-    if !external.failures.is_empty() {
-        failed = true;
-        for msg in &external.failures {
-            eprintln!("{msg}");
-        }
-    }
-
-    // Verify tests when configured.
-    let cfg = Config::load(&root);
-    if let Some(cmd) = cfg.test {
-        let outcome = tests_runner::run(&cmd, &root);
-        if !outcome.success {
+    // The pre-commit hook (`--staged`) does the FAST secret scan only, so it
+    // stays cheap on every commit. The heavier external scanners and the test
+    // suite run in the full `mpd check` (manual/CI) and at the Build/Test gate.
+    if !staged {
+        let external = checks::run_external_scanners(&root);
+        if !external.failures.is_empty() {
             failed = true;
-            eprintln!("Tests failed: {} ({})", outcome.summary, outcome.command);
-        } else if !quiet {
-            println!("Tests: {}", outcome.summary);
+            for msg in &external.failures {
+                eprintln!("{msg}");
+            }
+        }
+
+        let cfg = Config::load(&root);
+        if let Some(cmd) = cfg.test {
+            let outcome = tests_runner::run(&cmd, &root);
+            if !outcome.success {
+                failed = true;
+                eprintln!("Tests failed: {} ({})", outcome.summary, outcome.command);
+            } else if !quiet {
+                println!("Tests: {}", outcome.summary);
+            }
         }
     }
 
@@ -567,6 +584,10 @@ fn cmd_doctor(json: bool) -> CmdResult {
     let gitleaks = checks::tool_available("gitleaks");
     let semgrep = checks::tool_available("semgrep");
     let test_cmd = root.as_ref().map(|r| Config::load(r).test).unwrap_or(None);
+    let allow_entries = root.as_ref().map_or(0, |r| {
+        let al = crate::allowlist::Allowlist::load(r);
+        al.paths.len() + al.allow.len()
+    });
     let current = root.as_ref().and_then(|r| ledger::current(r));
     let schema_ok = root
         .as_ref()
@@ -584,6 +605,7 @@ fn cmd_doctor(json: bool) -> CmdResult {
             "gitleaks": gitleaks,
             "semgrep": semgrep,
             "test_command": test_cmd,
+            "allowlist_entries": allow_entries,
             "current_change": current,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -607,6 +629,10 @@ fn cmd_doctor(json: bool) -> CmdResult {
         test_cmd
             .as_deref()
             .unwrap_or("(unset — Build/Test gates will refuse)")
+    );
+    println!(
+        "  secret allowlist:    {allow_entries} entr{}",
+        if allow_entries == 1 { "y" } else { "ies" }
     );
     println!(
         "  current change:      {}",

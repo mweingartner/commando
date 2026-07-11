@@ -44,7 +44,8 @@ fn hooks_dir(root: &Path) -> Option<PathBuf> {
 
 /// The `pre-commit` hook script. `MPD_GATE_SKIP=1` bypasses one commit.
 pub const PRE_COMMIT: &str = r#"#!/bin/sh
-# mpd pre-commit gate: secret scan (+ optional test verification) on staged changes.
+# mpd pre-commit gate: fast secret scan on staged changes (tests run at the
+# Build/Test gate and in CI, not on every commit).
 # Bypass a single commit with MPD_GATE_SKIP=1.
 if [ "$MPD_GATE_SKIP" = "1" ]; then
     echo "mpd: pre-commit gate skipped (MPD_GATE_SKIP=1)"

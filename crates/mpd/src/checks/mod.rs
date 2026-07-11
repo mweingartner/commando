@@ -108,13 +108,6 @@ pub struct SecretReport {
     pub findings: Vec<secrets::Finding>,
 }
 
-impl SecretReport {
-    /// Whether the scan came back clean.
-    pub fn clean(&self) -> bool {
-        self.findings.is_empty()
-    }
-}
-
 /// Scan the given files for secrets using the built-in scanner. The report is
 /// labeled `builtin` honestly — this is exactly the scanner that produced the
 /// findings. External scanners (gitleaks/Semgrep) run separately via

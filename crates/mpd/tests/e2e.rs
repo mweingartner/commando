@@ -419,6 +419,57 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
 }
 
 #[test]
+fn secret_allowlist_unblocks_security_code_gate() {
+    let sb = Sandbox::new("allowlist");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "add-x"]);
+    // A tracked fixture file with a fake key (split literal so THIS test source
+    // stays clean); staged so git ls-files reports it.
+    sb.write(
+        "Tests/Fixtures.swift",
+        &format!("let key = \"AKIA{}\"\n", "IOSFODNN7EXAMPLE"),
+    );
+    run("git", &["add", "Tests/Fixtures.swift"], &sb.dir);
+    sb.mpd(&["gate", "architecture", "--pass"]);
+    sb.mpd(&["gate", "security-plan", "--pass"]);
+    sb.mpd(&["gate", "build", "--pass"]);
+
+    // Without an allowlist, the security-code gate refuses.
+    let out = sb.mpd(&["gate", "security-code", "--pass"]);
+    assert!(
+        !out.status.success(),
+        "gate should refuse on the fixture secret"
+    );
+
+    // Allowlist the fixtures directory; the gate now passes and reports it.
+    sb.write(
+        ".mpd/secret-allowlist.json",
+        "{\n  \"paths\": [\"Tests/**\"]\n}\n",
+    );
+    let out = sb.mpd(&["gate", "security-code", "--pass"]);
+    assert!(
+        out.status.success(),
+        "allowlist should unblock the gate: {}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).contains("suppressed by allowlist"),
+        "suppression must be reported, not silent: {}",
+        stdout(&out)
+    );
+
+    // --quiet must NOT silence the suppression signal (a security signal).
+    let out = sb.mpd(&["check", "--quiet"]);
+    assert!(out.status.success(), "check --quiet: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("suppressed by allowlist"),
+        "--quiet must not silence suppression reporting: {:?}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn init_detects_worktree_and_installs_hook() {
     // Regression: a git worktree's `.git` is a gitlink FILE, not a directory.
     // mpd must still detect the repo and resolve the (shared) hooks dir.

@@ -118,6 +118,28 @@ External best-of-breed scanners (gitleaks, Semgrep) are used when present as
 ledger records which scanners actually backed each PASS. Degraded coverage is
 reported by `mpd doctor`, never silently treated as clean.
 
+### Secret allowlist
+
+Real repos have intentional fixture secrets (fake API keys in tests). To
+acknowledge them without weakening the gate, add `.mpd/secret-allowlist.json`:
+
+```json
+{
+  "paths": ["Tests/**", "scripts/fixtures/**"],
+  "allow": [
+    { "path": "Sources/AI/Context.swift", "rule": "private-key-block", "line": 324 }
+  ]
+}
+```
+
+`paths` are repo-relative globs (`*` within a segment, `**` across segments);
+`allow` entries narrow by `rule` and/or `line`. Two guarantees: suppressions are
+**always counted and reported** (never silent), and a missing or malformed
+allowlist suppresses **nothing** (fail-closed). The file is version-controlled
+trust — committing an entry is a reviewable statement that a finding is a
+verified false positive. When gitleaks is the active scanner it honors its own
+`.gitleaksignore` independently.
+
 ## Trust boundaries
 
 - **`.mpd/config.json` is executable trust.** Its `test` value is run via
