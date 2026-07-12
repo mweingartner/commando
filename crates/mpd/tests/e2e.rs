@@ -363,16 +363,23 @@ fn conditional_pass_condition_blocks_archive_until_closed() {
     // Nothing was moved.
     assert!(sb.dir.join("openspec/changes/risky-thing").is_dir());
 
-    // Close the condition directly in the durable ledger state. (There is
-    // currently no CLI verb to close a condition — this simulates one
-    // becoming available, and pins the on-disk shape `blocking_reasons`
-    // depends on: `ledger.conditions[i].closed`.)
+    // Close the condition via the CLI verb `mpd resolve`. It persists
+    // `conditions[0].closed = true` — the on-disk shape `blocking_reasons`
+    // depends on. (Before `resolve` existed, this test hand-edited the JSON.)
     let state_path = sb.dir.join(".mpd/state/risky-thing.json");
-    let text = std::fs::read_to_string(&state_path).unwrap();
-    let mut v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["conditions"][0]["closed"], false);
-    v["conditions"][0]["closed"] = Value::Bool(true);
-    std::fs::write(&state_path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    let before: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(before["conditions"][0]["closed"], false);
+    let out = sb.mpd(&["resolve", "1"]);
+    assert!(
+        out.status.success(),
+        "resolve should close condition #1: {}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(after["conditions"][0]["closed"], true);
 
     let s = json(&sb.mpd(&["status", "--json"]));
     assert_eq!(s["ready_to_archive"], true, "{s}");
@@ -385,6 +392,195 @@ fn conditional_pass_condition_blocks_archive_until_closed() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!sb.dir.join("openspec/changes/risky-thing").exists());
+}
+
+/// Author a minimal delta spec so a change has something to archive.
+fn write_thing_spec(sb: &Sandbox, change: &str) {
+    sb.write(
+        &format!("openspec/changes/{change}/specs/thing/spec.md"),
+        "## ADDED Requirements\n\n\
+         ### Requirement: Thing works\n\
+         The system SHALL do the thing.\n\n\
+         #### Scenario: It works\n\
+         - **WHEN** invoked\n\
+         - **THEN** it works\n",
+    );
+}
+
+/// Write `.mpd/config.json` with a passing test command and the given deploy.
+fn write_config_with_deploy(sb: &Sandbox, deploy: &str) {
+    sb.write(
+        ".mpd/config.json",
+        &format!(
+            "{{\n  \"test\": {PASSING_TEST_CMD:?},\n  \"deploy\": {deploy:?}\n}}\n"
+        ),
+    );
+}
+
+#[test]
+fn deploy_gate_runs_configured_deploy_command() {
+    let sb = Sandbox::new("deploy-runs");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "shippable"]);
+    write_thing_spec(&sb, "shippable");
+    // A deploy command that leaves a marker in the project root (the gate CWD).
+    write_config_with_deploy(&sb, "touch deployed.marker");
+
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(out.status.success(), "gate {phase}: {}", stdout(&out));
+    }
+
+    // The deploy command must not have run before the Deploy gate.
+    assert!(!sb.dir.join("deployed.marker").exists());
+    let out = sb.mpd(&["gate", "deploy", "--pass"]);
+    assert!(
+        out.status.success(),
+        "deploy gate failed: {}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        sb.dir.join("deployed.marker").exists(),
+        "deploy gate must run the configured deploy command"
+    );
+
+    // Ready to archive, and the deploy command is recorded as evidence.
+    let s = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(s["ready_to_archive"], true, "{s}");
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.dir.join(".mpd/state/shippable.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["gates"]["deploy"]["checks"]["command"], "touch deployed.marker",
+        "deploy command must be recorded as gate evidence: {state}"
+    );
+}
+
+#[test]
+fn deploy_gate_refuses_when_deploy_command_fails() {
+    let sb = Sandbox::new("deploy-fails");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "broken-deploy"]);
+    write_thing_spec(&sb, "broken-deploy");
+    write_config_with_deploy(&sb, "false"); // a deploy that always fails
+
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+    ] {
+        sb.mpd(&["gate", phase, "--pass"]);
+    }
+
+    let out = sb.mpd(&["gate", "deploy", "--pass"]);
+    assert!(
+        !out.status.success(),
+        "deploy gate must refuse when the deploy command fails"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Deploy gate refused"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The Deploy gate must not have been recorded as a pass.
+    let s = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(
+        s["phase"], "deploy",
+        "must remain at deploy after a refused deploy: {s}"
+    );
+}
+
+#[test]
+fn deploy_gate_records_readiness_when_no_deploy_configured() {
+    // With no deploy command set, the Deploy gate is a readiness record only —
+    // it must not fail for lack of a command (back-compat with pre-deploy configs).
+    let sb = Sandbox::new("deploy-unset");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "no-deploy"]);
+    write_thing_spec(&sb, "no-deploy");
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+    ] {
+        sb.mpd(&["gate", phase, "--pass"]);
+    }
+    let out = sb.mpd(&["gate", "deploy", "--pass"]);
+    assert!(
+        out.status.success(),
+        "deploy gate must pass with no deploy configured: {}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn resolve_cli_contract_and_all() {
+    let sb = Sandbox::new("resolve-cli");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "conds"]);
+    write_thing_spec(&sb, "conds");
+    sb.mpd(&["gate", "architecture", "--pass"]);
+    // Two open conditions from a conditional security-plan pass.
+    let out = sb.mpd(&[
+        "gate",
+        "security-plan",
+        "--conditional",
+        "--condition",
+        "first gap",
+        "--condition",
+        "second gap",
+    ]);
+    assert!(out.status.success(), "conditional gate: {}", stdout(&out));
+    sb.mpd(&["gate", "build", "--pass"]);
+    sb.mpd(&["gate", "security-code", "--pass"]);
+    sb.mpd(&["gate", "test", "--pass"]);
+
+    // Contract: exactly one of <index> or --all.
+    let out = sb.mpd(&["resolve", "1", "--all"]);
+    assert!(!out.status.success(), "index + --all must be rejected");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not both"));
+    let out = sb.mpd(&["resolve"]);
+    assert!(!out.status.success(), "no index and no --all must be rejected");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--all"));
+    // Out-of-range index is rejected and mutates nothing.
+    let out = sb.mpd(&["resolve", "9"]);
+    assert!(!out.status.success(), "out-of-range index must be rejected");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["ready_to_archive"],
+        false,
+        "still two open conditions"
+    );
+
+    // Close one by index, then the rest with --all → ready.
+    assert!(sb.mpd(&["resolve", "1"]).status.success());
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["ready_to_archive"],
+        false,
+        "one condition still open"
+    );
+    let out = sb.mpd(&["resolve", "--all"]);
+    assert!(out.status.success(), "resolve --all: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("Ready to archive"),
+        "stdout: {}",
+        stdout(&out)
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["ready_to_archive"],
+        true
+    );
 }
 
 #[test]
@@ -405,6 +601,7 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
     );
     assert_eq!(before["pre_commit_hook"], false);
     assert_eq!(before["test_command"], Value::Null);
+    assert_eq!(before["deploy_command"], Value::Null);
     assert_eq!(before["current_change"], Value::Null);
     assert!(before["secret_scanner_floor"].is_string());
     assert!(before["gitleaks"].is_boolean());
@@ -417,6 +614,7 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
     assert_eq!(after_init["git_repo"], true);
     assert_eq!(after_init["pre_commit_hook"], true);
     assert_eq!(after_init["test_command"], PASSING_TEST_CMD);
+    assert_eq!(after_init["deploy_command"], Value::Null);
     assert_eq!(after_init["current_change"], Value::Null);
     assert!(!after_init["project_root"].as_str().unwrap().is_empty());
 

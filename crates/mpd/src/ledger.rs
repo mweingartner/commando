@@ -153,6 +153,36 @@ impl Ledger {
     pub fn ready_to_archive(&self) -> bool {
         self.blocking_reasons().is_empty()
     }
+
+    /// Close the 1-based condition (as numbered by `blocking_reasons` /
+    /// `mpd status`). Errors if the index is out of range.
+    pub fn close_condition(&mut self, index_1based: usize) -> Result<(), String> {
+        let i = index_1based
+            .checked_sub(1)
+            .ok_or_else(|| "condition numbers are 1-based".to_string())?;
+        let len = self.conditions.len();
+        let cond = self.conditions.get_mut(i).ok_or_else(|| {
+            format!(
+                "no condition #{index_1based} (there {} {})",
+                if len == 1 { "is" } else { "are" },
+                len
+            )
+        })?;
+        cond.closed = true;
+        Ok(())
+    }
+
+    /// Close every open condition; returns how many were newly closed.
+    pub fn close_all_conditions(&mut self) -> usize {
+        let mut n = 0;
+        for c in self.conditions.iter_mut() {
+            if !c.closed {
+                c.closed = true;
+                n += 1;
+            }
+        }
+        n
+    }
 }
 
 /// `<root>/.mpd`.
@@ -279,6 +309,33 @@ mod tests {
         });
         assert!(!l.ready_to_archive());
         l.conditions[0].closed = true;
+        assert!(l.ready_to_archive());
+    }
+
+    #[test]
+    fn close_condition_by_index_and_all() {
+        let mut l = Ledger::new("c", "mpd", false);
+        for phase in [
+            Phase::Architecture,
+            Phase::SecurityPlan,
+            Phase::Build,
+            Phase::SecurityCode,
+            Phase::Test,
+        ] {
+            l.record(phase, pass(phase.persona().name));
+        }
+        for t in ["a", "b"] {
+            l.conditions.push(Condition {
+                text: t.into(),
+                owner: "Security".into(),
+                closed: false,
+            });
+        }
+        assert!(l.close_condition(3).is_err()); // out of range
+        assert!(l.close_condition(0).is_err()); // not 1-based
+        l.close_condition(1).unwrap();
+        assert!(!l.ready_to_archive()); // #2 still open
+        assert_eq!(l.close_all_conditions(), 1); // only #2 remained
         assert!(l.ready_to_archive());
     }
 

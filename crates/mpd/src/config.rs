@@ -11,6 +11,13 @@ pub struct Config {
     /// the Build/Test gates to verify a real, non-zero pass count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test: Option<String>,
+    /// The command that deploys/installs the built product (e.g.
+    /// `script/build_and_run.sh --deploy`). When set, the Deploy gate runs it
+    /// and refuses PASS if it exits non-zero — deploy becomes the
+    /// machine-enforced end-of-cycle default rather than a manual step. When
+    /// unset, the Deploy gate only records deploy-ready evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<String>,
 }
 
 /// Path to `.mpd/config.json`.

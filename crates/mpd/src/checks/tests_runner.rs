@@ -67,8 +67,9 @@ pub fn run(command: &str, dir: &Path) -> TestOutcome {
 /// Parse and sum pass counts from recognized framework output.
 ///
 /// Handles libtest (`test result: ok. 12 passed`), pytest (`12 passed`), jest
-/// (`Tests: 12 passed`), and any `N passed` token. Returns `None` if no count
-/// is found (which callers treat as *unverified*, not zero).
+/// (`Tests: 12 passed`), any `N passed` token, and Swift Testing
+/// (`Test run with N tests ... passed`). Returns `None` if no count is found
+/// (which callers treat as *unverified*, not zero).
 pub fn parse_pass_count(output: &str) -> Option<usize> {
     let tokens: Vec<&str> = output.split_whitespace().collect();
     let mut total = 0usize;
@@ -80,6 +81,26 @@ pub fn parse_pass_count(output: &str) -> Option<usize> {
             if let Ok(n) = pair[0].trim_end_matches([',', '.']).parse::<usize>() {
                 total += n;
                 found = true;
+            }
+        }
+    }
+    // Swift Testing prints `✔ Test run with <N> tests in <M> suites passed after
+    // …` — the count is not adjacent to `passed`, so the token scan above misses
+    // it. Fall back to summing the per-run totals from those success lines (one
+    // per test bundle). A failed run says `… failed` and also exits non-zero,
+    // which the caller already rejects, so only `passed` lines are counted.
+    if !found {
+        for line in output.lines() {
+            if !line.contains("passed") {
+                continue;
+            }
+            if let Some(rest) = line.split("Test run with ").nth(1) {
+                if let Some(num) = rest.split_whitespace().next() {
+                    if let Ok(n) = num.trim_end_matches([',', '.']).parse::<usize>() {
+                        total += n;
+                        found = true;
+                    }
+                }
             }
         }
     }
@@ -121,5 +142,27 @@ mod tests {
     fn zero_passed_is_some_zero() {
         // "0 passed" is a parseable count — callers reject it as non-positive.
         assert_eq!(parse_pass_count("test result: ok. 0 passed"), Some(0));
+    }
+
+    #[test]
+    fn parses_swift_testing() {
+        let out = "\u{25c7} Test run started.\n\
+                   \u{2714} Suite \"App launch state\" passed after 0.1 seconds.\n\
+                   \u{2714} Test run with 3108 tests in 308 suites passed after 141.0 seconds.";
+        assert_eq!(parse_pass_count(out), Some(3108));
+    }
+
+    #[test]
+    fn sums_multiple_swift_testing_bundles() {
+        let out = "\u{2714} Test run with 3108 tests in 308 suites passed after 141s.\n\
+                   \u{2714} Test run with 34 tests in 1 suite passed after 3s.";
+        assert_eq!(parse_pass_count(out), Some(3142));
+    }
+
+    #[test]
+    fn swift_testing_failure_line_is_not_counted() {
+        // A failed run says "failed" (and exits non-zero); no false pass count.
+        let out = "\u{2716} Test run with 10 tests in 2 suites failed after 1s.";
+        assert_eq!(parse_pass_count(out), None);
     }
 }

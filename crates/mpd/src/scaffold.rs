@@ -86,7 +86,10 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
 
     // .mpd config.
     mkdir(ledger::mpd_dir(root).join("state"), &mut report)?;
-    let cfg = Config { test: test_cmd };
+    let cfg = Config {
+        test: test_cmd,
+        deploy: None,
+    };
     if !crate::config::config_path(root).exists() {
         cfg.save(root)?;
         report.created.push(".mpd/config.json".to_string());

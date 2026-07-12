@@ -81,6 +81,17 @@ enum Command {
         #[arg(long = "condition")]
         conditions: Vec<String>,
     },
+    /// Close open conditions from a CONDITIONAL PASS (they block archive).
+    Resolve {
+        /// Condition number (1-based, as shown by `mpd status`). Omit with --all.
+        index: Option<usize>,
+        /// Close every open condition.
+        #[arg(long)]
+        all: bool,
+        /// Change (defaults to the current change).
+        #[arg(long)]
+        change: Option<String>,
+    },
     /// Run deterministic checks now (secret scan + optional test run).
     Check {
         /// Scan only staged files (used by the pre-commit hook).
@@ -142,6 +153,7 @@ pub fn run() -> i32 {
             by,
             conditions,
         ),
+        Command::Resolve { index, all, change } => cmd_resolve(index, all, change),
         Command::Check { staged, quiet } => cmd_check(staged, quiet),
         Command::Archive {
             change,
@@ -399,6 +411,24 @@ fn cmd_gate(
             summary.secrets_clean = Some(true);
             summary.scanner = Some(scanners.join("+"));
         }
+        // Deploy gate: when a deploy command is configured, RUN it (build +
+        // install) and refuse PASS if it fails — the machine-enforced
+        // end-of-cycle default. Unset ⇒ the gate only records deploy-ready
+        // evidence.
+        if phase == Phase::Deploy {
+            if let Some(cmd) = Config::load(&root).deploy {
+                println!("Deploying: {cmd}");
+                let outcome = tests_runner::run(&cmd, &root);
+                if !outcome.success {
+                    return Ok(gate_blocked(&format!(
+                        "Deploy gate refused: deploy command failed (command: {})",
+                        outcome.command
+                    )));
+                }
+                checks_summary.get_or_insert_with(CheckSummary::default).command =
+                    Some(outcome.command);
+            }
+        }
     }
 
     let by = by.unwrap_or_else(|| phase.persona().name.to_string());
@@ -439,6 +469,39 @@ fn cmd_gate(
 fn gate_blocked(msg: &str) -> i32 {
     eprintln!("{msg}");
     1
+}
+
+fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdResult {
+    let root = find_root()?;
+    let change = resolve_change(&root, change)?;
+    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+
+    match (index, all) {
+        (Some(_), true) => return Err("specify a condition number or --all, not both".into()),
+        (None, false) => return Err("specify a condition number (see `mpd status`) or --all".into()),
+        (Some(i), false) => {
+            ledger.close_condition(i)?;
+            println!("Closed condition #{i}.");
+        }
+        (None, true) => {
+            let n = ledger.close_all_conditions();
+            println!("Closed {n} open condition(s).");
+        }
+    }
+    ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+
+    let remaining = ledger.conditions.iter().filter(|c| !c.closed).count();
+    if remaining == 0 {
+        let tail = if ledger.ready_to_archive() {
+            " Ready to archive."
+        } else {
+            ""
+        };
+        println!("All conditions closed.{tail}");
+    } else {
+        println!("{remaining} condition(s) still open.");
+    }
+    Ok(0)
 }
 
 fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
@@ -585,6 +648,7 @@ fn cmd_doctor(json: bool) -> CmdResult {
     let gitleaks = checks::tool_available("gitleaks");
     let semgrep = checks::tool_available("semgrep");
     let test_cmd = root.as_ref().map(|r| Config::load(r).test).unwrap_or(None);
+    let deploy_cmd = root.as_ref().map(|r| Config::load(r).deploy).unwrap_or(None);
     let allow_entries = root.as_ref().map_or(0, |r| {
         let al = crate::allowlist::Allowlist::load(r);
         al.paths.len() + al.allow.len()
@@ -606,6 +670,7 @@ fn cmd_doctor(json: bool) -> CmdResult {
             "gitleaks": gitleaks,
             "semgrep": semgrep,
             "test_command": test_cmd,
+            "deploy_command": deploy_cmd,
             "allowlist_entries": allow_entries,
             "current_change": current,
         });
@@ -630,6 +695,12 @@ fn cmd_doctor(json: bool) -> CmdResult {
         test_cmd
             .as_deref()
             .unwrap_or("(unset — Build/Test gates will refuse)")
+    );
+    println!(
+        "  deploy command:      {}",
+        deploy_cmd
+            .as_deref()
+            .unwrap_or("(unset — Deploy gate records readiness only)")
     );
     println!(
         "  secret allowlist:    {allow_entries} entr{}",
