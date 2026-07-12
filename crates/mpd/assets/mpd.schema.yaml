@@ -58,6 +58,22 @@ artifacts:
       - specs
       - design
 
+  - id: documentation
+    generates: documentation.md
+    description: >
+      Durable, human-facing documentation of the solution — produced by the
+      Documenter in the Documentation phase (feature changes only) and folded
+      into the project docs directory at archive.
+    template: documentation.md
+    instruction: |
+      Synthesize clean, concise documentation from the accumulated artifacts.
+      Required sections: Purpose, Value, Scope, Functional details, Usage.
+      Turn spec scenarios into concrete usage examples. No placeholders.
+    requires:
+      - specs
+      - design
+      - tasks
+
 apply:
   requires:
     - tasks

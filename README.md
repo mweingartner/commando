@@ -5,8 +5,9 @@
 `mpd` is a single Rust binary that natively speaks the [OpenSpec](https://github.com/Fission-AI/OpenSpec)
 on-disk format and layers an adversarial-gate pipeline on top. It turns the
 phases of a model-paired workflow — Architecture → Security → Build → Security →
-Test → Deploy — into durable, machine-checkable state that outlives any single
-session, and enforces the gates deterministically at `git commit`.
+Test → Documentation → Deploy → Doc Validation — into durable, machine-checkable
+state that outlives any single session, and enforces the gates deterministically
+at `git commit`.
 
 It has **no runtime dependencies**: no Node, no OpenSpec CLI. The macOS/Linux
 binary links only against the system C library.
@@ -92,7 +93,7 @@ real OpenSpec fixtures and a fence-torture case.
 
 ```
 mpd init [--test <cmd>]      # scaffold openspec/ + mpd schema + install the commit gate
-mpd begin <name> [--ui]      # create a change and seed its pipeline ledger
+mpd begin <name> [--ui] [--fix|--chore]  # new change (--fix/--chore skip docs)
 mpd status [--json]          # current phase, gate verdicts, archive readiness
 mpd next [--harness ...]     # emit the next persona's brief (generic | claude-code | codex)
 mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C]
@@ -163,9 +164,9 @@ verified false positive. When gitleaks is the active scanner it honors its own
 ## Phase → persona → model
 
 The persona (role) is fixed; the **model is harness-specific**. The
-judgment/creative planning phases — **Design and Architecture** — are the
-deep-cognition tier; the execution/review phases are standard. `mpd next
---harness <h>` resolves the concrete model:
+judgment/creative planning and validation phases — **Design, Architecture, and
+Doc Validation** — are the deep-cognition tier; the execution/synthesis/review
+phases are standard. `mpd next --harness <h>` resolves the concrete model:
 
 | Phase | Persona | Tier | Claude Code | Codex |
 |---|---|---|---|---|
@@ -174,12 +175,38 @@ deep-cognition tier; the execution/review phases are standard. `mpd next
 | Security (plan / code) | Security | standard | Sonnet | Terra |
 | Build | Builder | standard | Sonnet | Terra |
 | Test | Tester | standard | Sonnet | Terra |
+| Documentation² | Documenter | standard | Sonnet | Terra |
 | Deploy | main session | — | — | — |
+| **Doc Validation**² | Architect & Designer | **deep** | **Fable** (→ Opus if unavailable) | **Sol** |
 
-¹ Design phases run only for `--ui` changes. Codex tiers are GPT-5.6 Sol / Terra
-/ Luna (deepest → lightest); Luna is available but unassigned by default. The
-`generic` harness reports the *tier* (`deep-cognition` / `standard`) rather than
-a concrete model.
+¹ Design phases run only for `--ui` changes. ² Documentation phases run only for
+feature changes (a `--fix` or `--chore` skips them). The Documenter *synthesizes*
+the doc cheaply; the Architect + Designer *validate* it (both spawned) at the
+deep tier. Codex tiers are GPT-5.6 Sol / Terra / Luna (deepest → lightest); Luna
+is unassigned by default. The `generic` harness reports the *tier*
+(`deep-cognition` / `standard`) rather than a concrete model.
+
+## Documentation
+
+Feature changes carry documentation through the pipeline as first-class,
+gated work:
+
+- **Documentation** (after Test) — the **Documenter** (cheap, standard tier)
+  *passively synthesizes* a durable doc from everything the prior phases
+  produced (proposal, design + Conditions for Builder, spec scenarios, security
+  findings, tasks, test results) covering **Purpose · Value · Scope · Functional
+  details · Usage**. Its gate is a **deterministic structural check** — the doc
+  must exist and cover every section with no unfilled placeholders — so an empty
+  stub can't pass.
+- **Doc Validation** (after Deploy) — the **Architect** (functional/scope
+  accuracy) and **Designer** (purpose/value/representation) *both* validate the
+  doc against what shipped, at the deep tier. A FAIL sends it back to the
+  Documenter to revise.
+
+At archive, the doc folds into a project subdirectory (default `docs/<name>.md`,
+configurable via `docs_dir`). Defect fixes (`--fix`) and non-functional chores
+(`--chore`) skip both phases — only changes that alter functional behavior are
+documented.
 
 ## Build & test
 

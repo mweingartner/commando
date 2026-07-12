@@ -4,7 +4,7 @@
 //! can initialize a project with no network or Node dependency.
 
 use crate::config::Config;
-use crate::ledger::{self, Ledger};
+use crate::ledger::{self, ChangeKind, Ledger};
 use crate::{githooks, phase::Phase};
 use openspec_core::date;
 use openspec_core::schema::ChangeMeta;
@@ -16,6 +16,7 @@ const T_PROPOSAL: &str = include_str!("../assets/templates/proposal.md");
 const T_SPEC: &str = include_str!("../assets/templates/spec.md");
 const T_DESIGN: &str = include_str!("../assets/templates/design.md");
 const T_TASKS: &str = include_str!("../assets/templates/tasks.md");
+const T_DOCUMENTATION: &str = include_str!("../assets/templates/documentation.md");
 
 const PROJECT_MD: &str = "# Project Context\n\n\
 <!-- Project-specific context for humans and agents. -->\n";
@@ -81,6 +82,12 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
         root,
         &mut report,
     )?;
+    write_new(
+        &schema_dir.join("templates").join("documentation.md"),
+        T_DOCUMENTATION,
+        root,
+        &mut report,
+    )?;
     write_new(&openspec.join("project.md"), PROJECT_MD, root, &mut report)?;
     write_new(&openspec.join("AGENTS.md"), AGENTS_MD, root, &mut report)?;
 
@@ -89,6 +96,7 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
     let cfg = Config {
         test: test_cmd,
         deploy: None,
+        docs_dir: None,
     };
     if !crate::config::config_path(root).exists() {
         cfg.save(root)?;
@@ -111,7 +119,7 @@ pub fn validate_change_name(name: &str) -> Result<(), String> {
 }
 
 /// Create a new change and seed its ledger. Returns the seeded ledger.
-pub fn begin(root: &Path, change: &str, ui: bool) -> io::Result<Ledger> {
+pub fn begin(root: &Path, change: &str, ui: bool, kind: ChangeKind) -> io::Result<Ledger> {
     validate_change_name(change).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let change_dir = root.join("openspec").join("changes").join(change);
@@ -134,10 +142,14 @@ pub fn begin(root: &Path, change: &str, ui: bool) -> io::Result<Ledger> {
     std::fs::write(change_dir.join("proposal.md"), T_PROPOSAL)?;
     std::fs::write(change_dir.join("design.md"), T_DESIGN)?;
     std::fs::write(change_dir.join("tasks.md"), T_TASKS)?;
+    // Seed the documentation stub only for documented (feature) changes.
+    if kind.documents() {
+        std::fs::write(change_dir.join("documentation.md"), T_DOCUMENTATION)?;
+    }
 
-    let ledger = Ledger::new(change, "mpd", ui);
+    let ledger = Ledger::new(change, "mpd", ui, kind);
     // Assert the seeded phase is sane (first applicable phase).
-    debug_assert_eq!(ledger.phase, Phase::first(ui));
+    debug_assert_eq!(ledger.phase, Phase::first(ledger.applicability()));
     ledger::save(root, &ledger)?;
     ledger::set_current(root, change)?;
     Ok(ledger)

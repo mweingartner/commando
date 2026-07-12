@@ -23,7 +23,7 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Ensure `target` is lexically within `base` and that no existing path
 /// component below `base` is a symlink — refusing to follow links out of the
 /// tree (CWE-59). Rejects `..` and other non-normal components.
-fn assert_contained(base: &Path, target: &Path) -> Result<()> {
+pub fn assert_contained(base: &Path, target: &Path) -> Result<()> {
     let rel = target.strip_prefix(base).map_err(|_| {
         CoreError::Io(format!(
             "path {} escapes {}",
@@ -53,7 +53,7 @@ fn assert_contained(base: &Path, target: &Path) -> Result<()> {
 }
 
 /// Read a file, refusing symlinks and capping size.
-fn read_capped(path: &Path) -> Result<String> {
+pub fn read_capped(path: &Path) -> Result<String> {
     let md = fs::symlink_metadata(path)?;
     if md.file_type().is_symlink() {
         return Err(CoreError::Io(format!(

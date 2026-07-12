@@ -48,6 +48,20 @@ pub fn guidance(phase: Phase) -> &'static str {
              accessibility) plus fuzz/property/metamorphic tests for any parser/serializer/ \
              codec/protocol. The full suite must be green with a real, non-zero count."
         }
+        Phase::Documentation => {
+            "Passively synthesize the durable documentation from everything the prior phases \
+             produced (proposal, design + Conditions for Builder, specs/scenarios, security \
+             findings, tasks, test results). Write documentation.md covering Purpose, Value, \
+             Scope, Functional details, and Usage — turn spec scenarios into concrete usage \
+             examples. Clean and concise; no placeholders left."
+        }
+        Phase::DocValidation => {
+            "Validate the documentation for accuracy from two lenses — spawn BOTH: the \
+             Architect verifies functional/scope/technical accuracy against the built code and \
+             specs; the Designer verifies the purpose, value, and user-facing representation. \
+             PASS only if both confirm; on inaccuracy, FAIL (or CONDITIONAL PASS with a \
+             condition) and have the Documenter revise before re-validating."
+        }
         Phase::Deploy => {
             "Readiness / real-target gate. Confirm all gates passed and conditions closed. \
              Deploy only when explicitly authorized; otherwise deliver deploy-ready evidence."
@@ -60,6 +74,7 @@ pub fn guidance(phase: Phase) -> &'static str {
 pub fn artifacts_for(phase: Phase) -> &'static [&'static str] {
     match phase {
         Phase::Architecture => &["proposal", "specs", "design", "tasks"],
+        Phase::Documentation => &["documentation"],
         _ => &[],
     }
 }
@@ -73,6 +88,10 @@ pub fn gate_hint(phase: Phase) -> &'static str {
         Phase::Test => "full suite green with a non-zero count; fuzz/property passes present",
         Phase::SecurityCode => "secret scan clean; Conditions for Builder verified against code",
         Phase::SecurityPlan => "threat model reviewed; conditions sound",
+        Phase::Documentation => {
+            "documentation.md exists and covers Purpose/Value/Scope/Functional/Usage (checked)"
+        }
+        Phase::DocValidation => "Architect and Designer both confirm the doc is accurate",
         _ => "persona sign-off recorded with evidence",
     }
 }

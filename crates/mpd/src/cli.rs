@@ -3,12 +3,12 @@
 
 use crate::checks::{self, tests_runner};
 use crate::config::Config;
-use crate::ledger::{self, CheckSummary, Condition, GateRecord, Verdict};
+use crate::ledger::{self, ChangeKind, CheckSummary, Condition, GateRecord, Verdict};
 use crate::phase::Phase;
 use crate::{githooks, harness, scaffold};
 use clap::{Parser, Subcommand};
 use openspec_core::{date, Project};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// mpd — an adversarial-gate overlay over the OpenSpec format.
 #[derive(Debug, Parser)]
@@ -33,6 +33,12 @@ enum Command {
         /// Mark the change as having a UI/UX surface (enables design phases).
         #[arg(long)]
         ui: bool,
+        /// A defect fix — skips the Documentation phases.
+        #[arg(long)]
+        fix: bool,
+        /// A non-functional chore (refactor/tooling/perf) — skips Documentation.
+        #[arg(long)]
+        chore: bool,
     },
     /// Show the current phase, gate verdicts, and readiness.
     Status {
@@ -127,7 +133,12 @@ pub fn run() -> i32 {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Init { test } => cmd_init(test),
-        Command::Begin { name, ui } => cmd_begin(name, ui),
+        Command::Begin {
+            name,
+            ui,
+            fix,
+            chore,
+        } => cmd_begin(name, ui, fix, chore),
         Command::Status { change, json } => cmd_status(change, json),
         Command::Next {
             change,
@@ -216,15 +227,25 @@ fn cmd_init(test: Option<String>) -> CmdResult {
     Ok(0)
 }
 
-fn cmd_begin(name: String, ui: bool) -> CmdResult {
+fn cmd_begin(name: String, ui: bool, fix: bool, chore: bool) -> CmdResult {
+    let kind = match (fix, chore) {
+        (false, false) => ChangeKind::Feature,
+        (true, false) => ChangeKind::Fix,
+        (false, true) => ChangeKind::Chore,
+        (true, true) => return Err("specify at most one of --fix, --chore".into()),
+    };
     let root = find_root()?;
-    let ledger = scaffold::begin(&root, &name, ui).map_err(|e| e.to_string())?;
+    let ledger = scaffold::begin(&root, &name, ui, kind).map_err(|e| e.to_string())?;
     println!(
-        "Started change {:?} (ui: {}). Current phase: {}.",
+        "Started change {:?} (kind: {}, ui: {}). Current phase: {}.",
         name,
+        kind.label(),
         ui,
         ledger.phase.label()
     );
+    if !kind.documents() {
+        println!("  (Documentation phases skipped for a {} change.)", kind.label());
+    }
     println!("Next: mpd next");
     Ok(0)
 }
@@ -265,7 +286,7 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     println!("Change: {}  (ui: {})", ledger.change, ledger.ui);
     println!("Current phase: {}\n", ledger.phase.label());
     println!("Pipeline:");
-    for phase in Phase::applicable(ledger.ui) {
+    for phase in Phase::applicable(ledger.applicability()) {
         let marker = match ledger.gates.get(&phase) {
             Some(r) => match r.verdict {
                 Verdict::Pass => "PASS",
@@ -411,6 +432,28 @@ fn cmd_gate(
             summary.secrets_clean = Some(true);
             summary.scanner = Some(scanners.join("+"));
         }
+        // Documentation gate: the doc must exist and cover every required
+        // section, with no unfilled placeholders — machine-checked, not the
+        // Documenter's word.
+        if phase.requires_doc_check() {
+            let path = Project::new(&root)
+                .change_dir(&change)
+                .join("documentation.md");
+            // Symlink-refusing, size-capped read (a symlinked doc yields "" and
+            // fails the structural check — never exfiltrated).
+            let text = openspec_core::read_capped(&path).unwrap_or_default();
+            let issues = check_documentation(&text);
+            if !issues.is_empty() {
+                for issue in &issues {
+                    eprintln!("  doc: {issue}");
+                }
+                return Ok(gate_blocked(&format!(
+                    "{} gate refused: documentation.md incomplete ({} issue(s))",
+                    phase.label(),
+                    issues.len()
+                )));
+            }
+        }
         // Deploy gate: when a deploy command is configured, RUN it (build +
         // install) and refuse PASS if it fails — the machine-enforced
         // end-of-cycle default. Unset ⇒ the gate only records deploy-ready
@@ -469,6 +512,51 @@ fn cmd_gate(
 fn gate_blocked(msg: &str) -> i32 {
     eprintln!("{msg}");
     1
+}
+
+/// The durable documentation target `<root>/<docs_dir>/<change>.md`. Validates
+/// that `docs_dir` is a project-relative subdirectory (no `..`, not absolute) —
+/// docs always live under the project they are for.
+fn docs_target(root: &Path, docs_dir: &str, change: &str) -> Result<PathBuf, String> {
+    let dir = Path::new(docs_dir);
+    if dir.is_absolute() || dir.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "invalid docs_dir {docs_dir:?}: must be a relative project subdirectory"
+        ));
+    }
+    Ok(root.join(dir).join(format!("{change}.md")))
+}
+
+/// The sections every `documentation.md` must contain (matched at `##` level,
+/// case-insensitively, by heading prefix — so "Functional details" matches).
+const REQUIRED_DOC_SECTIONS: &[&str] = &["Purpose", "Value", "Scope", "Functional", "Usage"];
+
+/// Structural completeness check for a documentation file. Returns the list of
+/// problems (empty ⇒ complete): missing sections, unfilled template
+/// placeholders, or too-short content.
+fn check_documentation(text: &str) -> Vec<String> {
+    let mut issues = Vec::new();
+    for section in REQUIRED_DOC_SECTIONS {
+        let present = text.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("##")
+                && trimmed
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with(&section.to_ascii_lowercase())
+        });
+        if !present {
+            issues.push(format!("missing section: {section}"));
+        }
+    }
+    if text.contains("<!--") {
+        issues.push("unfilled template placeholders remain (<!-- … -->)".to_string());
+    }
+    if text.trim().len() < 120 {
+        issues.push("documentation is too short to be meaningful".to_string());
+    }
+    issues
 }
 
 fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdResult {
@@ -592,6 +680,25 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         .plan_archive(&change, skip_specs)
         .map_err(|e| e.to_string())?;
 
+    // Documentation fold-in (feature changes only): read the change's
+    // documentation.md now, before commit_archive moves the change directory.
+    // A *symlinked* documentation.md is treated as absent (not followed).
+    let doc_src = project.change_dir(&change).join("documentation.md");
+    let doc_is_regular = doc_src
+        .symlink_metadata()
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false);
+    let doc_fold: Option<(PathBuf, String)> = if ledger.kind.documents() && doc_is_regular {
+        let target = docs_target(&root, Config::load(&root).docs_dir(), &change)?;
+        // Catch a pre-planted symlinked docs dir/target now, before anything is
+        // moved or written.
+        openspec_core::assert_contained(&root, &target).map_err(|e| e.to_string())?;
+        let content = openspec_core::read_capped(&doc_src).map_err(|e| e.to_string())?;
+        Some((target, content))
+    } else {
+        None
+    };
+
     println!("Archive plan for {change:?}:");
     if plan.skip_specs {
         println!("  (spec updates skipped)");
@@ -606,6 +713,9 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             );
         }
     }
+    if let Some((target, _)) = &doc_fold {
+        println!("  DOC   {}", target.display());
+    }
     println!("  → archive to {}", plan.archive_target.display());
 
     if !yes {
@@ -614,6 +724,21 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     }
 
     project.commit_archive(&plan).map_err(|e| e.to_string())?;
+
+    // Fold the documentation into the durable project docs directory. Reuse the
+    // hardened containment walk (every component, incl. the leaf, checked for
+    // symlinks) BEFORE creating or following any directory, and again after
+    // mkdir to close the TOCTOU window — refusing a symlinked docs dir or a
+    // symlinked target that would redirect the write outside the project.
+    if let Some((target, content)) = &doc_fold {
+        openspec_core::assert_contained(&root, target).map_err(|e| e.to_string())?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        openspec_core::assert_contained(&root, target).map_err(|e| e.to_string())?;
+        std::fs::write(target, content).map_err(|e| e.to_string())?;
+        println!("  documentation → {}", target.display());
+    }
 
     // Record Deploy gate and persist final ledger state.
     let mut ledger = ledger;

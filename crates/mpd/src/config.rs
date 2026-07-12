@@ -18,6 +18,17 @@ pub struct Config {
     /// unset, the Deploy gate only records deploy-ready evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy: Option<String>,
+    /// Project subdirectory where the durable documentation-of-record lands at
+    /// archive (default `docs`). Docs always live under the project they are for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_dir: Option<String>,
+}
+
+impl Config {
+    /// The documentation subdirectory, defaulting to `docs`.
+    pub fn docs_dir(&self) -> &str {
+        self.docs_dir.as_deref().unwrap_or("docs")
+    }
 }
 
 /// Path to `.mpd/config.json`.

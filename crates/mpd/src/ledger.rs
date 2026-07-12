@@ -5,7 +5,7 @@
 //! `.mpd/state/<change>.json` so it survives session death — the piece the
 //! in-session pipeline lacked.
 
-use crate::phase::Phase;
+use crate::phase::{Applicability, Phase};
 use openspec_core::validate_change_name;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,6 +14,38 @@ use std::path::{Path, PathBuf};
 
 fn invalid(e: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, e)
+}
+
+/// The kind of change, which governs whether the Documentation phases run.
+/// Only a feature (a change that alters functional behavior) is documented;
+/// defect fixes and non-functional chores skip the Documentation and Doc
+/// Validation phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChangeKind {
+    /// A feature or enhancement that changes functional behavior. Documented.
+    #[default]
+    Feature,
+    /// A defect fix. Not documented.
+    Fix,
+    /// A non-functional change (refactor, tooling, perf, deps). Not documented.
+    Chore,
+}
+
+impl ChangeKind {
+    /// Whether a change of this kind runs the Documentation phases.
+    pub fn documents(self) -> bool {
+        matches!(self, ChangeKind::Feature)
+    }
+
+    /// A short human label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ChangeKind::Feature => "feature",
+            ChangeKind::Fix => "fix",
+            ChangeKind::Chore => "chore",
+        }
+    }
 }
 
 /// A gate outcome.
@@ -92,6 +124,9 @@ pub struct Ledger {
     pub schema: String,
     /// Whether the change has a UI/UX surface (governs design-phase skipping).
     pub ui: bool,
+    /// The kind of change (governs documentation-phase skipping).
+    #[serde(default)]
+    pub kind: ChangeKind,
     /// The current phase.
     pub phase: Phase,
     /// Recorded gate verdicts, keyed by phase.
@@ -103,14 +138,32 @@ pub struct Ledger {
 
 impl Ledger {
     /// A fresh ledger positioned at the first applicable phase.
-    pub fn new(change: impl Into<String>, schema: impl Into<String>, ui: bool) -> Ledger {
+    pub fn new(
+        change: impl Into<String>,
+        schema: impl Into<String>,
+        ui: bool,
+        kind: ChangeKind,
+    ) -> Ledger {
+        let applicability = Applicability {
+            ui,
+            docs: kind.documents(),
+        };
         Ledger {
             change: change.into(),
             schema: schema.into(),
             ui,
-            phase: Phase::first(ui),
+            kind,
+            phase: Phase::first(applicability),
             gates: BTreeMap::new(),
             conditions: Vec::new(),
+        }
+    }
+
+    /// The change's phase applicability (which optional phase groups run).
+    pub fn applicability(&self) -> Applicability {
+        Applicability {
+            ui: self.ui,
+            docs: self.kind.documents(),
         }
     }
 
@@ -120,7 +173,7 @@ impl Ledger {
         let advances = record.verdict.advances();
         self.gates.insert(phase, record);
         if advances && phase == self.phase {
-            self.phase = phase.next(self.ui);
+            self.phase = phase.next(self.applicability());
         }
     }
 
@@ -129,7 +182,7 @@ impl Ledger {
     /// condition may remain open.
     pub fn blocking_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
-        for phase in Phase::applicable(self.ui) {
+        for phase in Phase::applicable(self.applicability()) {
             if phase == Phase::Deploy {
                 continue;
             }
@@ -255,9 +308,22 @@ mod tests {
         }
     }
 
+    /// Walk the execution phases common to every change (design/doc skipped).
+    fn walk_core(l: &mut Ledger) {
+        for phase in [
+            Phase::Architecture,
+            Phase::SecurityPlan,
+            Phase::Build,
+            Phase::SecurityCode,
+            Phase::Test,
+        ] {
+            l.record(phase, pass(phase.persona().name));
+        }
+    }
+
     #[test]
     fn passing_current_phase_advances() {
-        let mut l = Ledger::new("c", "mpd", false);
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Feature);
         assert_eq!(l.phase, Phase::Architecture);
         l.record(Phase::Architecture, pass("Architect"));
         assert_eq!(l.phase, Phase::SecurityPlan);
@@ -265,7 +331,7 @@ mod tests {
 
     #[test]
     fn fail_does_not_advance() {
-        let mut l = Ledger::new("c", "mpd", false);
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Feature);
         let mut rec = pass("Security");
         rec.verdict = Verdict::Fail;
         l.record(Phase::Architecture, rec);
@@ -274,34 +340,36 @@ mod tests {
     }
 
     #[test]
-    fn non_ui_change_ready_after_all_gates_but_deploy() {
-        let mut l = Ledger::new("c", "mpd", false);
-        for phase in [
-            Phase::Architecture,
-            Phase::SecurityPlan,
-            Phase::Build,
-            Phase::SecurityCode,
-            Phase::Test,
-        ] {
-            assert!(!l.ready_to_archive());
-            l.record(phase, pass(phase.persona().name));
-        }
+    fn fix_ready_after_core_gates_skipping_docs() {
+        // A fix skips the Documentation phases: Test → Deploy → ready.
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        walk_core(&mut l);
         assert_eq!(l.phase, Phase::Deploy);
         assert!(l.ready_to_archive(), "{:?}", l.blocking_reasons());
     }
 
     #[test]
+    fn feature_requires_documentation_and_validation() {
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Feature);
+        walk_core(&mut l);
+        // Documentation is required before archive.
+        assert_eq!(l.phase, Phase::Documentation);
+        assert!(!l.ready_to_archive());
+        l.record(Phase::Documentation, pass("Documenter"));
+        assert_eq!(l.phase, Phase::Deploy);
+        // Doc Validation (after Deploy) is still required.
+        assert!(!l.ready_to_archive());
+        l.record(Phase::Deploy, pass("main-session"));
+        assert_eq!(l.phase, Phase::DocValidation);
+        assert!(!l.ready_to_archive());
+        l.record(Phase::DocValidation, pass("Architect & Designer"));
+        assert!(l.ready_to_archive(), "{:?}", l.blocking_reasons());
+    }
+
+    #[test]
     fn open_condition_blocks_archive() {
-        let mut l = Ledger::new("c", "mpd", false);
-        for phase in [
-            Phase::Architecture,
-            Phase::SecurityPlan,
-            Phase::Build,
-            Phase::SecurityCode,
-            Phase::Test,
-        ] {
-            l.record(phase, pass(phase.persona().name));
-        }
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        walk_core(&mut l);
         l.conditions.push(Condition {
             text: "close the audit item".into(),
             owner: "Security".into(),
@@ -314,16 +382,8 @@ mod tests {
 
     #[test]
     fn close_condition_by_index_and_all() {
-        let mut l = Ledger::new("c", "mpd", false);
-        for phase in [
-            Phase::Architecture,
-            Phase::SecurityPlan,
-            Phase::Build,
-            Phase::SecurityCode,
-            Phase::Test,
-        ] {
-            l.record(phase, pass(phase.persona().name));
-        }
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        walk_core(&mut l);
         for t in ["a", "b"] {
             l.conditions.push(Condition {
                 text: t.into(),
@@ -341,7 +401,7 @@ mod tests {
 
     #[test]
     fn roundtrips_through_json() {
-        let mut l = Ledger::new("c", "mpd", true);
+        let mut l = Ledger::new("c", "mpd", true, ChangeKind::Feature);
         l.record(Phase::DesignMock, pass("Designer"));
         let json = serde_json::to_string(&l).unwrap();
         let back: Ledger = serde_json::from_str(&json).unwrap();

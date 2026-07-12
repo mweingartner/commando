@@ -1,15 +1,18 @@
 //! The Model-Paired Development phase state machine.
 //!
-//! The pipeline is a fixed sequence of adversarial-persona phases. Design
-//! phases (Mock, Review, Sign-off) are skipped for changes with no UI/UX
-//! surface. Everything else is mandatory. This module is pure — no I/O — so the
-//! ordering and skip rules are unit-testable in isolation.
+//! The pipeline is a fixed sequence of adversarial-persona phases. Two axes of
+//! [`Applicability`] gate which phases run: the **Design** phases (Mock, Review,
+//! Sign-off) run only for UI/UX changes, and the **Documentation** phases
+//! (Documentation, Doc Validation) run only for feature changes that alter
+//! functional behavior (defect fixes and non-functional chores skip them).
+//! Everything else is mandatory. This module is pure — no I/O — so the ordering
+//! and skip rules are unit-testable in isolation.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A pipeline phase. Ordering follows the canonical Model-Paired Development
-/// sequence; [`Phase::Done`] is the terminal state after Deploy.
+/// sequence; [`Phase::Done`] is the terminal state after Doc Validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
@@ -29,8 +32,12 @@ pub enum Phase {
     DesignSignoff,
     /// Tester runs functional + non-functional + fuzz/property passes.
     Test,
-    /// Deploy / readiness gate (main session).
+    /// Documenter synthesizes the durable doc (feature changes only).
+    Documentation,
+    /// Deploy / readiness gate.
     Deploy,
+    /// Architect + Designer validate the doc for accuracy (feature changes only).
+    DocValidation,
     /// All phases complete.
     Done,
 }
@@ -38,7 +45,7 @@ pub enum Phase {
 use Phase::*;
 
 /// The canonical phase order, excluding the terminal [`Phase::Done`].
-pub const PIPELINE: [Phase; 9] = [
+pub const PIPELINE: [Phase; 11] = [
     DesignMock,
     Architecture,
     DesignReview,
@@ -47,8 +54,21 @@ pub const PIPELINE: [Phase; 9] = [
     SecurityCode,
     DesignSignoff,
     Test,
+    Documentation,
     Deploy,
+    DocValidation,
 ];
+
+/// Which optional phase groups apply to a change. Derived from the change's
+/// UI/UX flag and its kind (see [`crate::ledger::ChangeKind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applicability {
+    /// The change has a UI/UX surface → the Design phases run.
+    pub ui: bool,
+    /// The change alters functional behavior worth documenting → the
+    /// Documentation phases run.
+    pub docs: bool,
+}
 
 /// The persona responsible for a phase. The *model* it runs under is
 /// harness-specific (Claude uses Fable/Sonnet, Codex uses Sol/Terra), so it is
@@ -60,9 +80,19 @@ pub struct Persona {
 }
 
 impl Phase {
-    /// A design phase (skipped when the change has no UI/UX component).
-    pub fn is_design(self) -> bool {
-        matches!(self, DesignMock | DesignReview | DesignSignoff)
+    /// The Doc Validation phase — validated by two personas (Architect +
+    /// Designer), so the harness spawns both.
+    pub fn is_doc_validation(self) -> bool {
+        matches!(self, DocValidation)
+    }
+
+    /// Whether this phase is active for a change with the given applicability.
+    pub fn is_active(self, a: Applicability) -> bool {
+        match self {
+            DesignMock | DesignReview | DesignSignoff => a.ui,
+            Documentation | DocValidation => a.docs,
+            _ => true,
+        }
     }
 
     /// Phases whose PASS verdict must be backed by a real test run.
@@ -75,6 +105,12 @@ impl Phase {
         matches!(self, SecurityCode)
     }
 
+    /// Phases whose PASS verdict must be backed by a documentation structural
+    /// check (the doc exists and covers every required section).
+    pub fn requires_doc_check(self) -> bool {
+        matches!(self, Documentation)
+    }
+
     /// The persona responsible for this phase.
     pub fn persona(self) -> Persona {
         let name = match self {
@@ -83,6 +119,8 @@ impl Phase {
             SecurityPlan | SecurityCode => "Security",
             Build => "Builder",
             Test => "Tester",
+            Documentation => "Documenter",
+            DocValidation => "Architect & Designer",
             Deploy => "main-session",
             Done => "-",
         };
@@ -90,13 +128,14 @@ impl Phase {
     }
 
     /// Whether this phase is the deep-cognition tier — the judgment/creative
-    /// planning phases (Architecture and the Design phases). Deep phases get the
-    /// strongest model per harness; execution/review phases (Security, Build,
-    /// Test) get the standard model.
+    /// planning and validation phases (Design, Architecture, and Doc
+    /// Validation). Deep phases get the strongest model per harness; the
+    /// execution/synthesis/review phases (Security, Build, Test, Documentation)
+    /// get the standard model.
     pub fn is_deep(self) -> bool {
         matches!(
             self,
-            Architecture | DesignMock | DesignReview | DesignSignoff
+            Architecture | DesignMock | DesignReview | DesignSignoff | DocValidation
         )
     }
 
@@ -111,7 +150,9 @@ impl Phase {
             SecurityCode => "security-code",
             DesignSignoff => "design-signoff",
             Test => "test",
+            Documentation => "documentation",
             Deploy => "deploy",
+            DocValidation => "doc-validation",
             Done => "done",
         }
     }
@@ -136,36 +177,38 @@ impl Phase {
             SecurityCode => "Security (code)",
             DesignSignoff => "Design Sign-off",
             Test => "Test",
+            Documentation => "Documentation",
             Deploy => "Deploy",
+            DocValidation => "Doc Validation",
             Done => "Done",
         }
     }
 
-    /// The first phase for a change, honoring the UI/UX skip rule.
-    pub fn first(ui: bool) -> Phase {
-        Self::skip_forward(DesignMock, ui)
+    /// The first phase for a change, honoring the applicability skip rules.
+    pub fn first(a: Applicability) -> Phase {
+        Self::skip_forward(DesignMock, a)
     }
 
-    /// The next phase after `self`, skipping design phases when `!ui`. Returns
-    /// [`Phase::Done`] after Deploy.
-    pub fn next(self, ui: bool) -> Phase {
+    /// The next phase after `self`, skipping inapplicable phases. Returns
+    /// [`Phase::Done`] after the last applicable phase.
+    pub fn next(self, a: Applicability) -> Phase {
         if self == Done {
             return Done;
         }
         let idx = PIPELINE.iter().position(|&p| p == self);
         match idx {
-            Some(i) if i + 1 < PIPELINE.len() => Self::skip_forward(PIPELINE[i + 1], ui),
+            Some(i) if i + 1 < PIPELINE.len() => Self::skip_forward(PIPELINE[i + 1], a),
             _ => Done,
         }
     }
 
-    /// From `start`, advance past any skipped design phases to the first
-    /// applicable phase (or [`Phase::Done`]).
-    fn skip_forward(start: Phase, ui: bool) -> Phase {
+    /// From `start`, advance past any inapplicable phases to the first active
+    /// phase (or [`Phase::Done`]).
+    fn skip_forward(start: Phase, a: Applicability) -> Phase {
         let mut idx = PIPELINE.iter().position(|&p| p == start).unwrap_or(0);
         while idx < PIPELINE.len() {
             let p = PIPELINE[idx];
-            if p.is_design() && !ui {
+            if !p.is_active(a) {
                 idx += 1;
                 continue;
             }
@@ -174,12 +217,12 @@ impl Phase {
         Done
     }
 
-    /// The ordered phases that actually apply to a change with the given UI flag.
-    pub fn applicable(ui: bool) -> Vec<Phase> {
+    /// The ordered phases that actually apply to a change.
+    pub fn applicable(a: Applicability) -> Vec<Phase> {
         PIPELINE
             .iter()
             .copied()
-            .filter(|p| ui || !p.is_design())
+            .filter(|p| p.is_active(a))
             .collect()
     }
 }
@@ -194,45 +237,64 @@ impl fmt::Display for Phase {
 mod tests {
     use super::*;
 
+    const FEATURE: Applicability = Applicability {
+        ui: false,
+        docs: true,
+    };
+    const UI_FEATURE: Applicability = Applicability {
+        ui: true,
+        docs: true,
+    };
+    const FIX: Applicability = Applicability {
+        ui: false,
+        docs: false,
+    };
+
     #[test]
-    fn non_ui_change_skips_design_phases() {
-        assert_eq!(Phase::first(false), Architecture);
-        assert_eq!(Architecture.next(false), SecurityPlan);
-        assert_eq!(SecurityPlan.next(false), Build);
-        assert_eq!(Build.next(false), SecurityCode);
+    fn non_ui_feature_skips_design_but_keeps_docs() {
+        assert_eq!(Phase::first(FEATURE), Architecture);
+        assert_eq!(Architecture.next(FEATURE), SecurityPlan);
+        assert_eq!(Build.next(FEATURE), SecurityCode);
         // Security (code) skips Design Sign-off straight to Test.
-        assert_eq!(SecurityCode.next(false), Test);
-        assert_eq!(Test.next(false), Deploy);
-        assert_eq!(Deploy.next(false), Done);
-        let applicable = Phase::applicable(false);
-        assert!(!applicable.iter().any(|p| p.is_design()));
+        assert_eq!(SecurityCode.next(FEATURE), Test);
+        // Test → Documentation → Deploy → Doc Validation → Done.
+        assert_eq!(Test.next(FEATURE), Documentation);
+        assert_eq!(Documentation.next(FEATURE), Deploy);
+        assert_eq!(Deploy.next(FEATURE), DocValidation);
+        assert_eq!(DocValidation.next(FEATURE), Done);
+        let applicable = Phase::applicable(FEATURE);
+        assert!(!applicable.contains(&DesignMock) && !applicable.contains(&DesignReview));
+        assert!(applicable.contains(&Documentation));
+        assert_eq!(applicable.len(), 8);
+    }
+
+    #[test]
+    fn ui_feature_includes_everything() {
+        assert_eq!(Phase::first(UI_FEATURE), DesignMock);
+        assert_eq!(DesignSignoff.next(UI_FEATURE), Test);
+        assert_eq!(Test.next(UI_FEATURE), Documentation);
+        assert_eq!(Phase::applicable(UI_FEATURE).len(), 11);
+    }
+
+    #[test]
+    fn fix_skips_documentation_phases() {
+        assert_eq!(Phase::first(FIX), Architecture);
+        // Test → Deploy (Documentation skipped) → Done (Doc Validation skipped).
+        assert_eq!(Test.next(FIX), Deploy);
+        assert_eq!(Deploy.next(FIX), Done);
+        let applicable = Phase::applicable(FIX);
+        assert!(!applicable.contains(&Documentation) && !applicable.contains(&DocValidation));
         assert_eq!(applicable.len(), 6);
     }
 
     #[test]
-    fn ui_change_includes_all_design_phases() {
-        assert_eq!(Phase::first(true), DesignMock);
-        assert_eq!(DesignMock.next(true), Architecture);
-        assert_eq!(Architecture.next(true), DesignReview);
-        assert_eq!(DesignReview.next(true), SecurityPlan);
-        assert_eq!(SecurityCode.next(true), DesignSignoff);
-        assert_eq!(DesignSignoff.next(true), Test);
-        assert_eq!(Phase::applicable(true).len(), 9);
-    }
-
-    #[test]
     fn persona_and_tier_assignments() {
-        assert_eq!(Architecture.persona().name, "Architect");
-        assert_eq!(SecurityPlan.persona().name, "Security");
-        assert_eq!(Build.persona().name, "Builder");
-        assert_eq!(Test.persona().name, "Tester");
-        assert_eq!(DesignMock.persona().name, "Designer");
-        // Deep tier = Architecture + Design phases; execution/review = standard.
-        assert!(Architecture.is_deep());
-        assert!(DesignMock.is_deep());
-        assert!(DesignSignoff.is_deep());
-        assert!(!Build.is_deep());
-        assert!(!SecurityPlan.is_deep());
-        assert!(!Test.is_deep());
+        assert_eq!(Documentation.persona().name, "Documenter");
+        assert_eq!(DocValidation.persona().name, "Architect & Designer");
+        // Documenter is standard tier (cheap synthesis); Doc Validation is deep.
+        assert!(!Documentation.is_deep());
+        assert!(DocValidation.is_deep());
+        assert!(Documentation.requires_doc_check());
+        assert!(DocValidation.is_doc_validation());
     }
 }

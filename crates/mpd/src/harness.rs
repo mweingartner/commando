@@ -31,6 +31,9 @@ pub struct NextBrief {
     /// Optional fallback note (e.g. Claude's Opus fallback for Fable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_note: Option<String>,
+    /// Whether this phase is validated by two personas (Architect + Designer),
+    /// so the harness spawns both.
+    pub dual: bool,
     /// OpenSpec artifacts to produce this phase.
     pub artifacts: Vec<String>,
     /// Task guidance for the persona.
@@ -80,6 +83,7 @@ pub fn brief(change: &str, phase: Phase, harness: &str) -> NextBrief {
         persona: persona.name.to_string(),
         model,
         model_note,
+        dual: phase.is_doc_validation(),
         artifacts: personas::artifacts_for(phase)
             .iter()
             .map(|s| s.to_string())
@@ -127,6 +131,21 @@ pub fn render_claude_code(b: &NextBrief) -> String {
             b.label, b.change, b.guidance, b.gate_command
         );
     }
+    if b.dual {
+        return format!(
+            "▸ {label} — {change}\n\
+             Spawn TWO subagents in parallel (both model: {model}):\n\
+             - subagent_type: architect — functional/scope/technical accuracy\n\
+             - subagent_type: designer  — purpose/value/representation\n\n\
+             {guidance}\n\n\
+             PASS only if both confirm. Record: {cmd}\n",
+            label = b.label,
+            change = b.change,
+            model = model_line(b),
+            guidance = b.guidance,
+            cmd = b.gate_command,
+        );
+    }
     let artifacts = if b.artifacts.is_empty() {
         String::new()
     } else {
@@ -158,6 +177,23 @@ pub fn render_codex(b: &NextBrief) -> String {
         return format!(
             "▸ {} — {}\n  Handle in the current Codex session (no persona switch).\n\n  {}\n\n  When done: {}\n",
             b.label, b.change, b.guidance, b.gate_command
+        );
+    }
+    if b.dual {
+        return format!(
+            "▸ {label} — {change}\n\
+             Validate from BOTH lenses (Codex is single-agent — run each in turn,\n\
+             or a fresh `codex --model {model}` session per lens):\n\
+             - Architect lens: functional/scope/technical accuracy\n\
+             - Designer lens: purpose/value/representation\n\
+             - model: {model} (GPT-5.6 tier)\n\n\
+             {guidance}\n\n\
+             PASS only if both lenses confirm. Record: {cmd}\n",
+            label = b.label,
+            change = b.change,
+            model = b.model,
+            guidance = b.guidance,
+            cmd = b.gate_command,
         );
     }
     let artifacts = if b.artifacts.is_empty() {

@@ -94,7 +94,7 @@ fn full_pipeline_happy_path() {
          - **THEN** it works\n",
     );
 
-    // Walk every gate to PASS.
+    // Walk the core gates.
     for phase in [
         "architecture",
         "security-plan",
@@ -111,14 +111,43 @@ fn full_pipeline_happy_path() {
         );
     }
 
+    // A feature reaches the Documentation phase; the gate structurally checks
+    // the doc. The unfilled template stub (seeded at begin) must be refused.
+    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "documentation");
+    let bad = sb.mpd(&["gate", "documentation", "--pass"]);
+    assert!(
+        !bad.status.success(),
+        "documentation gate must reject the unfilled stub"
+    );
+    // Fill it in with all required sections.
+    sb.write(
+        "openspec/changes/add-thing/documentation.md",
+        "# Thing\n\n## Purpose\nDoes the thing.\n\n## Value\nUsers get the thing \
+         done quickly.\n\n## Scope\nCovers the thing; not the other thing.\n\n\
+         ## Functional details\nOn invoke it does the thing and returns ok.\n\n\
+         ## Usage\nWHEN invoked THEN it works.\n",
+    );
+    let out = sb.mpd(&["gate", "documentation", "--pass"]);
+    assert!(out.status.success(), "documentation gate: {}", stdout(&out));
+
+    // Deploy, then the two-lens Doc Validation.
+    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "deploy");
+    sb.mpd(&["gate", "deploy", "--pass"]);
+    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "doc-validation");
+    // Doc Validation spawns both Architect and Designer (deep tier).
+    let dv = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
+    assert_eq!(dv["persona"], "Architect & Designer");
+    assert_eq!(dv["dual"], true);
+    sb.mpd(&["gate", "doc-validation", "--pass"]);
+
     // Ready now.
     let s = json(&sb.mpd(&["status", "--json"]));
-    assert_eq!(s["phase"], "deploy");
     assert_eq!(s["ready_to_archive"], true);
 
-    // Dry-run archive does not move anything.
+    // Dry-run archive does not move anything and previews the doc fold-in.
     let out = sb.mpd(&["archive"]);
     assert!(stdout(&out).contains("Dry run"));
+    assert!(stdout(&out).contains("docs/add-thing.md"), "doc preview: {}", stdout(&out));
     assert!(sb.dir.join("openspec/changes/add-thing").is_dir());
 
     // Real archive.
@@ -128,6 +157,9 @@ fn full_pipeline_happy_path() {
     let merged = std::fs::read_to_string(sb.dir.join("openspec/specs/thing/spec.md")).unwrap();
     assert!(merged.contains("### Requirement: Thing works"));
     assert!(merged.starts_with("# Thing"));
+    // Documentation folded into the durable project docs directory.
+    let doc = std::fs::read_to_string(sb.dir.join("docs/add-thing.md")).unwrap();
+    assert!(doc.contains("## Usage") && doc.contains("Does the thing"));
     // Change moved to archive.
     assert!(!sb.dir.join("openspec/changes/add-thing").exists());
     let archive_entries: Vec<_> = std::fs::read_dir(sb.dir.join("openspec/changes/archive"))
@@ -209,7 +241,7 @@ fn archive_refuses_with_unmet_gates() {
 fn ui_change_walks_all_design_phases_via_binary() {
     let sb = Sandbox::new("ui-flow");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    let out = sb.mpd(&["begin", "pretty-thing", "--ui"]);
+    let out = sb.mpd(&["begin", "pretty-thing", "--ui", "--fix"]);
     assert!(out.status.success(), "begin --ui failed: {}", stdout(&out));
 
     // Starts at Design Mock, not Architecture.
@@ -304,7 +336,7 @@ fn gate_rejects_conflicting_verdict_flags() {
 fn conditional_pass_condition_blocks_archive_until_closed() {
     let sb = Sandbox::new("conditional");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    sb.mpd(&["begin", "risky-thing"]);
+    sb.mpd(&["begin", "risky-thing", "--fix"]);
     sb.write(
         "openspec/changes/risky-thing/specs/thing/spec.md",
         "## ADDED Requirements\n\n\
@@ -421,7 +453,7 @@ fn write_config_with_deploy(sb: &Sandbox, deploy: &str) {
 fn deploy_gate_runs_configured_deploy_command() {
     let sb = Sandbox::new("deploy-runs");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    sb.mpd(&["begin", "shippable"]);
+    sb.mpd(&["begin", "shippable", "--fix"]);
     write_thing_spec(&sb, "shippable");
     // A deploy command that leaves a marker in the project root (the gate CWD).
     write_config_with_deploy(&sb, "touch deployed.marker");
@@ -467,7 +499,7 @@ fn deploy_gate_runs_configured_deploy_command() {
 fn deploy_gate_refuses_when_deploy_command_fails() {
     let sb = Sandbox::new("deploy-fails");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    sb.mpd(&["begin", "broken-deploy"]);
+    sb.mpd(&["begin", "broken-deploy", "--fix"]);
     write_thing_spec(&sb, "broken-deploy");
     write_config_with_deploy(&sb, "false"); // a deploy that always fails
 
@@ -529,7 +561,7 @@ fn deploy_gate_records_readiness_when_no_deploy_configured() {
 fn resolve_cli_contract_and_all() {
     let sb = Sandbox::new("resolve-cli");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    sb.mpd(&["begin", "conds"]);
+    sb.mpd(&["begin", "conds", "--fix"]);
     write_thing_spec(&sb, "conds");
     sb.mpd(&["gate", "architecture", "--pass"]);
     // Two open conditions from a conditional security-plan pass.
@@ -621,6 +653,68 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
     sb.mpd(&["begin", "some-change"]);
     let after_begin = json(&sb.mpd(&["doctor", "--json"]));
     assert_eq!(after_begin["current_change"], "some-change");
+}
+
+/// Drive a fresh feature change to the Documentation phase.
+#[cfg(unix)]
+fn drive_to_documentation(sb: &Sandbox, change: &str) {
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", change]);
+    for p in ["architecture", "security-plan", "build", "security-code", "test"] {
+        let o = sb.mpd(&["gate", p, "--pass"]);
+        assert!(
+            o.status.success(),
+            "gate {p}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn documentation_gate_refuses_symlinked_doc() {
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new("doclink");
+    drive_to_documentation(&sb, "feat-a");
+    // Plant a secret outside and symlink the change's documentation.md at it.
+    let secret = sb.dir.join("outside_secret.txt");
+    std::fs::write(&secret, "TOP-SECRET-CONTENT").unwrap();
+    let doc = sb.dir.join("openspec/changes/feat-a/documentation.md");
+    let _ = std::fs::remove_file(&doc);
+    symlink(&secret, &doc).unwrap();
+    let out = sb.mpd(&["gate", "documentation", "--pass"]);
+    assert!(!out.status.success(), "must refuse a symlinked documentation.md");
+    // The symlinked target's content is never read/echoed.
+    assert!(!stdout(&out).contains("TOP-SECRET-CONTENT"));
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_refuses_symlinked_doc_target() {
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new("docfoldlink");
+    drive_to_documentation(&sb, "feat-b");
+    sb.write(
+        "openspec/changes/feat-b/documentation.md",
+        "# Feat B\n\n## Purpose\nDoes B.\n\n## Value\nUsers get B done.\n\n\
+         ## Scope\nCovers B, not C.\n\n## Functional details\nOn invoke it does \
+         B and returns ok every time.\n\n## Usage\nWHEN invoked THEN B.\n",
+    );
+    sb.mpd(&["gate", "documentation", "--pass"]);
+    sb.mpd(&["gate", "deploy", "--pass"]);
+    sb.mpd(&["gate", "doc-validation", "--pass"]);
+    // Plant a symlink at the docs target pointing outside the project.
+    let secret = sb.dir.join("outside_secret.txt");
+    std::fs::write(&secret, "DO NOT OVERWRITE").unwrap();
+    std::fs::create_dir_all(sb.dir.join("docs")).unwrap();
+    symlink(&secret, sb.dir.join("docs/feat-b.md")).unwrap();
+    let out = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "archive must refuse a symlinked doc target"
+    );
+    // The outside file was not overwritten.
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "DO NOT OVERWRITE");
 }
 
 #[test]

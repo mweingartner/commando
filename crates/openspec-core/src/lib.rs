@@ -37,7 +37,7 @@ pub use merge::{merge, MergeError, MergeStats};
 pub use model::{DeltaSpec, Issue, Removed, Rename, Requirement, Scenario, Severity, Spec};
 pub use names::{validate_capability_name, validate_change_name};
 pub use parse::{parse_delta, parse_spec, ParseError};
-pub use project::{ArchivePlan, Project, SpecUpdate, TaskStatus};
+pub use project::{assert_contained, read_capped, ArchivePlan, Project, SpecUpdate, TaskStatus};
 pub use render::{render_delta, render_spec};
 pub use schema::{Artifact, ChangeMeta, Schema, YamlError};
 pub use validate::{has_blocking, validate_delta, validate_spec};
