@@ -80,7 +80,8 @@ fn full_pipeline_happy_path() {
     // next: Architect / opus
     let n = json(&sb.mpd(&["next", "--json"]));
     assert_eq!(n["persona"], "Architect");
-    assert_eq!(n["model"], "opus");
+    // Generic harness reports the tier, not a concrete model.
+    assert_eq!(n["model"], "deep-cognition");
 
     // Author a delta spec so archive has something to merge.
     sb.write(
@@ -218,7 +219,8 @@ fn ui_change_walks_all_design_phases_via_binary() {
 
     let n = json(&sb.mpd(&["next", "--json"]));
     assert_eq!(n["persona"], "Designer");
-    assert_eq!(n["model"], "opus");
+    // Design phases are standard-tier (only Architecture is deep).
+    assert_eq!(n["model"], "standard");
 
     sb.write(
         "openspec/changes/pretty-thing/specs/thing/spec.md",
@@ -416,6 +418,40 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
     sb.mpd(&["begin", "some-change"]);
     let after_begin = json(&sb.mpd(&["doctor", "--json"]));
     assert_eq!(after_begin["current_change"], "some-change");
+}
+
+#[test]
+fn next_reports_harness_specific_models() {
+    let sb = Sandbox::new("models");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "add-x"]);
+
+    // Architecture is the deep-cognition tier.
+    let cc = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
+    assert_eq!(cc["persona"], "Architect");
+    assert_eq!(cc["model"], "Fable");
+    assert!(
+        cc["model_note"].as_str().unwrap_or("").contains("Opus"),
+        "claude deep tier must note the Opus fallback: {cc}"
+    );
+    let cx = json(&sb.mpd(&["next", "--harness", "codex", "--json"]));
+    assert_eq!(cx["model"], "Sol");
+
+    // Advance past Architecture (no test needed for that gate) to a standard phase.
+    sb.mpd(&["gate", "architecture", "--pass"]);
+    let cc2 = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
+    assert_eq!(cc2["persona"], "Security");
+    assert_eq!(cc2["model"], "Sonnet");
+    let cx2 = json(&sb.mpd(&["next", "--harness", "codex", "--json"]));
+    assert_eq!(cx2["model"], "Terra");
+
+    // The codex renderer produces codex-flavored text.
+    let text = stdout(&sb.mpd(&["next", "--harness", "codex"]));
+    assert!(text.contains("Codex"), "codex render: {text}");
+    assert!(
+        text.contains("Terra"),
+        "codex render must name the model: {text}"
+    );
 }
 
 #[test]

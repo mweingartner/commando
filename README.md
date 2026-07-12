@@ -59,7 +59,7 @@ crates/
     ledger         #   durable gate verdicts + evidence  (.mpd/state/<change>.json)
     checks         #   secret scan + test-count verification
     personas       #   per-phase briefs + model assignments
-    harness        #   `next` adapters (generic / claude-code)
+    harness        #   `next` adapters (generic / claude-code / codex) + model policy
     githooks       #   the pre-commit enforcement floor
     scaffold       #   init / begin
 ```
@@ -94,7 +94,7 @@ real OpenSpec fixtures and a fence-torture case.
 mpd init [--test <cmd>]      # scaffold openspec/ + mpd schema + install the commit gate
 mpd begin <name> [--ui]      # create a change and seed its pipeline ledger
 mpd status [--json]          # current phase, gate verdicts, archive readiness
-mpd next [--harness ...]     # emit the next persona's brief (generic | claude-code)
+mpd next [--harness ...]     # emit the next persona's brief (generic | claude-code | codex)
 mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C]
 mpd check [--staged]         # run secret scan (+ tests) now
 mpd archive [--yes]          # dry-run preview, then fold specs into the record & archive
@@ -162,14 +162,23 @@ verified false positive. When gitleaks is the active scanner it honors its own
 
 ## Phase → persona → model
 
-| Phase | Persona | Model | Skipped when |
-|---|---|---|---|
-| Design Mock / Review / Sign-off | Designer | opus | no UI/UX surface |
-| Architecture | Architect | opus | — |
-| Security (plan / code) | Security | sonnet | — |
-| Build | Builder | sonnet | — |
-| Test | Tester | sonnet | — |
-| Deploy | main session | — | — |
+The persona (role) is fixed; the **model is harness-specific**. Architecture is
+the deep-cognition "heavy lifting" tier; every other phase is standard. `mpd next
+--harness <h>` resolves the concrete model:
+
+| Phase | Persona | Tier | Claude Code | Codex |
+|---|---|---|---|---|
+| Design Mock / Review / Sign-off¹ | Designer | standard | Sonnet | Terra |
+| **Architecture** | Architect | **deep** | **Fable** (→ Opus if unavailable) | **Sol** |
+| Security (plan / code) | Security | standard | Sonnet | Terra |
+| Build | Builder | standard | Sonnet | Terra |
+| Test | Tester | standard | Sonnet | Terra |
+| Deploy | main session | — | — | — |
+
+¹ Design phases run only for `--ui` changes. Codex tiers are GPT-5.6 Sol / Terra
+/ Luna (deepest → lightest); Luna is available but unassigned by default. The
+`generic` harness reports the *tier* (`deep-cognition` / `standard`) rather than
+a concrete model.
 
 ## Build & test
 

@@ -48,7 +48,7 @@ enum Command {
         /// Change to advance (defaults to the current change).
         #[arg(long)]
         change: Option<String>,
-        /// Rendering: `generic` or `claude-code`.
+        /// Rendering: `generic`, `claude-code`, or `codex`.
         #[arg(long, default_value = "generic")]
         harness: String,
         /// Emit machine-readable JSON.
@@ -287,17 +287,18 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool) -> CmdResu
         );
         return Ok(0);
     }
-    let brief = harness::brief(&change, ledger.phase);
+    let brief = harness::brief(&change, ledger.phase, &harness_kind);
     if json {
         println!("{}", serde_json::to_string_pretty(&brief).unwrap());
         return Ok(0);
     }
     let rendered = match harness_kind.as_str() {
         "claude-code" => harness::render_claude_code(&brief),
+        "codex" => harness::render_codex(&brief),
         "generic" => harness::render_generic(&brief),
         other => {
             return Err(format!(
-                "unknown harness {other:?} (use generic|claude-code)"
+                "unknown harness {other:?} (use generic|claude-code|codex)"
             ))
         }
     };

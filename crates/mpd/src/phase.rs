@@ -50,13 +50,13 @@ pub const PIPELINE: [Phase; 9] = [
     Deploy,
 ];
 
-/// The persona responsible for a phase, and the model it must run under.
+/// The persona responsible for a phase. The *model* it runs under is
+/// harness-specific (Claude uses Fable/Sonnet, Codex uses Sol/Terra), so it is
+/// resolved by [`crate::harness::model_for`], not fixed here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Persona {
     /// Persona name (e.g. `Architect`).
     pub name: &'static str,
-    /// Mandatory model assignment (e.g. `opus`, `sonnet`).
-    pub model: &'static str,
 }
 
 impl Phase {
@@ -75,38 +75,25 @@ impl Phase {
         matches!(self, SecurityCode)
     }
 
-    /// The persona and model assignment for this phase.
+    /// The persona responsible for this phase.
     pub fn persona(self) -> Persona {
-        match self {
-            DesignMock | DesignReview | DesignSignoff => Persona {
-                name: "Designer",
-                model: "opus",
-            },
-            Architecture => Persona {
-                name: "Architect",
-                model: "opus",
-            },
-            SecurityPlan | SecurityCode => Persona {
-                name: "Security",
-                model: "sonnet",
-            },
-            Build => Persona {
-                name: "Builder",
-                model: "sonnet",
-            },
-            Test => Persona {
-                name: "Tester",
-                model: "sonnet",
-            },
-            Deploy => Persona {
-                name: "main-session",
-                model: "-",
-            },
-            Done => Persona {
-                name: "-",
-                model: "-",
-            },
-        }
+        let name = match self {
+            DesignMock | DesignReview | DesignSignoff => "Designer",
+            Architecture => "Architect",
+            SecurityPlan | SecurityCode => "Security",
+            Build => "Builder",
+            Test => "Tester",
+            Deploy => "main-session",
+            Done => "-",
+        };
+        Persona { name }
+    }
+
+    /// Whether this phase is the deep-cognition "heavy lifting" tier (only
+    /// Architecture). Deep phases get the strongest model per harness; all other
+    /// phases get the standard model.
+    pub fn is_deep(self) -> bool {
+        matches!(self, Architecture)
     }
 
     /// The CLI/serde slug (kebab-case) for this phase.
@@ -230,11 +217,16 @@ mod tests {
     }
 
     #[test]
-    fn model_assignments_are_fixed() {
-        assert_eq!(Architecture.persona().model, "opus");
-        assert_eq!(SecurityPlan.persona().model, "sonnet");
-        assert_eq!(Build.persona().model, "sonnet");
-        assert_eq!(Test.persona().model, "sonnet");
+    fn persona_and_tier_assignments() {
+        assert_eq!(Architecture.persona().name, "Architect");
+        assert_eq!(SecurityPlan.persona().name, "Security");
+        assert_eq!(Build.persona().name, "Builder");
+        assert_eq!(Test.persona().name, "Tester");
         assert_eq!(DesignMock.persona().name, "Designer");
+        // Only Architecture is the deep-cognition tier.
+        assert!(Architecture.is_deep());
+        assert!(!Build.is_deep());
+        assert!(!SecurityPlan.is_deep());
+        assert!(!DesignMock.is_deep());
     }
 }
