@@ -355,10 +355,13 @@ impl Project {
     pub fn commit_archive(&self, plan: &ArchivePlan) -> Result<()> {
         let specs_dir = self.specs_dir();
         for update in &plan.updates {
+            // Contain BEFORE creating or following any directory (so a symlinked
+            // intermediate component can't tunnel a mkdir outside the tree)...
+            assert_contained(&specs_dir, &update.target_path)?;
             if let Some(parent) = update.target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // Re-validate containment at write time: refuse to follow a symlink
+            // ...and again at write time (TOCTOU): refuse to follow a symlink
             // planted at specs/<cap>/ or specs/<cap>/spec.md.
             assert_contained(&specs_dir, &update.target_path)?;
             fs::write(&update.target_path, &update.content)?;
