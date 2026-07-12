@@ -89,18 +89,55 @@ A naive parser miscounts those as real structure. `mpd`'s parser treats a
 example above is preserved verbatim as body text. This is verified against the
 real OpenSpec fixtures and a fence-torture case.
 
+## Quickstart
+
+```bash
+# 1. Install (from a clone of this repo)
+cargo install --path crates/mpd          # → ~/.cargo/bin/mpd  (put it on PATH)
+
+# 2. Initialize a project (from its repo root)
+cd ~/my/project
+mpd init --test "cargo test"             # scaffolds openspec/, installs the commit gate
+# optionally set a deploy command:
+#   edit .mpd/config.json → {"test": "...", "deploy": "scripts/deploy.sh"}
+
+# 3. Start a change and let mpd drive
+mpd begin add-rate-limiter               # a feature (documented). --fix/--chore skip docs.
+mpd next --harness claude-code           # prints the phase's persona, model, task, gate cmd
+#   … do the work the brief describes …
+mpd gate architecture --pass --evidence design.md#conditions
+
+# 4. Walk the loop: next → work → gate, until archive-ready
+mpd status                               # where am I? what's blocking archive?
+mpd gate build --pass                    # re-runs `cargo test`; refuses without a real pass
+# …security-code, test, documentation, deploy, doc-validation…
+mpd resolve --all                        # close any CONDITIONAL-PASS conditions
+mpd archive                              # dry-run preview of the spec + doc merge
+mpd archive --yes                        # apply: fold specs → openspec/specs/, doc → docs/
+```
+
+The **motion** is always the same three beats — `mpd next` → do the work → `mpd
+gate <phase>` — so a human, Claude Code, or Codex all drive it identically.
+`mpd next` tells each what to do and which model to use.
+
 ## Commands
 
 ```
-mpd init [--test <cmd>]      # scaffold openspec/ + mpd schema + install the commit gate
-mpd begin <name> [--ui] [--fix|--chore]  # new change (--fix/--chore skip docs)
-mpd status [--json]          # current phase, gate verdicts, archive readiness
-mpd next [--harness ...]     # emit the next persona's brief (generic | claude-code | codex)
+mpd init [--test <cmd>]              # scaffold openspec/ + mpd schema + install the commit gate
+mpd begin <name> [--ui] [--fix|--chore]   # new change (--ui adds design phases; --fix/--chore skip docs)
+mpd status [--change N] [--json]    # current phase, gate verdicts, tasks, archive readiness
+mpd next [--harness ...] [--json]   # emit the next persona's brief (generic | claude-code | codex)
 mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C]
-mpd check [--staged]         # run secret scan (+ tests) now
-mpd archive [--yes]          # dry-run preview, then fold specs into the record & archive
-mpd doctor [--json]          # diagnose setup
+mpd resolve <n> | --all             # close open CONDITIONAL-PASS conditions (they block archive)
+mpd check [--staged]                # run the secret scan now (+ external scanners/tests unless --staged)
+mpd archive [--yes] [--skip-specs]  # dry-run preview, then fold specs + docs into the record & archive
+mpd doctor [--json]                 # diagnose setup (schema, hook, scanners, test/deploy cmd, allowlist)
 ```
+
+`--fix` (defect) and `--chore` (refactor/tooling/perf) mark non-functional
+changes: they skip the two Documentation phases. `--ui` adds the three Design
+phases. Neither flag bypasses a gate — they only change *which optional phases
+apply*.
 
 ## The gates are real, not self-reported
 
@@ -108,6 +145,12 @@ mpd doctor [--json]          # diagnose setup
   refuses PASS unless it exits zero **and** a non-zero pass count is observed —
   it cannot accept the caller's word.
 - **`mpd gate security-code --pass`** refuses PASS on any secret finding.
+- **`mpd gate documentation --pass`** refuses PASS unless `documentation.md`
+  exists and covers every required section (Purpose/Value/Scope/Functional/Usage)
+  with no unfilled placeholders — an empty stub can't pass.
+- **`mpd gate deploy --pass`** runs the configured `deploy` command (when set)
+  and refuses PASS if it exits non-zero, so deploy is a machine-enforced step
+  rather than a checkbox.
 - **`mpd archive`** refuses on any non-PASS gate or open condition, and previews
   what it will merge before doing it (dry-run unless `--yes`).
 - The **git `pre-commit` hook** re-runs the checks independently, so enforcement
@@ -207,6 +250,25 @@ At archive, the doc folds into a project subdirectory (default `docs/<name>.md`,
 configurable via `docs_dir`). Defect fixes (`--fix`) and non-functional chores
 (`--chore`) skip both phases — only changes that alter functional behavior are
 documented.
+
+## Driving it from an agent harness
+
+`mpd` is harness-agnostic. To make the motion automatic, add a short block to
+the file your agent reads — `AGENTS.md` (Codex, and the emerging standard) or
+`CLAUDE.md` (Claude Code) — telling it to drive changes through mpd:
+
+> For any non-trivial change: `mpd begin`, then loop `mpd next --harness <h>` → do
+> exactly what the brief says → `mpd gate <phase> --pass|--fail`, until
+> `mpd archive`. Author the OpenSpec artifacts under `openspec/changes/<name>/`
+> when a phase calls for them. Never bypass a FAIL gate or commit around the
+> pre-commit hook.
+
+`mpd next` then supplies each phase's persona, model, task, and gate command.
+Claude Code spawns each persona as a subagent on the model mpd names; Codex
+(single-agent) adopts each persona in turn, or runs a fresh `codex --model <t>`
+per phase. The git pre-commit hook enforces the secret gate regardless of which
+harness — or human — drives the commit, so the guarantee holds even for a
+harness that ignores mpd entirely.
 
 ## Build & test
 
