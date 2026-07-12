@@ -219,8 +219,13 @@ fn ui_change_walks_all_design_phases_via_binary() {
 
     let n = json(&sb.mpd(&["next", "--json"]));
     assert_eq!(n["persona"], "Designer");
-    // Design phases are standard-tier (only Architecture is deep).
-    assert_eq!(n["model"], "standard");
+    // Design phases are deep-tier (alongside Architecture).
+    assert_eq!(n["model"], "deep-cognition");
+    // And concretely per harness:
+    let cc = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
+    assert_eq!(cc["model"], "Fable");
+    let cx = json(&sb.mpd(&["next", "--harness", "codex", "--json"]));
+    assert_eq!(cx["model"], "Sol");
 
     sb.write(
         "openspec/changes/pretty-thing/specs/thing/spec.md",

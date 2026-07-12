@@ -4,10 +4,10 @@
 //! JSON. What differs per harness is (a) how a persona is run and (b) which
 //! model backs it. Model policy by tier:
 //!
-//! | Tier                | Claude Code            | Codex            |
-//! |---------------------|------------------------|------------------|
-//! | Deep (Architecture) | Fable (→ Opus fallback)| Sol (GPT-5.6)    |
-//! | Standard (others)   | Sonnet                 | Terra (GPT-5.6)  |
+//! | Tier                        | Claude Code            | Codex          |
+//! |-----------------------------|------------------------|----------------|
+//! | Deep (Design + Architecture)| Fable (→ Opus fallback)| Sol (GPT-5.6)  |
+//! | Standard (Security/Build/Test)| Sonnet               | Terra (GPT-5.6)|
 //!
 //! Luna (GPT-5.6, lightest) exists but is not assigned by default.
 

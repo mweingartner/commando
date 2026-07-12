@@ -162,13 +162,14 @@ verified false positive. When gitleaks is the active scanner it honors its own
 
 ## Phase → persona → model
 
-The persona (role) is fixed; the **model is harness-specific**. Architecture is
-the deep-cognition "heavy lifting" tier; every other phase is standard. `mpd next
+The persona (role) is fixed; the **model is harness-specific**. The
+judgment/creative planning phases — **Design and Architecture** — are the
+deep-cognition tier; the execution/review phases are standard. `mpd next
 --harness <h>` resolves the concrete model:
 
 | Phase | Persona | Tier | Claude Code | Codex |
 |---|---|---|---|---|
-| Design Mock / Review / Sign-off¹ | Designer | standard | Sonnet | Terra |
+| **Design Mock / Review / Sign-off**¹ | Designer | **deep** | **Fable** (→ Opus if unavailable) | **Sol** |
 | **Architecture** | Architect | **deep** | **Fable** (→ Opus if unavailable) | **Sol** |
 | Security (plan / code) | Security | standard | Sonnet | Terra |
 | Build | Builder | standard | Sonnet | Terra |

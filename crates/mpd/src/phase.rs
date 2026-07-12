@@ -89,11 +89,15 @@ impl Phase {
         Persona { name }
     }
 
-    /// Whether this phase is the deep-cognition "heavy lifting" tier (only
-    /// Architecture). Deep phases get the strongest model per harness; all other
-    /// phases get the standard model.
+    /// Whether this phase is the deep-cognition tier — the judgment/creative
+    /// planning phases (Architecture and the Design phases). Deep phases get the
+    /// strongest model per harness; execution/review phases (Security, Build,
+    /// Test) get the standard model.
     pub fn is_deep(self) -> bool {
-        matches!(self, Architecture)
+        matches!(
+            self,
+            Architecture | DesignMock | DesignReview | DesignSignoff
+        )
     }
 
     /// The CLI/serde slug (kebab-case) for this phase.
@@ -223,10 +227,12 @@ mod tests {
         assert_eq!(Build.persona().name, "Builder");
         assert_eq!(Test.persona().name, "Tester");
         assert_eq!(DesignMock.persona().name, "Designer");
-        // Only Architecture is the deep-cognition tier.
+        // Deep tier = Architecture + Design phases; execution/review = standard.
         assert!(Architecture.is_deep());
+        assert!(DesignMock.is_deep());
+        assert!(DesignSignoff.is_deep());
         assert!(!Build.is_deep());
         assert!(!SecurityPlan.is_deep());
-        assert!(!DesignMock.is_deep());
+        assert!(!Test.is_deep());
     }
 }
