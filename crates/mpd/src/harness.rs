@@ -11,6 +11,7 @@
 //!
 //! Luna (GPT-5.6, lightest) exists but is not assigned by default.
 
+use crate::config::Config;
 use crate::personas;
 use crate::phase::Phase;
 use serde::Serialize;
@@ -44,38 +45,68 @@ pub struct NextBrief {
     pub gate_command: String,
 }
 
-/// Resolve `(model, fallback_note)` for a phase under a harness. Deep-cognition
-/// phases (Architecture) get the strongest model; all others get the standard
-/// model. Deploy/Done run in the main session (no spawned model).
-pub fn model_for(harness: &str, phase: Phase) -> (String, Option<String>) {
+/// Resolve `(model, fallback_note)` for a phase under a harness. A per-persona
+/// entry in the project's `models` config wins; otherwise the built-in tier
+/// default applies (deep → fable/sol, standard → sonnet/terra). Deploy/Done run
+/// in the main session (no spawned model). A missing/partial config never breaks
+/// resolution — it degrades to the built-in default.
+pub fn model_for(cfg: &Config, harness: &str, phase: Phase) -> (String, Option<String>) {
     if matches!(phase, Phase::Deploy | Phase::Done) {
         return ("-".to_string(), None);
     }
-    let deep = phase.is_deep();
+    let persona = phase.persona().name;
+    let model = cfg
+        .model_for(harness, persona)
+        .map(str::to_string)
+        .unwrap_or_else(|| builtin_default(harness, phase.is_deep()).to_string());
+    let note = cfg
+        .model_fallback(&model)
+        .or_else(|| builtin_fallback(&model))
+        .map(|f| format!("fall back to {f} if unavailable"));
+    (model, note)
+}
+
+/// The built-in default model for a harness/tier when config is silent. The
+/// harness-neutral `generic` reports the tier name rather than a concrete model.
+fn builtin_default(harness: &str, deep: bool) -> &'static str {
     match harness {
-        "codex" => (if deep { "Sol" } else { "Terra" }.to_string(), None),
-        "claude-code" => {
+        "codex" => {
             if deep {
-                (
-                    "Fable".to_string(),
-                    Some("fall back to the latest Opus if Fable is unavailable".to_string()),
-                )
+                "sol"
             } else {
-                ("Sonnet".to_string(), None)
+                "terra"
             }
         }
-        // Harness-neutral: report the tier rather than a concrete model.
-        _ => (
-            if deep { "deep-cognition" } else { "standard" }.to_string(),
-            None,
-        ),
+        "claude-code" => {
+            if deep {
+                "fable"
+            } else {
+                "sonnet"
+            }
+        }
+        _ => {
+            if deep {
+                "deep-cognition"
+            } else {
+                "standard"
+            }
+        }
     }
 }
 
-/// Build the brief for `phase` of `change`, resolving the model for `harness`.
-pub fn brief(change: &str, phase: Phase, harness: &str) -> NextBrief {
+/// The built-in fallback for a model id when config declares none.
+fn builtin_fallback(model: &str) -> Option<&'static str> {
+    match model {
+        "fable" => Some("opus"),
+        _ => None,
+    }
+}
+
+/// Build the brief for `phase` of `change`, resolving the model for `harness`
+/// against the project `cfg`.
+pub fn brief(cfg: &Config, change: &str, phase: Phase, harness: &str) -> NextBrief {
     let persona = phase.persona();
-    let (model, model_note) = model_for(harness, phase);
+    let (model, model_note) = model_for(cfg, harness, phase);
     NextBrief {
         change: change.to_string(),
         phase: phase.slug().to_string(),
@@ -218,4 +249,131 @@ pub fn render_codex(b: &NextBrief) -> String {
         gate = b.gate,
         cmd = b.gate_command,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelMap;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn deploy_and_done_report_no_model() {
+        let cfg = Config::default();
+        assert_eq!(
+            model_for(&cfg, "claude-code", Phase::Deploy),
+            ("-".to_string(), None)
+        );
+        assert_eq!(
+            model_for(&cfg, "codex", Phase::Done),
+            ("-".to_string(), None)
+        );
+        // Even a harness the config knows nothing about degrades the same way.
+        assert_eq!(
+            model_for(&cfg, "generic", Phase::Deploy),
+            ("-".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn builtin_defaults_when_config_is_empty() {
+        let cfg = Config::default();
+        // Deep tier (Architecture).
+        assert_eq!(
+            model_for(&cfg, "claude-code", Phase::Architecture).0,
+            "fable"
+        );
+        assert_eq!(model_for(&cfg, "codex", Phase::Architecture).0, "sol");
+        assert_eq!(
+            model_for(&cfg, "generic", Phase::Architecture).0,
+            "deep-cognition"
+        );
+        // Standard tier (Build).
+        assert_eq!(model_for(&cfg, "claude-code", Phase::Build).0, "sonnet");
+        assert_eq!(model_for(&cfg, "codex", Phase::Build).0, "terra");
+        assert_eq!(model_for(&cfg, "generic", Phase::Build).0, "standard");
+    }
+
+    #[test]
+    fn fable_fallback_note_names_opus() {
+        let cfg = Config::default();
+        let (model, note) = model_for(&cfg, "claude-code", Phase::Architecture);
+        assert_eq!(model, "fable");
+        assert_eq!(
+            note.as_deref(),
+            Some("fall back to opus if unavailable"),
+            "the fable→opus fallback note must have exact wording"
+        );
+        // Sonnet (standard tier) has no built-in fallback.
+        let (model, note) = model_for(&cfg, "claude-code", Phase::Build);
+        assert_eq!(model, "sonnet");
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn builtin_default_covers_every_harness_and_tier() {
+        assert_eq!(builtin_default("claude-code", true), "fable");
+        assert_eq!(builtin_default("claude-code", false), "sonnet");
+        assert_eq!(builtin_default("codex", true), "sol");
+        assert_eq!(builtin_default("codex", false), "terra");
+        assert_eq!(builtin_default("generic", true), "deep-cognition");
+        assert_eq!(builtin_default("generic", false), "standard");
+        // Any harness-neutral / unrecognized name falls back to the tier label.
+        assert_eq!(
+            builtin_default("some-future-harness", true),
+            "deep-cognition"
+        );
+        assert_eq!(builtin_default("some-future-harness", false), "standard");
+    }
+
+    #[test]
+    fn builtin_fallback_is_fable_only() {
+        assert_eq!(builtin_fallback("fable"), Some("opus"));
+        assert_eq!(builtin_fallback("sonnet"), None);
+        assert_eq!(builtin_fallback("sol"), None);
+        assert_eq!(builtin_fallback("terra"), None);
+        assert_eq!(builtin_fallback(""), None);
+    }
+
+    proptest! {
+        /// Metamorphic: whatever a project config declares as a persona's model
+        /// id, once resolved through `model_for`, an id `Config::model_for`
+        /// rejects (unsafe charset, empty, or oversized) must never surface
+        /// verbatim into the resolved model or the rendered brief — it degrades
+        /// to the built-in default first. A valid id passes through unchanged.
+        #[test]
+        fn invalid_config_model_id_never_reaches_rendered_output(id in ".*") {
+            let mut persona_map = BTreeMap::new();
+            persona_map.insert("Architect".to_string(), id.clone());
+            let mut models = ModelMap::new();
+            models.insert("claude-code".to_string(), persona_map);
+            let cfg = Config { models, ..Config::default() };
+
+            // The config's own validity oracle defines "invalid" here.
+            let considered_valid = cfg.model_for("claude-code", "Architect").is_some();
+            let (model, _note) = model_for(&cfg, "claude-code", Phase::Architecture);
+
+            if considered_valid {
+                prop_assert_eq!(&model, &id);
+            } else {
+                prop_assert_eq!(
+                    model.as_str(),
+                    "fable",
+                    "a rejected id must degrade to the built-in deep default, not leak the raw id"
+                );
+                let b = brief(&cfg, "change", Phase::Architecture, "claude-code");
+                let rendered = render_claude_code(&b);
+                // Only the *model line* is the actual injection surface (a raw
+                // id could otherwise coincidentally match ordinary prose
+                // punctuation elsewhere in the guidance text).
+                if !id.is_empty() && id != "fable" {
+                    prop_assert!(
+                        !rendered.contains(&format!("model: {id}")),
+                        "a rejected model id must never surface on the rendered model line"
+                    );
+                }
+            }
+        }
+    }
 }

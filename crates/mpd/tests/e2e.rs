@@ -265,9 +265,9 @@ fn ui_change_walks_all_design_phases_via_binary() {
     assert_eq!(n["model"], "deep-cognition");
     // And concretely per harness:
     let cc = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
-    assert_eq!(cc["model"], "Fable");
+    assert_eq!(cc["model"], "fable");
     let cx = json(&sb.mpd(&["next", "--harness", "codex", "--json"]));
-    assert_eq!(cx["model"], "Sol");
+    assert_eq!(cx["model"], "sol");
 
     sb.write(
         "openspec/changes/pretty-thing/specs/thing/spec.md",
@@ -750,29 +750,86 @@ fn next_reports_harness_specific_models() {
     // Architecture is the deep-cognition tier.
     let cc = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
     assert_eq!(cc["persona"], "Architect");
-    assert_eq!(cc["model"], "Fable");
+    assert_eq!(cc["model"], "fable");
     assert!(
-        cc["model_note"].as_str().unwrap_or("").contains("Opus"),
+        cc["model_note"].as_str().unwrap_or("").contains("opus"),
         "claude deep tier must note the Opus fallback: {cc}"
     );
     let cx = json(&sb.mpd(&["next", "--harness", "codex", "--json"]));
-    assert_eq!(cx["model"], "Sol");
+    assert_eq!(cx["model"], "sol");
 
     // Advance past Architecture (no test needed for that gate) to a standard phase.
     sb.mpd(&["gate", "architecture", "--pass"]);
     let cc2 = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
     assert_eq!(cc2["persona"], "Security");
-    assert_eq!(cc2["model"], "Sonnet");
+    assert_eq!(cc2["model"], "sonnet");
     let cx2 = json(&sb.mpd(&["next", "--harness", "codex", "--json"]));
-    assert_eq!(cx2["model"], "Terra");
+    assert_eq!(cx2["model"], "terra");
 
     // The codex renderer produces codex-flavored text.
     let text = stdout(&sb.mpd(&["next", "--harness", "codex"]));
     assert!(text.contains("Codex"), "codex render: {text}");
     assert!(
-        text.contains("Terra"),
+        text.contains("terra"),
         "codex render must name the model: {text}"
     );
+}
+
+#[test]
+fn next_full_inlines_directive_and_warns_on_divergence() {
+    let sb = Sandbox::new("next-full");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "add-y"]);
+
+    // At Architecture, --full inlines the bundled Architect directive verbatim
+    // and the bundled-copy path must not warn about divergence.
+    let out = sb.mpd(&["next", "--harness", "claude-code", "--full"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("───── directive: Architect ─────"),
+        "full text must inline the directive under a labeled section: {text}"
+    );
+    let bundled_architect =
+        std::fs::read_to_string(sb.dir.join(".mpd/directives/personas/architect.md")).unwrap();
+    assert!(
+        text.contains(bundled_architect.trim()),
+        "the full directive text must be inlined verbatim"
+    );
+    assert!(
+        !text.contains("differs from the bundled default"),
+        "an unmodified bundled directive must not trigger the divergence warning: {text}"
+    );
+
+    // The --json shape carries the same information structurally.
+    let j = json(&sb.mpd(&["next", "--harness", "claude-code", "--json", "--full"]));
+    let directives = j["directives"].as_array().unwrap();
+    assert_eq!(directives.len(), 1);
+    assert_eq!(directives[0]["persona"], "Architect");
+    assert_eq!(directives[0]["modified"], false);
+    assert!(directives[0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Persona: Architect"));
+
+    // Without --full, no directive text or section is inlined.
+    let plain = stdout(&sb.mpd(&["next", "--harness", "claude-code"]));
+    assert!(!plain.contains("───── directive:"));
+
+    // Now diverge the project copy: --full must warn before inlining it.
+    sb.write(
+        ".mpd/directives/personas/architect.md",
+        "# CUSTOM ARCHITECT OVERRIDE\n",
+    );
+    let out = sb.mpd(&["next", "--harness", "claude-code", "--full"]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("differs from the bundled default"),
+        "a divergent project directive must trigger the warning: {text}"
+    );
+    assert!(text.contains("# CUSTOM ARCHITECT OVERRIDE"));
+
+    let j = json(&sb.mpd(&["next", "--harness", "claude-code", "--json", "--full"]));
+    assert_eq!(j["directives"][0]["modified"], true);
 }
 
 #[test]

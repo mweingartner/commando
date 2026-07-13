@@ -1,0 +1,86 @@
+{
+  "change": "bundle-directives-configurable-models",
+  "schema": "mpd",
+  "ui": false,
+  "kind": "feature",
+  "phase": "done",
+  "gates": {
+    "architecture": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "design.md#conditions-for-builder",
+      "at": "2026-07-13"
+    },
+    "security-plan": {
+      "verdict": "conditional-pass",
+      "by": "Security",
+      "evidence": "design.md#conditions-for-builder",
+      "at": "2026-07-13"
+    },
+    "build": {
+      "verdict": "pass",
+      "by": "Builder",
+      "evidence": "cargo test --workspace: 45 unit + 19 e2e green; clippy -D warnings clean; directives.rs/config.rs/harness.rs/scaffold.rs/cli.rs implemented per plan",
+      "checks": {
+        "tests_passed": 134,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-13"
+    },
+    "security-code": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "Security(code) PASS: 3 plan conditions SATISFIED; Medium (Config::save intrinsic guard) fixed+re-reviewed PASS; is_installed symlink fix. 5 secret findings were self-scan false positives in the scanner's own source (checks/secrets.rs detection patterns + negative-test fixtures) — allowlisted via version-controlled .mpd/secret-allowlist.json.",
+      "checks": {
+        "secrets_clean": true,
+        "scanner": "builtin+gitleaks"
+      },
+      "at": "2026-07-13"
+    },
+    "test": {
+      "verdict": "pass",
+      "by": "Tester",
+      "evidence": "cargo test --workspace: 154 tests all green (mpd 59 unit + 20 e2e; openspec-core suites). Added proptest metamorphic (valid_model_id/model_for injection), directive precedence + oversized-fallback, e2e next --full inlining/divergence-warning. clippy -D warnings clean; fmt clean.",
+      "checks": {
+        "tests_passed": 149,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-13"
+    },
+    "documentation": {
+      "verdict": "pass",
+      "by": "Documenter",
+      "evidence": "openspec/changes/bundle-directives-configurable-models/documentation.md — Purpose/Value/Scope/Functional/Usage; example-driven, bound to code (default_models snippet, cli.rs warning text).",
+      "at": "2026-07-13"
+    },
+    "deploy": {
+      "verdict": "pass",
+      "by": "main-session",
+      "evidence": "/Users/mweingar/dev/commando/openspec/changes/archive/2026-07-13-bundle-directives-configurable-models",
+      "at": "2026-07-13"
+    },
+    "doc-validation": {
+      "verdict": "pass",
+      "by": "Architect & Designer",
+      "evidence": "Architect + Designer lenses both CONDITIONAL PASS on same 3 Usage-example doc-vs-code defects; Documenter revised: (1) removed generic-only 'Next phase:' prefix from both claude-code examples, (2) flush-left brief body, (3) alphabetical BTreeMap persona-key order in seeded config. Re-verified against harness.rs/config.rs — now accurate. Purpose/Value/Scope/Functional/Security-invariants/tier-table/divergence-string/doctor-block confirmed accurate.",
+      "at": "2026-07-13"
+    }
+  },
+  "conditions": [
+    {
+      "text": "Builder: add a dangling-symlink WRITE test for directive install + seeded config.json (refuse, not follow)",
+      "owner": "Security",
+      "closed": true
+    },
+    {
+      "text": "Builder: add Config::load symlink-refusal + model-id charset-rejection unit tests",
+      "owner": "Security",
+      "closed": true
+    },
+    {
+      "text": "Security(code): verify write-path symlink guard, Config::load read_capped, and model-id charset check in code",
+      "owner": "Security",
+      "closed": true
+    }
+  ]
+}

@@ -60,6 +60,10 @@ enum Command {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+        /// Inline the persona's full directive (from `.mpd/directives/`, else the
+        /// bundled default) so the brief is self-sufficient.
+        #[arg(long)]
+        full: bool,
     },
     /// Record a gate verdict (runs deterministic checks for enforcement phases).
     Gate {
@@ -144,7 +148,8 @@ pub fn run() -> i32 {
             change,
             harness,
             json,
-        } => cmd_next(change, harness, json),
+            full,
+        } => cmd_next(change, harness, json, full),
         Command::Gate {
             phase,
             change,
@@ -313,7 +318,7 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     Ok(0)
 }
 
-fn cmd_next(change: Option<String>, harness_kind: String, json: bool) -> CmdResult {
+fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
@@ -323,11 +328,38 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool) -> CmdResu
         );
         return Ok(0);
     }
-    let brief = harness::brief(&change, ledger.phase, &harness_kind);
+    let cfg = Config::load(&root);
+    let brief = harness::brief(&cfg, &change, ledger.phase, &harness_kind);
+
+    // With --full, resolve the phase persona's directive(s). A composite persona
+    // (Doc Validation = "Architect & Designer") resolves its parts.
+    let directives: Vec<(String, crate::directives::Directive)> = if full {
+        let names: Vec<&str> = if ledger.phase.is_doc_validation() {
+            vec!["Architect", "Designer"]
+        } else {
+            vec![brief.persona.as_str()]
+        };
+        names
+            .into_iter()
+            .filter_map(|n| crate::directives::for_persona(&root, n).map(|d| (n.to_string(), d)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&brief).unwrap());
+        let mut v = serde_json::to_value(&brief).unwrap();
+        if full {
+            let arr: Vec<_> = directives
+                .iter()
+                .map(|(p, d)| serde_json::json!({"persona": p, "modified": d.modified, "text": d.text}))
+                .collect();
+            v["directives"] = serde_json::json!(arr);
+        }
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
     }
+
     let rendered = match harness_kind.as_str() {
         "claude-code" => harness::render_claude_code(&brief),
         "codex" => harness::render_codex(&brief),
@@ -339,6 +371,15 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool) -> CmdResu
         }
     };
     print!("{rendered}");
+    for (persona, d) in &directives {
+        if d.modified {
+            println!(
+                "\n⚠  project directive for {persona} differs from the bundled default — \
+                 review it before trusting it, especially at Security/Build phases."
+            );
+        }
+        println!("\n───── directive: {persona} ─────\n{}", d.text);
+    }
     Ok(0)
 }
 
@@ -792,12 +833,17 @@ fn cmd_doctor(json: bool) -> CmdResult {
         .as_ref()
         .map(|r| r.join("openspec/schemas/mpd/schema.yaml").is_file())
         .unwrap_or(false);
+    let directives_ok = root
+        .as_ref()
+        .map(|r| crate::directives::is_installed(r))
+        .unwrap_or(false);
 
     if json {
         let v = serde_json::json!({
             "project_root": root.as_ref().map(|r| r.display().to_string()),
             "openspec_present": root.is_some(),
             "mpd_schema_installed": schema_ok,
+            "directives_installed": directives_ok,
             "git_repo": git,
             "pre_commit_hook": hook,
             "secret_scanner_floor": "builtin",
@@ -819,6 +865,7 @@ fn cmd_doctor(json: bool) -> CmdResult {
         None => println!("  project root:        (none — run `mpd init`)"),
     }
     println!("  mpd schema:          {}", yn(schema_ok));
+    println!("  directives:          {}", yn(directives_ok));
     println!("  git repo:            {}", yn(git));
     println!("  pre-commit gate:     {}", yn(hook));
     println!("  secret scanner:      builtin (always-on floor)");

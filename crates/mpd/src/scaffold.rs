@@ -91,16 +91,31 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
     write_new(&openspec.join("project.md"), PROJECT_MD, root, &mut report)?;
     write_new(&openspec.join("AGENTS.md"), AGENTS_MD, root, &mut report)?;
 
-    // .mpd config.
+    // .mpd config, with the per-persona model map seeded explicitly.
     mkdir(ledger::mpd_dir(root).join("state"), &mut report)?;
+    let (models, model_fallbacks) = crate::config::default_models();
     let cfg = Config {
         test: test_cmd,
         deploy: None,
         docs_dir: None,
+        models,
+        model_fallbacks,
     };
-    if !crate::config::config_path(root).exists() {
+    let cfg_path = crate::config::config_path(root);
+    if !cfg_path.exists() {
+        openspec_core::assert_contained(root, &cfg_path).map_err(io::Error::other)?;
         cfg.save(root)?;
         report.created.push(".mpd/config.json".to_string());
+    }
+
+    // Install the bundled MPD doctrine directives (non-destructive).
+    for (rel, content) in crate::directives::bundled() {
+        write_new(
+            &ledger::mpd_dir(root).join("directives").join(rel),
+            content,
+            root,
+            &mut report,
+        )?;
     }
 
     // git hook.
@@ -157,9 +172,14 @@ pub fn begin(root: &Path, change: &str, ui: bool, kind: ChangeKind) -> io::Resul
 
 fn write_new(path: &Path, content: &str, root: &Path, report: &mut InitReport) -> io::Result<()> {
     if !path.exists() {
+        // `exists()` follows symlinks, so a *dangling* symlink reads as absent —
+        // writing would then follow it to an arbitrary target. Refuse any symlink
+        // (target or intermediate component) before creating dirs or writing.
+        openspec_core::assert_contained(root, path).map_err(io::Error::other)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        openspec_core::assert_contained(root, path).map_err(io::Error::other)?;
         std::fs::write(path, content)?;
         report.created.push(display_rel(root, path));
     }
@@ -193,5 +213,26 @@ mod tests {
         assert!(validate_change_name("add--thing").is_err()); // double dash
         assert!(validate_change_name("add-thing-").is_err()); // trailing dash
         assert!(validate_change_name("add thing").is_err()); // space
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_refuses_dangling_symlink() {
+        use super::{write_new, InitReport};
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("mpd-write-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A dangling symlink reads as absent to `exists()`; a naive write would
+        // follow it to `target` (outside the project). write_new must refuse.
+        let target = root.join("target-outside");
+        let link = root.join("directives").join("protocol.md");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+        let mut report = InitReport::default();
+        let err = write_new(&link, "DOCTRINE", &root, &mut report).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(!target.exists(), "must not create the symlink target");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

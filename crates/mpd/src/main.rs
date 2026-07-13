@@ -11,6 +11,7 @@ mod allowlist;
 mod checks;
 mod cli;
 mod config;
+mod directives;
 mod githooks;
 mod harness;
 mod ledger;
