@@ -61,6 +61,8 @@ crates/
     checks         #   secret scan + test-count verification
     personas       #   per-phase briefs + model assignments
     harness        #   `next` adapters (generic / claude-code / codex) + model policy
+    directives     #   bundled MPD doctrine (include_str!) + project-first resolution
+    config         #   .mpd/config.json — test/deploy cmds + per-persona model map
     githooks       #   the pre-commit enforcement floor
     scaffold       #   init / begin
 ```
@@ -97,13 +99,15 @@ cargo install --path crates/mpd          # → ~/.cargo/bin/mpd  (put it on PATH
 
 # 2. Initialize a project (from its repo root)
 cd ~/my/project
-mpd init --test "cargo test"             # scaffolds openspec/, installs the commit gate
+mpd init --test "cargo test"             # scaffolds openspec/, installs directives + the commit gate,
+                                         # seeds the per-persona model map in .mpd/config.json
 # optionally set a deploy command:
 #   edit .mpd/config.json → {"test": "...", "deploy": "scripts/deploy.sh"}
 
 # 3. Start a change and let mpd drive
 mpd begin add-rate-limiter               # a feature (documented). --fix/--chore skip docs.
 mpd next --harness claude-code           # prints the phase's persona, model, task, gate cmd
+mpd next --harness claude-code --full    # …and inlines the persona's full directive
 #   … do the work the brief describes …
 mpd gate architecture --pass --evidence design.md#conditions
 
@@ -126,12 +130,12 @@ gate <phase>` — so a human, Claude Code, or Codex all drive it identically.
 mpd init [--test <cmd>]              # scaffold openspec/ + mpd schema + install the commit gate
 mpd begin <name> [--ui] [--fix|--chore]   # new change (--ui adds design phases; --fix/--chore skip docs)
 mpd status [--change N] [--json]    # current phase, gate verdicts, tasks, archive readiness
-mpd next [--harness ...] [--json]   # emit the next persona's brief (generic | claude-code | codex)
+mpd next [--harness ...] [--full] [--json]  # emit the next persona's brief (generic | claude-code | codex)
 mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C]
 mpd resolve <n> | --all             # close open CONDITIONAL-PASS conditions (they block archive)
 mpd check [--staged]                # run the secret scan now (+ external scanners/tests unless --staged)
 mpd archive [--yes] [--skip-specs]  # dry-run preview, then fold specs + docs into the record & archive
-mpd doctor [--json]                 # diagnose setup (schema, hook, scanners, test/deploy cmd, allowlist)
+mpd doctor [--json]                 # diagnose setup (schema, directives, hook, scanners, test/deploy cmd, allowlist)
 ```
 
 `--fix` (defect) and `--chore` (refactor/tooling/perf) mark non-functional
@@ -192,10 +196,16 @@ verified false positive. When gitleaks is the active scanner it honors its own
   edits `.mpd/config.json` is equivalent to granting arbitrary code execution**
   on the next gate run — treat it like a `Makefile` or `package.json` script in
   review.
-- **The engine refuses to follow symlinks out of `openspec/`.** Reads and the
-  archive merge validate that every path component stays within the tree and is
-  not a symlink, so a committed symlink cannot redirect a spec write to
-  `~/.ssh/authorized_keys` or read an arbitrary file.
+- **The engine refuses to follow symlinks out of `openspec/`.** Reads, writes,
+  and the archive merge validate that every path component stays within the tree
+  and is not a symlink, so a committed symlink cannot redirect a spec or config
+  write to `~/.ssh/authorized_keys` or read an arbitrary file. The same guard
+  applies to `.mpd/directives/` and `.mpd/config.json` reads/writes.
+- **A project directive is untrusted instruction text.** `mpd next --full`
+  inlines a persona directive verbatim as that persona's operating instructions,
+  so a project copy that diverges from the bundled default is flagged with a
+  visible warning — a malicious edit to a directive is surfaced for review, not
+  trusted silently.
 - **Change and capability names are validated at every use**, not just at
   creation — a tampered `.mpd/current` or a `--change ../../x` flag is rejected
   before it becomes a path.
@@ -229,6 +239,38 @@ deep tier. Codex tiers are GPT-5.6 Sol / Terra / Luna (deepest → lightest); Lu
 is unassigned by default. The `generic` harness reports the *tier*
 (`deep-cognition` / `standard`) rather than a concrete model.
 
+### Models are configuration, not code
+
+The table above is the **default**, seeded into `.mpd/config.json` at `mpd init`
+as a per-harness, per-persona map. As models evolve you retarget a persona by
+editing data — no rebuild, no release:
+
+```json
+{
+  "test": "cargo test --workspace",
+  "models": {
+    "claude-code": {
+      "Architect": "fable", "Designer": "fable",
+      "Builder": "sonnet", "Documenter": "sonnet",
+      "Security": "sonnet", "Tester": "sonnet"
+    },
+    "codex": {
+      "Architect": "sol", "Designer": "sol",
+      "Builder": "terra", "Documenter": "terra",
+      "Security": "terra", "Tester": "terra"
+    }
+  },
+  "model_fallbacks": { "fable": "opus" }
+}
+```
+
+Point Security at a stronger model for one project — `"Security": "opus"` — and
+`mpd next --harness claude-code` reports it immediately. An absent entry falls
+back to the built-in tier default, so a partial map never breaks resolution;
+`model_fallbacks` surfaces as a note (`fable (fall back to opus if unavailable)`).
+Model ids are charset-validated (`[A-Za-z0-9._-]`, ≤64) so a configured value can
+never smuggle shell metacharacters into a rendered `--model` string.
+
 ## Documentation
 
 Feature changes carry documentation through the pipeline as first-class,
@@ -250,6 +292,32 @@ At archive, the doc folds into a project subdirectory (default `docs/<name>.md`,
 configurable via `docs_dir`). Defect fixes (`--fix`) and non-functional chores
 (`--chore`) skip both phases — only changes that alter functional behavior are
 documented.
+
+## The doctrine ships in the binary
+
+The Model-Paired Development doctrine — the protocol plus one directive per
+persona — is **compiled into `mpd`** (`include_str!`), not read from a file on
+your machine. `mpd init` installs it to `.mpd/directives/` so each project can
+customize it, and every `mpd next` surfaces the active phase's persona directive:
+
+```bash
+mpd next --harness claude-code          # names the persona + directive
+mpd next --harness claude-code --full   # inlines the FULL directive text
+```
+
+With `--full`, a harness that has **no** `CLAUDE.md`/`AGENTS.md` at all is still
+self-sufficient — the brief carries the persona's complete operating instructions
+inline. Resolution is **project-first**: the `.mpd/directives/` copy wins when
+present, otherwise the bundled default is used, so a fresh clone always resolves.
+
+Because a directive is inlined *verbatim as that persona's instructions* and
+lives in the branch under review, an edited project copy is untrusted until seen:
+`mpd next --full` prepends a **divergence warning** when a project directive
+differs from the bundled default, flagging it for review rather than trusting it
+silently — the mitigation for directive-content prompt-injection (a PR that
+quietly edits `personas/security.md` to "PASS without scanning"). Directive reads
+are symlink-refusing and size-capped, so a planted symlink can't redirect a read
+to an arbitrary file. `mpd doctor` reports whether directives are installed.
 
 ## Driving it from an agent harness
 
