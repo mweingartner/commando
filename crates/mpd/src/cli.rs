@@ -244,7 +244,10 @@ fn cmd_begin(name: String, ui: bool, fix: bool, chore: bool) -> CmdResult {
         ledger.phase.label()
     );
     if !kind.documents() {
-        println!("  (Documentation phases skipped for a {} change.)", kind.label());
+        println!(
+            "  (Documentation phases skipped for a {} change.)",
+            kind.label()
+        );
     }
     println!("Next: mpd next");
     Ok(0)
@@ -468,8 +471,9 @@ fn cmd_gate(
                         outcome.command
                     )));
                 }
-                checks_summary.get_or_insert_with(CheckSummary::default).command =
-                    Some(outcome.command);
+                checks_summary
+                    .get_or_insert_with(CheckSummary::default)
+                    .command = Some(outcome.command);
             }
         }
     }
@@ -566,7 +570,9 @@ fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdRe
 
     match (index, all) {
         (Some(_), true) => return Err("specify a condition number or --all, not both".into()),
-        (None, false) => return Err("specify a condition number (see `mpd status`) or --all".into()),
+        (None, false) => {
+            return Err("specify a condition number (see `mpd status`) or --all".into())
+        }
         (Some(i), false) => {
             ledger.close_condition(i)?;
             println!("Closed condition #{i}.");
@@ -773,7 +779,10 @@ fn cmd_doctor(json: bool) -> CmdResult {
     let gitleaks = checks::tool_available("gitleaks");
     let semgrep = checks::tool_available("semgrep");
     let test_cmd = root.as_ref().map(|r| Config::load(r).test).unwrap_or(None);
-    let deploy_cmd = root.as_ref().map(|r| Config::load(r).deploy).unwrap_or(None);
+    let deploy_cmd = root
+        .as_ref()
+        .map(|r| Config::load(r).deploy)
+        .unwrap_or(None);
     let allow_entries = root.as_ref().map_or(0, |r| {
         let al = crate::allowlist::Allowlist::load(r);
         al.paths.len() + al.allow.len()

@@ -113,7 +113,10 @@ fn full_pipeline_happy_path() {
 
     // A feature reaches the Documentation phase; the gate structurally checks
     // the doc. The unfilled template stub (seeded at begin) must be refused.
-    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "documentation");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "documentation"
+    );
     let bad = sb.mpd(&["gate", "documentation", "--pass"]);
     assert!(
         !bad.status.success(),
@@ -133,7 +136,10 @@ fn full_pipeline_happy_path() {
     // Deploy, then the two-lens Doc Validation.
     assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "deploy");
     sb.mpd(&["gate", "deploy", "--pass"]);
-    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "doc-validation");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "doc-validation"
+    );
     // Doc Validation spawns both Architect and Designer (deep tier).
     let dv = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
     assert_eq!(dv["persona"], "Architect & Designer");
@@ -147,7 +153,11 @@ fn full_pipeline_happy_path() {
     // Dry-run archive does not move anything and previews the doc fold-in.
     let out = sb.mpd(&["archive"]);
     assert!(stdout(&out).contains("Dry run"));
-    assert!(stdout(&out).contains("docs/add-thing.md"), "doc preview: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("docs/add-thing.md"),
+        "doc preview: {}",
+        stdout(&out)
+    );
     assert!(sb.dir.join("openspec/changes/add-thing").is_dir());
 
     // Real archive.
@@ -443,9 +453,7 @@ fn write_thing_spec(sb: &Sandbox, change: &str) {
 fn write_config_with_deploy(sb: &Sandbox, deploy: &str) {
     sb.write(
         ".mpd/config.json",
-        &format!(
-            "{{\n  \"test\": {PASSING_TEST_CMD:?},\n  \"deploy\": {deploy:?}\n}}\n"
-        ),
+        &format!("{{\n  \"test\": {PASSING_TEST_CMD:?},\n  \"deploy\": {deploy:?}\n}}\n"),
     );
 }
 
@@ -486,9 +494,10 @@ fn deploy_gate_runs_configured_deploy_command() {
     // Ready to archive, and the deploy command is recorded as evidence.
     let s = json(&sb.mpd(&["status", "--json"]));
     assert_eq!(s["ready_to_archive"], true, "{s}");
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(sb.dir.join(".mpd/state/shippable.json")).unwrap())
-            .unwrap();
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/shippable.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         state["gates"]["deploy"]["checks"]["command"], "touch deployed.marker",
         "deploy command must be recorded as gate evidence: {state}"
@@ -584,7 +593,10 @@ fn resolve_cli_contract_and_all() {
     assert!(!out.status.success(), "index + --all must be rejected");
     assert!(String::from_utf8_lossy(&out.stderr).contains("not both"));
     let out = sb.mpd(&["resolve"]);
-    assert!(!out.status.success(), "no index and no --all must be rejected");
+    assert!(
+        !out.status.success(),
+        "no index and no --all must be rejected"
+    );
     assert!(String::from_utf8_lossy(&out.stderr).contains("--all"));
     // Out-of-range index is rejected and mutates nothing.
     let out = sb.mpd(&["resolve", "9"]);
@@ -660,7 +672,13 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
 fn drive_to_documentation(sb: &Sandbox, change: &str) {
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", change]);
-    for p in ["architecture", "security-plan", "build", "security-code", "test"] {
+    for p in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+    ] {
         let o = sb.mpd(&["gate", p, "--pass"]);
         assert!(
             o.status.success(),
@@ -683,7 +701,10 @@ fn documentation_gate_refuses_symlinked_doc() {
     let _ = std::fs::remove_file(&doc);
     symlink(&secret, &doc).unwrap();
     let out = sb.mpd(&["gate", "documentation", "--pass"]);
-    assert!(!out.status.success(), "must refuse a symlinked documentation.md");
+    assert!(
+        !out.status.success(),
+        "must refuse a symlinked documentation.md"
+    );
     // The symlinked target's content is never read/echoed.
     assert!(!stdout(&out).contains("TOP-SECRET-CONTENT"));
 }
@@ -714,7 +735,10 @@ fn archive_refuses_symlinked_doc_target() {
         "archive must refuse a symlinked doc target"
     );
     // The outside file was not overwritten.
-    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "DO NOT OVERWRITE");
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "DO NOT OVERWRITE"
+    );
 }
 
 #[test]
