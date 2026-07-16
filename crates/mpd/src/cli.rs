@@ -264,8 +264,11 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
     let project = Project::new(&root);
     let tasks = project.task_status(&change).unwrap_or_default();
-    let reasons = ledger.blocking_reasons();
-    let ready = ledger.ready_to_archive();
+    // Readiness = the ledger's gate/condition reasons PLUS unfilled core-artifact
+    // stubs (which `mpd archive` also refuses), so status and archive agree.
+    let mut reasons = ledger.blocking_reasons();
+    reasons.extend(artifact_stub_issues(&project, &change));
+    let ready = reasons.is_empty();
 
     if json {
         let gates: serde_json::Map<String, serde_json::Value> = ledger
@@ -286,6 +289,7 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
             "tasks": { "done": tasks.done, "total": tasks.total },
             "ready_to_archive": ready,
             "blocking_reasons": reasons,
+            "history": serde_json::to_value(&ledger.history).unwrap_or(serde_json::Value::Null),
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
@@ -306,6 +310,27 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
         };
         println!("  [{marker}] {}", phase.label());
     }
+
+    // Verdict history: when any phase was recorded more than once (e.g. a FAIL
+    // later re-recorded PASS), show the full ordered trail so the catch stays
+    // visible instead of being hidden behind the latest green stamp.
+    if ledger.history.len() > ledger.gates.len() {
+        println!("\nGate history:");
+        for ev in &ledger.history {
+            let v = match ev.record.verdict {
+                Verdict::Pass => "PASS",
+                Verdict::ConditionalPass => "COND",
+                Verdict::Fail => "FAIL",
+            };
+            println!(
+                "  {v}  {}  ({}, {})",
+                ev.phase.label(),
+                ev.record.by,
+                ev.record.at
+            );
+        }
+    }
+
     println!("\nTasks: {}/{} complete", tasks.done, tasks.total);
     if ready {
         println!("Ready to archive: yes");
@@ -314,6 +339,16 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
         for r in &reasons {
             println!("  - {r}");
         }
+    }
+
+    // Point the operator at the next command instead of leaving it to be guessed.
+    let open_conditions = ledger.conditions.iter().filter(|c| !c.closed).count();
+    if open_conditions > 0 {
+        println!("\n→ close open conditions: mpd resolve <n>");
+    } else if ledger.phase != Phase::Done {
+        println!("\n→ next: mpd next");
+    } else if ready {
+        println!("\n→ ready: mpd archive --yes");
     }
     Ok(0)
 }
@@ -576,6 +611,16 @@ fn docs_target(root: &Path, docs_dir: &str, change: &str) -> Result<PathBuf, Str
 /// case-insensitively, by heading prefix — so "Functional details" matches).
 const REQUIRED_DOC_SECTIONS: &[&str] = &["Purpose", "Value", "Scope", "Functional", "Usage"];
 
+/// Whether `text` still carries an UNFILLED template placeholder (`<!-- … -->`).
+/// A `<!--` that appears only inside an inline-code span (backticks) is ignored,
+/// so a document that merely *describes* the placeholder convention (like this
+/// change's own design/proposal) is not mistaken for an unfilled stub. On each
+/// line the even-indexed backtick splits are the spans outside inline code.
+fn has_unfilled_placeholder(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.split('`').step_by(2).any(|seg| seg.contains("<!--")))
+}
+
 /// Structural completeness check for a documentation file. Returns the list of
 /// problems (empty ⇒ complete): missing sections, unfilled template
 /// placeholders, or too-short content.
@@ -595,11 +640,37 @@ fn check_documentation(text: &str) -> Vec<String> {
             issues.push(format!("missing section: {section}"));
         }
     }
-    if text.contains("<!--") {
+    if has_unfilled_placeholder(text) {
         issues.push("unfilled template placeholders remain (<!-- … -->)".to_string());
     }
     if text.trim().len() < 120 {
         issues.push("documentation is too short to be meaningful".to_string());
+    }
+    issues
+}
+
+/// The core OpenSpec artifacts every change must fill before archive.
+const REQUIRED_ARTIFACTS: &[&str] = &["proposal.md", "design.md", "tasks.md"];
+
+/// Issues with a change's core artifacts (empty ⇒ all filled): each must exist,
+/// carry real content, and have no unfilled `<!-- … -->` template placeholders —
+/// the same guarantee the Documentation gate already enforces for
+/// `documentation.md`, extended to the core artifacts so a template stub can't be
+/// archived. Reads are symlink-refusing and size-capped (`read_capped`): a
+/// symlinked or oversized artifact yields "" and is reported as a stub, never
+/// followed.
+fn artifact_stub_issues(project: &Project, change: &str) -> Vec<String> {
+    let dir = project.change_dir(change);
+    let mut issues = Vec::new();
+    for name in REQUIRED_ARTIFACTS {
+        let text = openspec_core::read_capped(&dir.join(name)).unwrap_or_default();
+        if text.trim().is_empty() {
+            issues.push(format!("{name} is missing or empty"));
+        } else if has_unfilled_placeholder(&text) {
+            issues.push(format!(
+                "{name} still has unfilled template placeholders (<!-- … -->)"
+            ));
+        }
     }
     issues
 }
@@ -723,6 +794,20 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     }
 
     let project = Project::new(&root);
+
+    // Irreversibility guard #2: never archive a change whose core artifacts are
+    // still unfilled template stubs. The Documentation gate already blocks a stub
+    // documentation.md; extend the same guarantee to proposal/design/tasks so an
+    // empty template can't be folded into the permanent record.
+    let stub_issues = artifact_stub_issues(&project, &change);
+    if !stub_issues.is_empty() {
+        eprintln!("Cannot archive {change:?} — core artifacts are incomplete:");
+        for i in &stub_issues {
+            eprintln!("  - {i}");
+        }
+        return Ok(1);
+    }
+
     let plan = project
         .plan_archive(&change, skip_specs)
         .map_err(|e| e.to_string())?;
@@ -895,4 +980,29 @@ fn cmd_doctor(json: bool) -> CmdResult {
         println!("\n  Tip: re-run `mpd init` to install the pre-commit gate.");
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_unfilled_placeholder;
+
+    #[test]
+    fn placeholder_detection_ignores_inline_code_mentions() {
+        // Genuine unfilled placeholders (outside inline code) are detected,
+        // whether standalone or after a markdown marker.
+        assert!(has_unfilled_placeholder(
+            "# Title\n\n<!-- The problem this solves. -->\n"
+        ));
+        assert!(has_unfilled_placeholder("- [ ] 1.1 <!-- Task description -->\n"));
+        // A doc that only *describes* the `<!--` convention inside inline code
+        // (as this change's own design/proposal do) is NOT a stub — the bug the
+        // dogfooding of this very change surfaced.
+        assert!(!has_unfilled_placeholder(
+            "The check rejects `<!--` placeholders, e.g. the `<!-- ... -->` stub, when unfilled.\n"
+        ));
+        // A fully-authored doc has none.
+        assert!(!has_unfilled_placeholder(
+            "# Real\n\nAll content here, no comments.\n"
+        ));
+    }
 }

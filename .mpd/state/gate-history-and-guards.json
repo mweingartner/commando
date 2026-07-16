@@ -1,0 +1,147 @@
+{
+  "change": "gate-history-and-guards",
+  "schema": "mpd",
+  "ui": false,
+  "kind": "feature",
+  "phase": "done",
+  "gates": {
+    "architecture": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "design.md",
+      "at": "2026-07-16"
+    },
+    "security-plan": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "design.md#conditions",
+      "at": "2026-07-16"
+    },
+    "build": {
+      "verdict": "pass",
+      "by": "Builder",
+      "evidence": "tasks.md",
+      "checks": {
+        "tests_passed": 158,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-16"
+    },
+    "security-code": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "design.md#conditions",
+      "checks": {
+        "secrets_clean": true,
+        "scanner": "builtin+gitleaks"
+      },
+      "at": "2026-07-16"
+    },
+    "test": {
+      "verdict": "pass",
+      "by": "Tester",
+      "evidence": "tasks.md",
+      "checks": {
+        "tests_passed": 158,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-16"
+    },
+    "documentation": {
+      "verdict": "pass",
+      "by": "Documenter",
+      "evidence": "documentation.md",
+      "at": "2026-07-16"
+    },
+    "deploy": {
+      "verdict": "pass",
+      "by": "main-session",
+      "evidence": "/Users/mweingar/dev/commando/openspec/changes/archive/2026-07-16-gate-history-and-guards",
+      "at": "2026-07-16"
+    },
+    "doc-validation": {
+      "verdict": "pass",
+      "by": "Architect & Designer",
+      "evidence": "documentation.md",
+      "at": "2026-07-16"
+    }
+  },
+  "conditions": [],
+  "history": [
+    {
+      "phase": "build",
+      "record": {
+        "verdict": "pass",
+        "by": "Builder",
+        "evidence": "tasks.md",
+        "checks": {
+          "tests_passed": 158,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-16"
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "design.md#conditions",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-16"
+      }
+    },
+    {
+      "phase": "test",
+      "record": {
+        "verdict": "pass",
+        "by": "Tester",
+        "evidence": "tasks.md",
+        "checks": {
+          "tests_passed": 158,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-16"
+      }
+    },
+    {
+      "phase": "documentation",
+      "record": {
+        "verdict": "pass",
+        "by": "Documenter",
+        "evidence": "documentation.md",
+        "at": "2026-07-16"
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main-session",
+        "evidence": "cargo install --path crates/mpd (mpd 0.1.0 installed)",
+        "at": "2026-07-16"
+      }
+    },
+    {
+      "phase": "doc-validation",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect & Designer",
+        "evidence": "documentation.md",
+        "at": "2026-07-16"
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main-session",
+        "evidence": "/Users/mweingar/dev/commando/openspec/changes/archive/2026-07-16-gate-history-and-guards",
+        "at": "2026-07-16"
+      }
+    }
+  ]
+}

@@ -115,6 +115,18 @@ pub struct Condition {
     pub closed: bool,
 }
 
+/// One recorded gate verdict, preserved in the append-only history. The `gates`
+/// map keeps only the *latest* verdict per phase (which drives advancement and
+/// readiness); `history` keeps the full ordered trail, so a catch-then-fix
+/// (FAIL → PASS) survives in the audit record instead of being overwritten.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateEvent {
+    /// The phase that was recorded.
+    pub phase: Phase,
+    /// The verdict record at that moment.
+    pub record: GateRecord,
+}
+
 /// The durable state of one change's trip through the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
@@ -134,6 +146,12 @@ pub struct Ledger {
     /// Open/closed conditions from conditional passes.
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// Append-only log of every gate verdict ever recorded, in order. Preserves
+    /// the full audit trail (incl. a FAIL that was later re-recorded PASS) that
+    /// the latest-per-phase `gates` map would otherwise overwrite. Additive and
+    /// optional so pre-existing ledgers deserialize with an empty history.
+    #[serde(default)]
+    pub history: Vec<GateEvent>,
 }
 
 impl Ledger {
@@ -156,6 +174,7 @@ impl Ledger {
             phase: Phase::first(applicability),
             gates: BTreeMap::new(),
             conditions: Vec::new(),
+            history: Vec::new(),
         }
     }
 
@@ -171,6 +190,13 @@ impl Ledger {
     /// move to the next applicable phase.
     pub fn record(&mut self, phase: Phase, record: GateRecord) {
         let advances = record.verdict.advances();
+        // Preserve the full audit trail: a later PASS must not erase an earlier
+        // FAIL/CONDITIONAL for the same phase. `gates` keeps the latest verdict
+        // (drives advancement + readiness); `history` keeps every verdict.
+        self.history.push(GateEvent {
+            phase,
+            record: record.clone(),
+        });
         self.gates.insert(phase, record);
         if advances && phase == self.phase {
             self.phase = phase.next(self.applicability());
@@ -337,6 +363,51 @@ mod tests {
         l.record(Phase::Architecture, rec);
         assert_eq!(l.phase, Phase::Architecture);
         assert!(!l.ready_to_archive());
+    }
+
+    #[test]
+    fn record_preserves_verdict_history() {
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        l.record(Phase::Architecture, pass("Architect"));
+        l.record(Phase::SecurityPlan, pass("Security"));
+        l.record(Phase::Build, pass("Builder"));
+        // Security (code) FAILs, then is fixed and re-recorded PASS.
+        let mut fail = pass("Security");
+        fail.verdict = Verdict::Fail;
+        l.record(Phase::SecurityCode, fail);
+        assert_eq!(l.phase, Phase::SecurityCode, "FAIL does not advance");
+        l.record(Phase::SecurityCode, pass("Security"));
+        // Latest-per-phase shows PASS (and advances); history keeps FAIL *and* PASS.
+        assert_eq!(l.gates[&Phase::SecurityCode].verdict, Verdict::Pass);
+        assert_eq!(l.phase, Phase::Test);
+        let sc: Vec<_> = l
+            .history
+            .iter()
+            .filter(|e| e.phase == Phase::SecurityCode)
+            .map(|e| e.record.verdict)
+            .collect();
+        assert_eq!(
+            sc,
+            vec![Verdict::Fail, Verdict::Pass],
+            "catch-then-fix must survive in the audit trail"
+        );
+    }
+
+    #[test]
+    fn old_ledger_without_history_deserializes() {
+        // A ledger serialized before `history` existed (field absent) must load
+        // with an empty history via #[serde(default)] and round-trip forward.
+        let json = r#"{
+            "change": "c", "schema": "mpd", "ui": false, "kind": "fix",
+            "phase": "build",
+            "gates": { "architecture": { "verdict": "pass", "by": "Architect", "at": "2026-07-11" } },
+            "conditions": []
+        }"#;
+        let l: Ledger = serde_json::from_str(json).unwrap();
+        assert!(l.history.is_empty());
+        assert_eq!(l.phase, Phase::Build);
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(l, back);
     }
 
     #[test]

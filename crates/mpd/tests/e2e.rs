@@ -71,6 +71,7 @@ fn full_pipeline_happy_path() {
     // begin (non-UI)
     let out = sb.mpd(&["begin", "add-thing"]);
     assert!(out.status.success(), "begin failed: {}", stdout(&out));
+    fill_artifacts(&sb, "add-thing");
 
     // status: at Architecture
     let s = json(&sb.mpd(&["status", "--json"]));
@@ -253,6 +254,7 @@ fn ui_change_walks_all_design_phases_via_binary() {
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     let out = sb.mpd(&["begin", "pretty-thing", "--ui", "--fix"]);
     assert!(out.status.success(), "begin --ui failed: {}", stdout(&out));
+    fill_artifacts(&sb, "pretty-thing");
 
     // Starts at Design Mock, not Architecture.
     let s = json(&sb.mpd(&["status", "--json"]));
@@ -347,6 +349,7 @@ fn conditional_pass_condition_blocks_archive_until_closed() {
     let sb = Sandbox::new("conditional");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "risky-thing", "--fix"]);
+    fill_artifacts(&sb, "risky-thing");
     sb.write(
         "openspec/changes/risky-thing/specs/thing/spec.md",
         "## ADDED Requirements\n\n\
@@ -449,6 +452,21 @@ fn write_thing_spec(sb: &Sandbox, change: &str) {
     );
 }
 
+/// Overwrite a change's seeded template stubs (proposal/design/tasks) with real
+/// content so the archive stub-guard and readiness check accept it — the normal
+/// state of any change that a persona actually authored.
+fn fill_artifacts(sb: &Sandbox, change: &str) {
+    for name in ["proposal.md", "design.md", "tasks.md"] {
+        sb.write(
+            &format!("openspec/changes/{change}/{name}"),
+            &format!(
+                "# {name} for {change}\n\nReal, filled content for the {change} change — \
+                 no template placeholders remain.\n"
+            ),
+        );
+    }
+}
+
 /// Write `.mpd/config.json` with a passing test command and the given deploy.
 fn write_config_with_deploy(sb: &Sandbox, deploy: &str) {
     sb.write(
@@ -463,6 +481,7 @@ fn deploy_gate_runs_configured_deploy_command() {
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "shippable", "--fix"]);
     write_thing_spec(&sb, "shippable");
+    fill_artifacts(&sb, "shippable");
     // A deploy command that leaves a marker in the project root (the gate CWD).
     write_config_with_deploy(&sb, "touch deployed.marker");
 
@@ -572,6 +591,7 @@ fn resolve_cli_contract_and_all() {
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "conds", "--fix"]);
     write_thing_spec(&sb, "conds");
+    fill_artifacts(&sb, "conds");
     sb.mpd(&["gate", "architecture", "--pass"]);
     // Two open conditions from a conditional security-plan pass.
     let out = sb.mpd(&[
@@ -672,6 +692,7 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
 fn drive_to_documentation(sb: &Sandbox, change: &str) {
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", change]);
+    fill_artifacts(sb, change);
     for p in [
         "architecture",
         "security-plan",
@@ -941,4 +962,95 @@ fn change_flag_rejects_path_traversal() {
             "traversal change {bad:?} must be rejected"
         );
     }
+}
+
+#[test]
+fn archive_refuses_unfilled_artifact_stubs() {
+    let sb = Sandbox::new("stub-guard");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "stubby", "--fix"]);
+    write_thing_spec(&sb, "stubby");
+    // Walk every gate WITHOUT filling proposal/design/tasks — they stay the
+    // template stubs `begin` seeded.
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+    ] {
+        assert!(sb.mpd(&["gate", phase, "--pass"]).status.success());
+    }
+    // Every gate passed, but the unfilled artifact stubs must block readiness...
+    let s = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(s["ready_to_archive"], false, "{s}");
+    let reasons: Vec<String> = s["blocking_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("design.md") && r.contains("placeholder")),
+        "a stub reason must name the unfilled artifact: {reasons:?}"
+    );
+    // ...and archive must refuse before moving anything.
+    let out = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "archive must refuse unfilled artifact stubs"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("core artifacts are incomplete"));
+    assert!(sb.dir.join("openspec/changes/stubby").is_dir(), "nothing moved");
+    // Fill the artifacts → ready → archive succeeds.
+    fill_artifacts(&sb, "stubby");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["ready_to_archive"],
+        true
+    );
+    assert!(sb.mpd(&["archive", "--yes"]).status.success());
+    assert!(!sb.dir.join("openspec/changes/stubby").exists());
+}
+
+#[test]
+fn status_preserves_gate_history_across_fail_then_pass() {
+    let sb = Sandbox::new("gate-history");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "caught", "--fix"]);
+    fill_artifacts(&sb, "caught");
+    sb.mpd(&["gate", "architecture", "--pass"]);
+    sb.mpd(&["gate", "security-plan", "--pass"]);
+    sb.mpd(&["gate", "build", "--pass"]);
+    // Security (code) FAILs, then is fixed and re-recorded PASS.
+    assert!(sb.mpd(&["gate", "security-code", "--fail"]).status.success());
+    // A FAIL must not advance the phase.
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-code"
+    );
+    assert!(sb.mpd(&["gate", "security-code", "--pass"]).status.success());
+    let s = json(&sb.mpd(&["status", "--json"]));
+    // The latest verdict advanced past security-code...
+    assert_eq!(s["phase"], "test");
+    // ...but the audit trail preserves BOTH the FAIL and the PASS, in order.
+    let sc: Vec<&str> = s["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["phase"] == "security-code")
+        .map(|e| e["record"]["verdict"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        sc,
+        vec!["fail", "pass"],
+        "history must show the catch-then-fix: {s}"
+    );
+    // The human-readable status renders the history section, surfacing the FAIL.
+    let text = stdout(&sb.mpd(&["status"]));
+    assert!(
+        text.contains("Gate history:") && text.contains("FAIL"),
+        "status text must surface the caught FAIL: {text}"
+    );
 }

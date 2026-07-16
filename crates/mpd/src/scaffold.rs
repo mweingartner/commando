@@ -108,6 +108,18 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
         report.created.push(".mpd/config.json".to_string());
     }
 
+    // Gitignore the transient per-developer state (the current-change pointer and
+    // any scratch tmp), while the durable ledger (.mpd/state/), config, and
+    // directives stay tracked. Scoped to .mpd/ so the project's root .gitignore is
+    // left untouched. Without this, `.mpd/current` reads as an uncommitted file and
+    // the commit/stop hooks nag about it every turn.
+    write_new(
+        &ledger::mpd_dir(root).join(".gitignore"),
+        "/current\n/tmp/\n",
+        root,
+        &mut report,
+    )?;
+
     // Install the bundled MPD doctrine directives (non-destructive).
     for (rel, content) in crate::directives::bundled() {
         write_new(
@@ -233,6 +245,21 @@ mod tests {
         let err = write_new(&link, "DOCTRINE", &root, &mut report).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(!target.exists(), "must not create the symlink target");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_gitignores_transient_state() {
+        use super::init;
+        let root = std::env::temp_dir().join(format!("mpd-init-gi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        init(&root, Some("cargo test".into())).unwrap();
+        let gi = std::fs::read_to_string(root.join(".mpd").join(".gitignore")).unwrap();
+        assert!(
+            gi.lines().any(|l| l.trim() == "/current"),
+            "init must gitignore the transient current-change pointer: {gi:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
