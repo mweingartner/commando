@@ -23,3 +23,8 @@ For each finding: severity, exact file:line, the concrete exploit/failure
 scenario, and a specific remediation. Also state what you checked and found
 sound. Prefer reusing the codebase's already-hardened patterns over re-deriving
 weaker equivalents.
+
+A blocking FAIL must be inside or cross into the change's declared threat
+profile and identify attacker, prerequisite capability, crossed boundary,
+concrete harm, and exact fix. Record out-of-profile hardening as advisory; do
+not inflate it into a blocker merely because it is theoretically imaginable.

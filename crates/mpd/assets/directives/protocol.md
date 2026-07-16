@@ -31,9 +31,25 @@ save time:
 - Everything else is mandatory. Small or docs-only changes use concise,
   proportionate artifacts; size or familiarity never bypasses a gate.
 
+## Proportional governance
+
+Every change declares a risk level (`low`, `medium`, or `high`) and a credible
+threat profile. `mpd next` carries that contract into every persona brief.
+Security may block only on a concrete exploit path within or into the declared
+profile: attacker, prerequisite capability, crossed boundary, concrete harm,
+and exact fix. Out-of-profile defense in depth is advisory.
+
+Canonical `proposal.md`, `design.md`, and `tasks.md` describe the current
+approved contract. Move superseded drafts to `history/`. Artifact page guidance
+is advisory; review-attempt limits require an explicit `mpd reconcile` decision
+before expansion, but reconciliation never converts or bypasses a FAIL. If the
+human rejects a criterion, reconcile immediately instead of manufacturing more
+review prose.
+
 ## Gates are machine-enforced, not self-reported
 
-Every gate ends **PASS**, **CONDITIONAL PASS**, or **FAIL**. A conditional pass
+Every gate ends **PASS**, **CONDITIONAL PASS**, or **FAIL**. Every FAIL is
+classified as product, test, infrastructure, environment, or policy. A conditional pass
 records open conditions (owner + closing evidence) that block archive until
 resolved (`mpd resolve`). A FAIL blocks; a material change returns to the
 earliest affected phase and invalidates downstream approvals.

@@ -3,7 +3,10 @@
 
 use crate::checks::{self, tests_runner};
 use crate::config::Config;
-use crate::ledger::{self, ChangeKind, CheckSummary, Condition, GateRecord, Verdict};
+use crate::ledger::{
+    self, bounded_text, ChangeKind, CheckSummary, Condition, Exploitability, FailureClass,
+    GateRecord, Governance, ReconciliationKind, RiskLevel, ThreatProfile, Verdict,
+};
 use crate::phase::Phase;
 use crate::{githooks, harness, scaffold};
 use clap::{Parser, Subcommand};
@@ -39,6 +42,12 @@ enum Command {
         /// A non-functional chore (refactor/tooling/perf) — skips Documentation.
         #[arg(long)]
         chore: bool,
+        /// Review rigor (`low`, `medium`, or `high`).
+        #[arg(long)]
+        risk: Option<String>,
+        /// Credible threat boundary for this change.
+        #[arg(long = "threat-profile")]
+        threat_profile: Option<String>,
     },
     /// Show the current phase, gate verdicts, and readiness.
     Status {
@@ -90,6 +99,32 @@ enum Command {
         /// An open condition to attach to a CONDITIONAL PASS (repeatable).
         #[arg(long = "condition")]
         conditions: Vec<String>,
+        /// Required classification for FAIL.
+        #[arg(long = "class")]
+        failure_class: Option<String>,
+        #[arg(long)]
+        attacker: Option<String>,
+        #[arg(long)]
+        capability: Option<String>,
+        #[arg(long)]
+        boundary: Option<String>,
+        #[arg(long)]
+        harm: Option<String>,
+        #[arg(long = "fix")]
+        exact_fix: Option<String>,
+    },
+    /// Record a bounded human decision before an excess review attempt.
+    Reconcile {
+        #[arg(long = "continue")]
+        continue_reason: Option<String>,
+        #[arg(long)]
+        narrow: Option<String>,
+        #[arg(long, value_names = ["LEVEL", "REASON"], num_args = 2)]
+        risk: Option<Vec<String>>,
+        #[arg(long = "threat-profile", value_names = ["PROFILE", "REASON"], num_args = 2)]
+        threat_profile: Option<Vec<String>>,
+        #[arg(long)]
+        change: Option<String>,
     },
     /// Close open conditions from a CONDITIONAL PASS (they block archive).
     Resolve {
@@ -142,7 +177,9 @@ pub fn run() -> i32 {
             ui,
             fix,
             chore,
-        } => cmd_begin(name, ui, fix, chore),
+            risk,
+            threat_profile,
+        } => cmd_begin(name, ui, fix, chore, risk, threat_profile),
         Command::Status { change, json } => cmd_status(change, json),
         Command::Next {
             change,
@@ -159,6 +196,12 @@ pub fn run() -> i32 {
             evidence,
             by,
             conditions,
+            failure_class,
+            attacker,
+            capability,
+            boundary,
+            harm,
+            exact_fix,
         } => cmd_gate(
             phase,
             change,
@@ -168,7 +211,20 @@ pub fn run() -> i32 {
             evidence,
             by,
             conditions,
+            failure_class,
+            attacker,
+            capability,
+            boundary,
+            harm,
+            exact_fix,
         ),
+        Command::Reconcile {
+            continue_reason,
+            narrow,
+            risk,
+            threat_profile,
+            change,
+        } => cmd_reconcile(continue_reason, narrow, risk, threat_profile, change),
         Command::Resolve { index, all, change } => cmd_resolve(index, all, change),
         Command::Check { staged, quiet } => cmd_check(staged, quiet),
         Command::Archive {
@@ -232,7 +288,14 @@ fn cmd_init(test: Option<String>) -> CmdResult {
     Ok(0)
 }
 
-fn cmd_begin(name: String, ui: bool, fix: bool, chore: bool) -> CmdResult {
+fn cmd_begin(
+    name: String,
+    ui: bool,
+    fix: bool,
+    chore: bool,
+    risk: Option<String>,
+    threat_profile: Option<String>,
+) -> CmdResult {
     let kind = match (fix, chore) {
         (false, false) => ChangeKind::Feature,
         (true, false) => ChangeKind::Fix,
@@ -240,13 +303,43 @@ fn cmd_begin(name: String, ui: bool, fix: bool, chore: bool) -> CmdResult {
         (true, true) => return Err("specify at most one of --fix, --chore".into()),
     };
     let root = find_root()?;
-    let ledger = scaffold::begin(&root, &name, ui, kind).map_err(|e| e.to_string())?;
+    let cfg = Config::load(&root);
+    let risk = match risk {
+        Some(v) => v.parse::<RiskLevel>()?,
+        None => cfg
+            .governance
+            .as_ref()
+            .and_then(|g| g.risk)
+            .unwrap_or(if ui {
+                RiskLevel::Medium
+            } else {
+                RiskLevel::Low
+            }),
+    };
+    let threat_profile = match threat_profile {
+        Some(v) => v.parse::<ThreatProfile>()?,
+        None => cfg
+            .governance
+            .as_ref()
+            .and_then(|g| g.threat_profile)
+            .unwrap_or_default(),
+    };
+    let governance = Governance {
+        risk,
+        threat_profile,
+        reconciliations: vec![],
+    };
+    let ledger = scaffold::begin(&root, &name, ui, kind, governance).map_err(|e| e.to_string())?;
     println!(
         "Started change {:?} (kind: {}, ui: {}). Current phase: {}.",
         name,
         kind.label(),
         ui,
         ledger.phase.label()
+    );
+    println!(
+        "Governance: risk {}, threat profile {}.",
+        risk, threat_profile
     );
     if !kind.documents() {
         println!(
@@ -269,6 +362,10 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     let mut reasons = ledger.blocking_reasons();
     reasons.extend(artifact_stub_issues(&project, &change));
     let ready = reasons.is_empty();
+    let artifact_budget = artifact_budget(&project, &change, ledger.governance.risk);
+    let attempt_authorization = ledger
+        .attempt_authorization(ledger.phase)
+        .map(|r| r.kind.label().to_string());
 
     if json {
         let gates: serde_json::Map<String, serde_json::Value> = ledger
@@ -290,12 +387,38 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
             "ready_to_archive": ready,
             "blocking_reasons": reasons,
             "history": serde_json::to_value(&ledger.history).unwrap_or(serde_json::Value::Null),
+            "governance": ledger.governance,
+            "artifact_budget": artifact_budget,
+            "current_attempt": ledger.next_attempt(ledger.phase),
+            "attempt_limit": ledger.governance.risk.attempt_limit(),
+            "reconciliation_required": !ledger.attempt_authorized(ledger.phase),
+            "attempt_authorization": attempt_authorization,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
     }
 
     println!("Change: {}  (ui: {})", ledger.change, ledger.ui);
+    println!(
+        "Governance: risk {}, threat profile {}",
+        ledger.governance.risk, ledger.governance.threat_profile
+    );
+    println!(
+        "Review attempt: {}/{}",
+        ledger.next_attempt(ledger.phase),
+        ledger.governance.risk.attempt_limit()
+    );
+    if let Some(kind) = &attempt_authorization {
+        println!(
+            "Excess attempt {} authorized by {} reconciliation (base limit {}).",
+            ledger.next_attempt(ledger.phase),
+            kind,
+            ledger.governance.risk.attempt_limit()
+        );
+    }
+    if let Some(warning) = &artifact_budget.warning {
+        println!("Warning: {warning}");
+    }
     println!("Current phase: {}\n", ledger.phase.label());
     println!("Pipeline:");
     for phase in Phase::applicable(ledger.applicability()) {
@@ -314,7 +437,12 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     // Verdict history: when any phase was recorded more than once (e.g. a FAIL
     // later re-recorded PASS), show the full ordered trail so the catch stays
     // visible instead of being hidden behind the latest green stamp.
-    if ledger.history.len() > ledger.gates.len() {
+    if ledger.history.len() > ledger.gates.len()
+        || ledger
+            .history
+            .iter()
+            .any(|e| e.record.verdict == Verdict::Fail)
+    {
         println!("\nGate history:");
         for ev in &ledger.history {
             let v = match ev.record.verdict {
@@ -322,11 +450,18 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
                 Verdict::ConditionalPass => "COND",
                 Verdict::Fail => "FAIL",
             };
+            let class = ev
+                .record
+                .failure_class
+                .map(|c| format!(", class {c}"))
+                .unwrap_or_default();
             println!(
-                "  {v}  {}  ({}, {})",
+                "  {v}  {}  ({}, attempt {}, {}s{})",
                 ev.phase.label(),
-                ev.record.by,
-                ev.record.at
+                harness::terminal_safe(&ev.record.by),
+                ev.record.attempt,
+                ev.record.duration_secs(),
+                class
             );
         }
     }
@@ -364,7 +499,21 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool
         return Ok(0);
     }
     let cfg = Config::load(&root);
-    let brief = harness::brief(&cfg, &change, ledger.phase, &harness_kind);
+    let page_warning =
+        artifact_budget(&Project::new(&root), &change, ledger.governance.risk).warning;
+    let brief = harness::brief(
+        &cfg,
+        &change,
+        ledger.phase,
+        &harness_kind,
+        &ledger.governance,
+        ledger.next_attempt(ledger.phase),
+        !ledger.attempt_authorized(ledger.phase),
+        ledger
+            .attempt_authorization(ledger.phase)
+            .map(|r| r.kind.label().to_string()),
+        page_warning,
+    );
 
     // With --full, resolve the phase persona's directive(s). A composite persona
     // (Doc Validation = "Architect & Designer") resolves its parts.
@@ -428,6 +577,12 @@ fn cmd_gate(
     evidence: Option<String>,
     by: Option<String>,
     conditions: Vec<String>,
+    failure_class: Option<String>,
+    attacker: Option<String>,
+    capability: Option<String>,
+    boundary: Option<String>,
+    harm: Option<String>,
+    exact_fix: Option<String>,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
@@ -441,7 +596,39 @@ fn cmd_gate(
         _ => return Err("specify exactly one of --pass, --conditional, --fail".into()),
     };
 
+    let exploit_fields_present = [&attacker, &capability, &boundary, &harm, &exact_fix]
+        .iter()
+        .any(|v| v.is_some());
+    let failure_class = match (verdict, failure_class) {
+        (Verdict::Fail, Some(v)) => Some(v.parse::<FailureClass>()?),
+        (Verdict::Fail, None) => return Err(
+            "--fail requires exactly one --class product|test|infrastructure|environment|policy"
+                .into(),
+        ),
+        (_, Some(_)) => return Err("--class is valid only with --fail".into()),
+        (_, None) => None,
+    };
+    let security = matches!(phase, Phase::SecurityPlan | Phase::SecurityCode);
+    let exploitability = if verdict == Verdict::Fail && security {
+        Some(Exploitability {
+            attacker: bounded_text(attacker.as_deref().unwrap_or(""), "attacker")?,
+            capability: bounded_text(capability.as_deref().unwrap_or(""), "capability")?,
+            boundary: bounded_text(boundary.as_deref().unwrap_or(""), "boundary")?,
+            harm: bounded_text(harm.as_deref().unwrap_or(""), "harm")?,
+            fix: bounded_text(exact_fix.as_deref().unwrap_or(""), "fix")?,
+        })
+    } else if exploit_fields_present {
+        return Err("exploitability flags are valid only with a Security --fail".into());
+    } else {
+        None
+    };
+
     let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    if !ledger.attempt_authorized(phase) {
+        return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), ledger.governance.risk));
+    }
+    let attempt = ledger.next_attempt(phase);
+    let completed = ledger::now_epoch_secs();
     let mut checks_summary: Option<CheckSummary> = None;
 
     // Enforcement: a PASS/CONDITIONAL on a test/secret phase must be backed by
@@ -563,6 +750,15 @@ fn cmd_gate(
             evidence,
             checks: checks_summary,
             at: date::today_utc(),
+            failure_class,
+            exploitability,
+            attempt,
+            started_at_epoch_secs: if ledger.phase_started_at_epoch_secs == 0 {
+                completed
+            } else {
+                ledger.phase_started_at_epoch_secs.min(completed)
+            },
+            completed_at_epoch_secs: completed,
         },
     );
     if verdict == Verdict::ConditionalPass {
@@ -587,6 +783,80 @@ fn cmd_gate(
         ledger.phase.label()
     );
     Ok(0)
+}
+
+fn cmd_reconcile(
+    continue_reason: Option<String>,
+    narrow: Option<String>,
+    risk: Option<Vec<String>>,
+    threat_profile: Option<Vec<String>>,
+    change: Option<String>,
+) -> CmdResult {
+    let root = find_root()?;
+    let change = resolve_change(&root, change)?;
+    let choices = usize::from(continue_reason.is_some())
+        + usize::from(narrow.is_some())
+        + usize::from(risk.is_some())
+        + usize::from(threat_profile.is_some());
+    if choices != 1 {
+        return Err("specify exactly one of --continue, --narrow, --risk <level> <reason>, or --threat-profile <profile> <reason>".into());
+    }
+    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let (kind, reason, value) = if let Some(r) = continue_reason {
+        (ReconciliationKind::Continue, r, None)
+    } else if let Some(r) = narrow {
+        (ReconciliationKind::Narrow, r, None)
+    } else if let Some(v) = risk {
+        (ReconciliationKind::Risk, v[1].clone(), Some(v[0].clone()))
+    } else {
+        let v = threat_profile.unwrap();
+        (
+            ReconciliationKind::ThreatProfile,
+            v[1].clone(),
+            Some(v[0].clone()),
+        )
+    };
+    ledger.reconcile(kind, reason, value)?;
+    ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+    println!("Recorded reconciliation for {} attempt {}. Current governance: risk {}, threat profile {}.", ledger.phase.label(), ledger.next_attempt(ledger.phase), ledger.governance.risk, ledger.governance.threat_profile);
+    Ok(0)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ArtifactBudget {
+    approx_pages: Option<usize>,
+    page_limit: Option<usize>,
+    readable: bool,
+    warning: Option<String>,
+}
+
+fn artifact_budget(project: &Project, change: &str, risk: RiskLevel) -> ArtifactBudget {
+    let mut words = 0usize;
+    for name in REQUIRED_ARTIFACTS {
+        match openspec_core::read_capped(&project.change_dir(change).join(name)) {
+            Ok(text) => words = words.saturating_add(text.split_whitespace().count()),
+            Err(_) => {
+                return ArtifactBudget {
+                    approx_pages: None,
+                    page_limit: risk.page_limit(),
+                    readable: false,
+                    warning: Some(format!(
+                        "canonical artifact estimate unavailable: {name} is unreadable or exceeds the safe read limit; review it directly before continuing."
+                    )),
+                };
+            }
+        }
+    }
+    let pages = words.div_ceil(500);
+    let limit = risk.page_limit();
+    ArtifactBudget {
+        approx_pages: Some(pages),
+        page_limit: limit,
+        readable: true,
+        warning: limit.filter(|n| pages > *n).map(|n| format!(
+            "canonical artifacts are approximately {pages} pages (guidance: {n}); consolidate current state and move superseded prose to history/."
+        )),
+    }
 }
 
 fn gate_blocked(msg: &str) -> i32 {
@@ -882,6 +1152,11 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             evidence: Some(plan.archive_target.display().to_string()),
             checks: None,
             at: date::today_utc(),
+            failure_class: None,
+            exploitability: None,
+            attempt: ledger.next_attempt(Phase::Deploy),
+            started_at_epoch_secs: ledger.phase_started_at_epoch_secs,
+            completed_at_epoch_secs: ledger::now_epoch_secs(),
         },
     );
     ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
@@ -993,7 +1268,9 @@ mod tests {
         assert!(has_unfilled_placeholder(
             "# Title\n\n<!-- The problem this solves. -->\n"
         ));
-        assert!(has_unfilled_placeholder("- [ ] 1.1 <!-- Task description -->\n"));
+        assert!(has_unfilled_placeholder(
+            "- [ ] 1.1 <!-- Task description -->\n"
+        ));
         // A doc that only *describes* the `<!--` convention inside inline code
         // (as this change's own design/proposal do) is NOT a stub — the bug the
         // dogfooding of this very change surfaced.

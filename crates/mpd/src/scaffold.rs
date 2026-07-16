@@ -4,7 +4,7 @@
 //! can initialize a project with no network or Node dependency.
 
 use crate::config::Config;
-use crate::ledger::{self, ChangeKind, Ledger};
+use crate::ledger::{self, ChangeKind, Governance, Ledger};
 use crate::{githooks, phase::Phase};
 use openspec_core::date;
 use openspec_core::schema::ChangeMeta;
@@ -96,6 +96,7 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
     let (models, model_fallbacks) = crate::config::default_models();
     let cfg = Config {
         test: test_cmd,
+        governance: None,
         deploy: None,
         docs_dir: None,
         models,
@@ -146,7 +147,13 @@ pub fn validate_change_name(name: &str) -> Result<(), String> {
 }
 
 /// Create a new change and seed its ledger. Returns the seeded ledger.
-pub fn begin(root: &Path, change: &str, ui: bool, kind: ChangeKind) -> io::Result<Ledger> {
+pub fn begin(
+    root: &Path,
+    change: &str,
+    ui: bool,
+    kind: ChangeKind,
+    governance: Governance,
+) -> io::Result<Ledger> {
     validate_change_name(change).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let change_dir = root.join("openspec").join("changes").join(change);
@@ -174,7 +181,7 @@ pub fn begin(root: &Path, change: &str, ui: bool, kind: ChangeKind) -> io::Resul
         std::fs::write(change_dir.join("documentation.md"), T_DOCUMENTATION)?;
     }
 
-    let ledger = Ledger::new(change, "mpd", ui, kind);
+    let ledger = Ledger::new_with_governance(change, "mpd", ui, kind, governance);
     // Assert the seeded phase is sane (first applicable phase).
     debug_assert_eq!(ledger.phase, Phase::first(ledger.applicability()));
     ledger::save(root, &ledger)?;

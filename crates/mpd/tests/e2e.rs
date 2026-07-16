@@ -476,6 +476,223 @@ fn write_config_with_deploy(sb: &Sandbox, deploy: &str) {
 }
 
 #[test]
+fn governance_defaults_overrides_and_brief_parity() {
+    let sb = Sandbox::new("governance");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    let out = sb.mpd(&[
+        "begin",
+        "network-work",
+        "--ui",
+        "--risk",
+        "high",
+        "--threat-profile",
+        "network-server",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("risk high, threat profile network-server"));
+    let status = json(&sb.mpd(&["status", "--json"]));
+    let next = json(&sb.mpd(&["next", "--json"]));
+    assert_eq!(status["governance"]["risk"], "high");
+    assert_eq!(status["governance"]["threat_profile"], "network-server");
+    assert_eq!(next["risk"], "high");
+    assert_eq!(next["threat_profile"], "network-server");
+    assert_eq!(next["attempt_limit"], 3);
+}
+
+#[test]
+fn fail_class_and_security_exploitability_are_strict_and_persisted() {
+    let sb = Sandbox::new("classified-fail");
+    sb.mpd(&["init"]);
+    sb.mpd(&["begin", "secure-change", "--risk", "medium"]);
+    let missing = sb.mpd(&["gate", "architecture", "--fail"]);
+    assert!(!missing.status.success());
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let out = sb.mpd(&["gate", "architecture", "--fail", "--class", "policy"]);
+    assert!(out.status.success());
+    let state = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(state["history"][0]["record"]["failure_class"], "policy");
+
+    // A fresh change reaches Security, where all five exploitability fields are required.
+    sb.mpd(&["begin", "security-case", "--risk", "medium"]);
+    sb.mpd(&["gate", "architecture", "--pass"]);
+    let incomplete = sb.mpd(&[
+        "gate",
+        "security-plan",
+        "--fail",
+        "--class",
+        "product",
+        "--attacker",
+        "contributor",
+    ]);
+    assert!(!incomplete.status.success());
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let complete = sb.mpd(&[
+        "gate",
+        "security-plan",
+        "--fail",
+        "--class",
+        "product",
+        "--attacker",
+        "contributor",
+        "--capability",
+        "modify repository",
+        "--boundary",
+        "terminal renderer",
+        "--harm",
+        "misleading output",
+        "--fix",
+        "strip controls",
+    ]);
+    assert!(
+        complete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    let state = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(state["history"][1]["record"]["attempt"], 1);
+    assert_eq!(
+        state["history"][1]["record"]["exploitability"]["harm"],
+        "misleading output"
+    );
+    assert!(!sb
+        .mpd(&["gate", "security-plan", "--pass", "--class", "test"])
+        .status
+        .success());
+    assert!(!sb
+        .mpd(&[
+            "gate",
+            "architecture",
+            "--fail",
+            "--class",
+            "product",
+            "--attacker",
+            "someone",
+        ])
+        .status
+        .success());
+}
+
+#[test]
+fn every_failure_class_is_accepted_as_a_closed_enum() {
+    for class in ["product", "test", "infrastructure", "environment", "policy"] {
+        let sb = Sandbox::new(&format!("class-{class}"));
+        sb.mpd(&["init"]);
+        sb.mpd(&["begin", "classified", "--risk", "medium"]);
+        let out = sb.mpd(&["gate", "architecture", "--fail", "--class", class]);
+        assert!(
+            out.status.success(),
+            "class {class}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            json(&sb.mpd(&["status", "--json"]))["history"][0]["record"]["failure_class"],
+            class
+        );
+    }
+}
+
+#[test]
+fn artifact_budget_warns_without_blocking_next() {
+    let sb = Sandbox::new("artifact-budget");
+    sb.mpd(&["init"]);
+    sb.mpd(&["begin", "long-contract"]);
+    sb.write(
+        "openspec/changes/long-contract/design.md",
+        &"word ".repeat(1100),
+    );
+    let status = sb.mpd(&["status"]);
+    assert!(status.status.success());
+    assert!(stdout(&status).contains("approximately 3 pages"));
+    let next = json(&sb.mpd(&["next", "--json"]));
+    assert!(next["artifact_warning"]
+        .as_str()
+        .unwrap()
+        .contains("approximately 3 pages"));
+}
+
+#[test]
+fn oversized_artifact_reports_unknown_budget_in_status_and_brief() {
+    let sb = Sandbox::new("artifact-budget-oversized");
+    sb.mpd(&["init"]);
+    sb.mpd(&["begin", "oversized-contract"]);
+    sb.write(
+        "openspec/changes/oversized-contract/design.md",
+        &"x".repeat(17 * 1024 * 1024),
+    );
+    let status_human = stdout(&sb.mpd(&["status"]));
+    let next_human = stdout(&sb.mpd(&["next"]));
+    assert!(
+        status_human.contains("artifact estimate unavailable"),
+        "{status_human}"
+    );
+    assert!(
+        next_human.contains("artifact estimate unavailable"),
+        "{next_human}"
+    );
+    let status = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(status["artifact_budget"]["readable"], false);
+    assert!(status["artifact_budget"]["approx_pages"].is_null());
+    assert!(status["artifact_budget"]["warning"]
+        .as_str()
+        .unwrap()
+        .contains("artifact estimate unavailable"));
+    let next = json(&sb.mpd(&["next", "--json"]));
+    assert!(next["artifact_warning"]
+        .as_str()
+        .unwrap()
+        .contains("artifact estimate unavailable"));
+}
+
+#[test]
+fn excess_attempt_requires_one_shot_reconciliation() {
+    let sb = Sandbox::new("reconcile");
+    sb.mpd(&["init"]);
+    sb.mpd(&["begin", "retry-change"]);
+    assert!(sb
+        .mpd(&["gate", "architecture", "--fail", "--class", "product"])
+        .status
+        .success());
+    let blocked = sb.mpd(&["gate", "architecture", "--pass"]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("mpd reconcile"));
+    assert!(sb
+        .mpd(&["reconcile", "--continue", "implementation corrected"])
+        .status
+        .success());
+    let status_human = stdout(&sb.mpd(&["status"]));
+    let next_human = stdout(&sb.mpd(&["next"]));
+    let authorization = "Excess attempt 2 authorized by continue reconciliation (base limit 1).";
+    assert!(status_human.contains(authorization), "{status_human}");
+    assert!(next_human.contains(authorization), "{next_human}");
+    let status_json = json(&sb.mpd(&["status", "--json"]));
+    let next_json = json(&sb.mpd(&["next", "--json"]));
+    assert_eq!(status_json["attempt_authorization"], "continue");
+    assert_eq!(next_json["attempt_authorization"], "continue");
+    assert_eq!(status_json["reconciliation_required"], false);
+    assert_eq!(next_json["reconciliation_required"], false);
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+    let state = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(state["history"][1]["record"]["attempt"], 2);
+    assert_eq!(state["governance"]["reconciliations"][0]["consumed"], true);
+}
+
+#[test]
 fn deploy_gate_runs_configured_deploy_command() {
     let sb = Sandbox::new("deploy-runs");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
@@ -1003,7 +1220,10 @@ fn archive_refuses_unfilled_artifact_stubs() {
         "archive must refuse unfilled artifact stubs"
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("core artifacts are incomplete"));
-    assert!(sb.dir.join("openspec/changes/stubby").is_dir(), "nothing moved");
+    assert!(
+        sb.dir.join("openspec/changes/stubby").is_dir(),
+        "nothing moved"
+    );
     // Fill the artifacts → ready → archive succeeds.
     fill_artifacts(&sb, "stubby");
     assert_eq!(
@@ -1018,19 +1238,41 @@ fn archive_refuses_unfilled_artifact_stubs() {
 fn status_preserves_gate_history_across_fail_then_pass() {
     let sb = Sandbox::new("gate-history");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    sb.mpd(&["begin", "caught", "--fix"]);
+    sb.mpd(&["begin", "caught", "--fix", "--risk", "medium"]);
     fill_artifacts(&sb, "caught");
     sb.mpd(&["gate", "architecture", "--pass"]);
     sb.mpd(&["gate", "security-plan", "--pass"]);
     sb.mpd(&["gate", "build", "--pass"]);
     // Security (code) FAILs, then is fixed and re-recorded PASS.
-    assert!(sb.mpd(&["gate", "security-code", "--fail"]).status.success());
+    assert!(sb
+        .mpd(&[
+            "gate",
+            "security-code",
+            "--fail",
+            "--class",
+            "product",
+            "--attacker",
+            "contributor",
+            "--capability",
+            "modify source",
+            "--boundary",
+            "secret handling",
+            "--harm",
+            "credential exposure",
+            "--fix",
+            "remove credential"
+        ])
+        .status
+        .success());
     // A FAIL must not advance the phase.
     assert_eq!(
         json(&sb.mpd(&["status", "--json"]))["phase"],
         "security-code"
     );
-    assert!(sb.mpd(&["gate", "security-code", "--pass"]).status.success());
+    assert!(sb
+        .mpd(&["gate", "security-code", "--pass"])
+        .status
+        .success());
     let s = json(&sb.mpd(&["status", "--json"]));
     // The latest verdict advanced past security-code...
     assert_eq!(s["phase"], "test");

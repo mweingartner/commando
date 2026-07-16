@@ -12,6 +12,7 @@
 //! Luna (GPT-5.6, lightest) exists but is not assigned by default.
 
 use crate::config::Config;
+use crate::ledger::Governance;
 use crate::personas;
 use crate::phase::Phase;
 use serde::Serialize;
@@ -43,6 +44,16 @@ pub struct NextBrief {
     pub gate: String,
     /// The command to record the gate verdict.
     pub gate_command: String,
+    pub risk: String,
+    pub threat_profile: String,
+    pub attempt: usize,
+    pub attempt_limit: usize,
+    pub reconciliation_required: bool,
+    /// Reconciliation kind authorizing this excess attempt, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_authorization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_warning: Option<String>,
 }
 
 /// Resolve `(model, fallback_note)` for a phase under a harness. A per-persona
@@ -104,7 +115,18 @@ fn builtin_fallback(model: &str) -> Option<&'static str> {
 
 /// Build the brief for `phase` of `change`, resolving the model for `harness`
 /// against the project `cfg`.
-pub fn brief(cfg: &Config, change: &str, phase: Phase, harness: &str) -> NextBrief {
+#[allow(clippy::too_many_arguments)]
+pub fn brief(
+    cfg: &Config,
+    change: &str,
+    phase: Phase,
+    harness: &str,
+    governance: &Governance,
+    attempt: usize,
+    reconciliation_required: bool,
+    attempt_authorization: Option<String>,
+    artifact_warning: Option<String>,
+) -> NextBrief {
     let persona = phase.persona();
     let (model, model_note) = model_for(cfg, harness, phase);
     NextBrief {
@@ -122,7 +144,44 @@ pub fn brief(cfg: &Config, change: &str, phase: Phase, harness: &str) -> NextBri
         guidance: personas::guidance(phase).to_string(),
         gate: personas::gate_hint(phase).to_string(),
         gate_command: format!("mpd gate {} --pass --evidence <pointer>", phase.slug()),
+        risk: governance.risk.to_string(),
+        threat_profile: governance.threat_profile.to_string(),
+        attempt,
+        attempt_limit: governance.risk.attempt_limit(),
+        reconciliation_required,
+        attempt_authorization,
+        artifact_warning,
     }
+}
+
+/// Strip terminal control characters from repository-controlled text before
+/// human rendering. JSON remains lossless and correctly escaped by serde_json.
+pub fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+fn governance_lines(b: &NextBrief) -> String {
+    let mut out = format!(
+        "  Governance: risk {}, threat profile {}\n  Review attempt: {}/{}\n",
+        b.risk, b.threat_profile, b.attempt, b.attempt_limit
+    );
+    if let Some(kind) = &b.attempt_authorization {
+        out.push_str(&format!(
+            "  Excess attempt {} authorized by {} reconciliation (base limit {}).\n",
+            b.attempt, kind, b.attempt_limit
+        ));
+    } else if b.reconciliation_required {
+        out.push_str("  Reconciliation required before this attempt.\n");
+    }
+    if let Some(w) = &b.artifact_warning {
+        out.push_str(&format!("  Warning: {}\n", terminal_safe(w)));
+    }
+    if b.persona == "Security" {
+        out.push_str("  Blocking FAIL requires attacker, prerequisite capability, crossed boundary, concrete harm, and exact fix. Out-of-profile hardening is advisory unless it crosses into the declared profile.\n");
+    }
+    out
 }
 
 /// The model line, including any fallback note.
@@ -137,6 +196,7 @@ fn model_line(b: &NextBrief) -> String {
 pub fn render_generic(b: &NextBrief) -> String {
     let mut out = String::new();
     out.push_str(&format!("▸ Next phase: {} — {}\n", b.label, b.change));
+    out.push_str(&governance_lines(b));
     out.push_str(&format!(
         "  Persona: {} (model tier: {})\n",
         b.persona,
@@ -156,15 +216,16 @@ pub fn render_generic(b: &NextBrief) -> String {
 
 /// Render a brief as Claude Code subagent spawn instructions.
 pub fn render_claude_code(b: &NextBrief) -> String {
+    let governance = governance_lines(b);
     if b.persona == "main-session" || b.persona == "-" {
         return format!(
-            "▸ {} — {}\n  Handle in the main session (no subagent).\n\n  {}\n\n  When done: {}\n",
-            b.label, b.change, b.guidance, b.gate_command
+            "▸ {} — {}\n{}  Handle in the main session (no subagent).\n\n  {}\n\n  When done: {}\n",
+            b.label, b.change, governance, b.guidance, b.gate_command
         );
     }
     if b.dual {
         return format!(
-            "▸ {label} — {change}\n\
+            "▸ {label} — {change}\n{governance}\
              Spawn TWO subagents in parallel (both model: {model}):\n\
              - subagent_type: architect — functional/scope/technical accuracy\n\
              - subagent_type: designer  — purpose/value/representation\n\n\
@@ -172,6 +233,7 @@ pub fn render_claude_code(b: &NextBrief) -> String {
              PASS only if both confirm. Record: {cmd}\n",
             label = b.label,
             change = b.change,
+            governance = governance,
             model = model_line(b),
             guidance = b.guidance,
             cmd = b.gate_command,
@@ -183,7 +245,7 @@ pub fn render_claude_code(b: &NextBrief) -> String {
         format!("\n\nArtifacts to produce: {}", b.artifacts.join(", "))
     };
     format!(
-        "▸ {label} — {change}\n\
+        "▸ {label} — {change}\n{governance}\
          Spawn a subagent (Agent tool):\n\
          - subagent_type: {persona_lc}\n\
          - model: {model}\n\
@@ -191,6 +253,7 @@ pub fn render_claude_code(b: &NextBrief) -> String {
          Gate ({gate}). When the subagent returns, record: {cmd}\n",
         label = b.label,
         change = b.change,
+        governance = governance,
         persona_lc = b.persona.to_ascii_lowercase(),
         model = model_line(b),
         guidance = b.guidance,
@@ -204,15 +267,16 @@ pub fn render_claude_code(b: &NextBrief) -> String {
 /// so a phase is run as a Codex turn/session that adopts the persona directly,
 /// on the tier's GPT-5.6 model.
 pub fn render_codex(b: &NextBrief) -> String {
+    let governance = governance_lines(b);
     if b.persona == "main-session" || b.persona == "-" {
         return format!(
-            "▸ {} — {}\n  Handle in the current Codex session (no persona switch).\n\n  {}\n\n  When done: {}\n",
-            b.label, b.change, b.guidance, b.gate_command
+            "▸ {} — {}\n{}  Handle in the current Codex session (no persona switch).\n\n  {}\n\n  When done: {}\n",
+            b.label, b.change, governance, b.guidance, b.gate_command
         );
     }
     if b.dual {
         return format!(
-            "▸ {label} — {change}\n\
+            "▸ {label} — {change}\n{governance}\
              Validate from BOTH lenses (Codex is single-agent — run each in turn,\n\
              or a fresh `codex --model {model}` session per lens):\n\
              - Architect lens: functional/scope/technical accuracy\n\
@@ -222,6 +286,7 @@ pub fn render_codex(b: &NextBrief) -> String {
              PASS only if both lenses confirm. Record: {cmd}\n",
             label = b.label,
             change = b.change,
+            governance = governance,
             model = b.model,
             guidance = b.guidance,
             cmd = b.gate_command,
@@ -233,7 +298,7 @@ pub fn render_codex(b: &NextBrief) -> String {
         format!("\n  Artifacts to produce: {}", b.artifacts.join(", "))
     };
     format!(
-        "▸ {label} — {change}\n\
+        "▸ {label} — {change}\n{governance}\
          Run this phase as the {persona} persona (Codex has no subagent tool —\n\
          adopt the persona in this turn, or start a fresh `codex --model {model}`\n\
          session for model separation):\n\
@@ -242,6 +307,7 @@ pub fn render_codex(b: &NextBrief) -> String {
          Gate ({gate}). When done, record: {cmd}\n",
         label = b.label,
         change = b.change,
+        governance = governance,
         persona = b.persona,
         model = b.model,
         artifacts = artifacts,
@@ -312,6 +378,15 @@ mod tests {
     }
 
     #[test]
+    fn terminal_rendering_strips_control_sequences() {
+        assert_eq!(
+            terminal_safe("safe\u{1b}]8;;evil\u{7}text"),
+            "safe]8;;eviltext"
+        );
+        assert_eq!(terminal_safe("line\nnext\tcell"), "line\nnext\tcell");
+    }
+
+    #[test]
     fn builtin_default_covers_every_harness_and_tier() {
         assert_eq!(builtin_default("claude-code", true), "fable");
         assert_eq!(builtin_default("claude-code", false), "sonnet");
@@ -362,7 +437,17 @@ mod tests {
                     "fable",
                     "a rejected id must degrade to the built-in deep default, not leak the raw id"
                 );
-                let b = brief(&cfg, "change", Phase::Architecture, "claude-code");
+                let b = brief(
+                    &cfg,
+                    "change",
+                    Phase::Architecture,
+                    "claude-code",
+                    &Governance::default(),
+                    1,
+                    false,
+                    None,
+                    None,
+                );
                 let rendered = render_claude_code(&b);
                 // Only the *model line* is the actual injection surface (a raw
                 // id could otherwise coincidentally match ordinary prose

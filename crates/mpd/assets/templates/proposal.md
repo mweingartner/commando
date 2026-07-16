@@ -1,5 +1,7 @@
 # <!-- Change title -->
 
+<!-- Canonical current state. Move superseded drafts to history/. -->
+
 ## Why
 
 <!-- 1-2 sentences: the problem or opportunity. Why now? -->

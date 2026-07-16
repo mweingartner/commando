@@ -1,0 +1,353 @@
+{
+  "change": "improve-mpd-process-governance",
+  "schema": "mpd",
+  "ui": true,
+  "kind": "feature",
+  "phase": "done",
+  "gates": {
+    "design-mock": {
+      "verdict": "pass",
+      "by": "Designer",
+      "evidence": "openspec/changes/improve-mpd-process-governance/design.md",
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "architecture": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "openspec/changes/improve-mpd-process-governance/design.md#conditions-for-builder",
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "design-review": {
+      "verdict": "pass",
+      "by": "Designer",
+      "evidence": "openspec/changes/improve-mpd-process-governance/design.md#conditions-for-builder",
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "security-plan": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "openspec/changes/improve-mpd-process-governance/security-plan.md",
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "build": {
+      "verdict": "pass",
+      "by": "Builder",
+      "evidence": "openspec/changes/improve-mpd-process-governance/tasks.md",
+      "checks": {
+        "tests_passed": 169,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "security-code": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "openspec/changes/improve-mpd-process-governance/security-code.md",
+      "checks": {
+        "secrets_clean": true,
+        "scanner": "builtin+gitleaks"
+      },
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "design-signoff": {
+      "verdict": "pass",
+      "by": "Designer",
+      "evidence": "openspec/changes/improve-mpd-process-governance/design-signoff.md",
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "test": {
+      "verdict": "pass",
+      "by": "Tester",
+      "evidence": "openspec/changes/improve-mpd-process-governance/test.md",
+      "checks": {
+        "tests_passed": 171,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "documentation": {
+      "verdict": "pass",
+      "by": "Documenter",
+      "evidence": "openspec/changes/improve-mpd-process-governance/documentation.md",
+      "at": "2026-07-16",
+      "attempt": 0,
+      "started_at_epoch_secs": 0,
+      "completed_at_epoch_secs": 0
+    },
+    "deploy": {
+      "verdict": "pass",
+      "by": "main-session",
+      "evidence": "/Users/mweingar/dev/commando/openspec/changes/archive/2026-07-16-improve-mpd-process-governance",
+      "at": "2026-07-16",
+      "attempt": 2,
+      "started_at_epoch_secs": 1784239192,
+      "completed_at_epoch_secs": 1784239202
+    },
+    "doc-validation": {
+      "verdict": "pass",
+      "by": "Architect & Designer",
+      "evidence": "openspec/changes/improve-mpd-process-governance/doc-validation.md",
+      "at": "2026-07-16",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784239114,
+      "completed_at_epoch_secs": 1784239192
+    }
+  },
+  "conditions": [],
+  "history": [
+    {
+      "phase": "design-mock",
+      "record": {
+        "verdict": "pass",
+        "by": "Designer",
+        "evidence": "openspec/changes/improve-mpd-process-governance/design.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "architecture",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect",
+        "evidence": "openspec/changes/improve-mpd-process-governance/design.md#conditions-for-builder",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "design-review",
+      "record": {
+        "verdict": "pass",
+        "by": "Designer",
+        "evidence": "openspec/changes/improve-mpd-process-governance/design.md#conditions-for-builder",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "security-plan",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "openspec/changes/improve-mpd-process-governance/security-plan.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "build",
+      "record": {
+        "verdict": "pass",
+        "by": "Builder",
+        "evidence": "openspec/changes/improve-mpd-process-governance/tasks.md",
+        "checks": {
+          "tests_passed": 169,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "openspec/changes/improve-mpd-process-governance/security-code.md",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "design-signoff",
+      "record": {
+        "verdict": "fail",
+        "by": "Designer",
+        "evidence": "openspec/changes/improve-mpd-process-governance/design-signoff.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "openspec/changes/improve-mpd-process-governance/security-code.md",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "design-signoff",
+      "record": {
+        "verdict": "pass",
+        "by": "Designer",
+        "evidence": "openspec/changes/improve-mpd-process-governance/design-signoff.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "test",
+      "record": {
+        "verdict": "fail",
+        "by": "Tester",
+        "evidence": "openspec/changes/improve-mpd-process-governance/test.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "openspec/changes/improve-mpd-process-governance/security-code.md",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "design-signoff",
+      "record": {
+        "verdict": "pass",
+        "by": "Designer",
+        "evidence": "openspec/changes/improve-mpd-process-governance/design-signoff.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "test",
+      "record": {
+        "verdict": "pass",
+        "by": "Tester",
+        "evidence": "openspec/changes/improve-mpd-process-governance/test.md",
+        "checks": {
+          "tests_passed": 171,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "documentation",
+      "record": {
+        "verdict": "pass",
+        "by": "Documenter",
+        "evidence": "openspec/changes/improve-mpd-process-governance/documentation.md",
+        "at": "2026-07-16",
+        "attempt": 0,
+        "started_at_epoch_secs": 0,
+        "completed_at_epoch_secs": 0
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main-session",
+        "evidence": "openspec/changes/improve-mpd-process-governance/tasks.md",
+        "at": "2026-07-16",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784239114,
+        "completed_at_epoch_secs": 1784239114
+      }
+    },
+    {
+      "phase": "doc-validation",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect & Designer",
+        "evidence": "openspec/changes/improve-mpd-process-governance/doc-validation.md",
+        "at": "2026-07-16",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784239114,
+        "completed_at_epoch_secs": 1784239192
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main-session",
+        "evidence": "/Users/mweingar/dev/commando/openspec/changes/archive/2026-07-16-improve-mpd-process-governance",
+        "at": "2026-07-16",
+        "attempt": 2,
+        "started_at_epoch_secs": 1784239192,
+        "completed_at_epoch_secs": 1784239202
+      }
+    }
+  ],
+  "governance": {
+    "risk": "medium",
+    "threat_profile": "local-trusted-user",
+    "reconciliations": []
+  },
+  "phase_started_at_epoch_secs": 1784239192
+}

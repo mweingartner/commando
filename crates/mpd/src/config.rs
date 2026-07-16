@@ -1,6 +1,6 @@
 //! Project-local mpd configuration (`.mpd/config.json`).
 
-use crate::ledger::mpd_dir;
+use crate::ledger::{mpd_dir, RiskLevel, ThreatProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,9 @@ pub type ModelMap = BTreeMap<String, BTreeMap<String, String>>;
 /// Configuration read from `.mpd/config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    /// Optional project defaults for newly begun changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<GovernanceDefaults>,
     /// The command that runs the test suite (e.g. `cargo test`). Required for
     /// the Build/Test gates to verify a real, non-zero pass count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +38,14 @@ pub struct Config {
     /// Fallback model per model id, e.g. `{"fable": "opus"}` — surfaced as a note.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_fallbacks: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<RiskLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threat_profile: Option<ThreatProfile>,
 }
 
 impl Config {
@@ -195,6 +206,24 @@ mod tests {
         assert!(valid_model_id(&"a".repeat(64)));
         assert!(!valid_model_id("has space"));
         assert!(!valid_model_id("has/slash"));
+    }
+
+    #[test]
+    fn legacy_config_and_governance_defaults_both_deserialize() {
+        let legacy: Config = serde_json::from_str(r#"{"test":"cargo test"}"#).unwrap();
+        assert_eq!(legacy.governance, None);
+        let configured: Config = serde_json::from_str(
+            r#"{"governance":{"risk":"high","threat_profile":"credential-bearing"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.governance.as_ref().unwrap().risk,
+            Some(RiskLevel::High)
+        );
+        assert_eq!(
+            configured.governance.as_ref().unwrap().threat_profile,
+            Some(ThreatProfile::CredentialBearing)
+        );
     }
 
     #[cfg(unix)]

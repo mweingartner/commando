@@ -1,3 +1,13 @@
 {
-  "test": "cargo test --workspace"
+  "test": "cargo test --workspace",
+  "models": {
+    "codex": {
+      "Architect": "sol",
+      "Designer": "sol",
+      "Security": "terra",
+      "Builder": "terra",
+      "Tester": "terra",
+      "Documenter": "luna"
+    }
+  }
 }

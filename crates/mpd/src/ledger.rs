@@ -11,6 +11,136 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+macro_rules! string_enum {
+    ($name:ident, $default:ident, { $($variant:ident => $text:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum $name { $(#[doc = $text] $variant,)+ }
+        impl $name {
+            pub fn label(self) -> &'static str { match self { $(Self::$variant => $text,)+ } }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.label()) }
+        }
+        impl FromStr for $name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s { $($text => Ok(Self::$variant),)+ _ => Err(format!("unsupported {} {s:?}", stringify!($name))) }
+            }
+        }
+        impl Default for $name { fn default() -> Self { Self::$default } }
+    };
+}
+
+string_enum!(RiskLevel, Medium, { Low => "low", Medium => "medium", High => "high" });
+string_enum!(ThreatProfile, LocalTrustedUser, {
+    LocalTrustedUser => "local-trusted-user", LocalUntrustedInput => "local-untrusted-input",
+    NetworkClient => "network-client", NetworkServer => "network-server",
+    CredentialBearing => "credential-bearing", HighAssurance => "high-assurance"
+});
+string_enum!(FailureClass, Product, {
+    Product => "product", Test => "test", Infrastructure => "infrastructure",
+    Environment => "environment", Policy => "policy"
+});
+
+impl RiskLevel {
+    pub fn attempt_limit(self) -> usize {
+        match self {
+            Self::Low => 1,
+            Self::Medium => 2,
+            Self::High => 3,
+        }
+    }
+    pub fn page_limit(self) -> Option<usize> {
+        match self {
+            Self::Low => Some(2),
+            Self::Medium => Some(8),
+            Self::High => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Governance {
+    pub risk: RiskLevel,
+    pub threat_profile: ThreatProfile,
+    #[serde(default)]
+    pub reconciliations: Vec<Reconciliation>,
+}
+impl Default for Governance {
+    fn default() -> Self {
+        Self {
+            risk: RiskLevel::Medium,
+            threat_profile: ThreatProfile::LocalTrustedUser,
+            reconciliations: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exploitability {
+    pub attacker: String,
+    pub capability: String,
+    pub boundary: String,
+    pub harm: String,
+    pub fix: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReconciliationKind {
+    Continue,
+    Narrow,
+    Risk,
+    ThreatProfile,
+}
+
+impl ReconciliationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Narrow => "narrow",
+            Self::Risk => "risk",
+            Self::ThreatProfile => "threat-profile",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reconciliation {
+    pub kind: ReconciliationKind,
+    pub reason: String,
+    pub phase: Phase,
+    pub authorized_attempt: usize,
+    pub at_epoch_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<String>,
+    #[serde(default)]
+    pub consumed: bool,
+}
+
+pub fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub fn bounded_text(value: &str, field: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{field} must not be blank"));
+    }
+    if value.chars().count() > 500 {
+        return Err(format!("{field} must be at most 500 characters"));
+    }
+    Ok(value.to_string())
+}
 
 fn invalid(e: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, e)
@@ -102,6 +232,23 @@ pub struct GateRecord {
     pub checks: Option<CheckSummary>,
     /// When it was recorded (`YYYY-MM-DD`).
     pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exploitability: Option<Exploitability>,
+    #[serde(default)]
+    pub attempt: usize,
+    #[serde(default)]
+    pub started_at_epoch_secs: u64,
+    #[serde(default)]
+    pub completed_at_epoch_secs: u64,
+}
+
+impl GateRecord {
+    pub fn duration_secs(&self) -> u64 {
+        self.completed_at_epoch_secs
+            .saturating_sub(self.started_at_epoch_secs)
+    }
 }
 
 /// An open condition from a CONDITIONAL PASS that blocks archive until closed.
@@ -152,15 +299,30 @@ pub struct Ledger {
     /// optional so pre-existing ledgers deserialize with an empty history.
     #[serde(default)]
     pub history: Vec<GateEvent>,
+    #[serde(default)]
+    pub governance: Governance,
+    #[serde(default)]
+    pub phase_started_at_epoch_secs: u64,
 }
 
 impl Ledger {
     /// A fresh ledger positioned at the first applicable phase.
+    #[cfg(test)]
     pub fn new(
         change: impl Into<String>,
         schema: impl Into<String>,
         ui: bool,
         kind: ChangeKind,
+    ) -> Ledger {
+        Self::new_with_governance(change, schema, ui, kind, Governance::default())
+    }
+
+    pub fn new_with_governance(
+        change: impl Into<String>,
+        schema: impl Into<String>,
+        ui: bool,
+        kind: ChangeKind,
+        governance: Governance,
     ) -> Ledger {
         let applicability = Applicability {
             ui,
@@ -175,7 +337,97 @@ impl Ledger {
             gates: BTreeMap::new(),
             conditions: Vec::new(),
             history: Vec::new(),
+            governance,
+            phase_started_at_epoch_secs: now_epoch_secs(),
         }
+    }
+
+    pub fn attempts_for(&self, phase: Phase) -> usize {
+        self.history.iter().filter(|e| e.phase == phase).count()
+    }
+    pub fn next_attempt(&self, phase: Phase) -> usize {
+        next_attempt_after(self.attempts_for(phase))
+    }
+    pub fn attempt_authorized(&self, phase: Phase) -> bool {
+        let next = self.next_attempt(phase);
+        next <= self.governance.risk.attempt_limit()
+            || self
+                .governance
+                .reconciliations
+                .iter()
+                .any(|r| !r.consumed && r.phase == phase && r.authorized_attempt == next)
+    }
+
+    /// The one-shot reconciliation authorizing the next excess attempt, if any.
+    pub fn attempt_authorization(&self, phase: Phase) -> Option<&Reconciliation> {
+        let next = self.next_attempt(phase);
+        (next > self.governance.risk.attempt_limit())
+            .then(|| {
+                self.governance
+                    .reconciliations
+                    .iter()
+                    .find(|r| !r.consumed && r.phase == phase && r.authorized_attempt == next)
+            })
+            .flatten()
+    }
+    pub fn reconcile(
+        &mut self,
+        kind: ReconciliationKind,
+        reason: String,
+        new_value: Option<String>,
+    ) -> Result<(), String> {
+        let reason = bounded_text(&reason, "reason")?;
+        let phase = self.phase;
+        let mut prior = None;
+        let mut new = None;
+        match kind {
+            ReconciliationKind::Risk => {
+                let value: RiskLevel = new_value.ok_or("--risk requires a value")?.parse()?;
+                prior = Some(self.governance.risk.to_string());
+                new = Some(value.to_string());
+                self.governance.risk = value;
+                self.invalidate_from_security();
+            }
+            ReconciliationKind::ThreatProfile => {
+                let value: ThreatProfile = new_value
+                    .ok_or("--threat-profile requires a value")?
+                    .parse()?;
+                prior = Some(self.governance.threat_profile.to_string());
+                new = Some(value.to_string());
+                self.governance.threat_profile = value;
+                self.invalidate_from_security();
+            }
+            _ => {}
+        }
+        let phase = if matches!(
+            kind,
+            ReconciliationKind::Risk | ReconciliationKind::ThreatProfile
+        ) {
+            self.phase
+        } else {
+            phase
+        };
+        let authorized_attempt = self.next_attempt(phase);
+        self.governance.reconciliations.push(Reconciliation {
+            kind,
+            reason,
+            phase,
+            authorized_attempt,
+            at_epoch_secs: now_epoch_secs(),
+            prior,
+            new,
+            consumed: false,
+        });
+        Ok(())
+    }
+    fn invalidate_from_security(&mut self) {
+        for p in Phase::applicable(self.applicability()) {
+            if p >= Phase::SecurityPlan {
+                self.gates.remove(&p);
+            }
+        }
+        self.phase = Phase::SecurityPlan;
+        self.phase_started_at_epoch_secs = now_epoch_secs();
     }
 
     /// The change's phase applicability (which optional phase groups run).
@@ -198,8 +450,17 @@ impl Ledger {
             record: record.clone(),
         });
         self.gates.insert(phase, record);
+        if let Some(r) = self.governance.reconciliations.iter_mut().find(|r| {
+            !r.consumed
+                && r.phase == phase
+                && r.authorized_attempt
+                    == self.history.last().map(|e| e.record.attempt).unwrap_or(0)
+        }) {
+            r.consumed = true;
+        }
         if advances && phase == self.phase {
             self.phase = phase.next(self.applicability());
+            self.phase_started_at_epoch_secs = now_epoch_secs();
         }
     }
 
@@ -262,6 +523,10 @@ impl Ledger {
         }
         n
     }
+}
+
+fn next_attempt_after(prior_attempts: usize) -> usize {
+    prior_attempts.saturating_add(1)
 }
 
 /// `<root>/.mpd`.
@@ -331,6 +596,11 @@ mod tests {
             evidence: None,
             checks: None,
             at: "2026-07-11".to_string(),
+            failure_class: None,
+            exploitability: None,
+            attempt: 1,
+            started_at_epoch_secs: 0,
+            completed_at_epoch_secs: 0,
         }
     }
 
@@ -406,8 +676,88 @@ mod tests {
         let l: Ledger = serde_json::from_str(json).unwrap();
         assert!(l.history.is_empty());
         assert_eq!(l.phase, Phase::Build);
+        assert_eq!(l.governance, Governance::default());
         let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         assert_eq!(l, back);
+    }
+
+    #[test]
+    fn typed_governance_parsing_is_closed_and_bounded() {
+        assert_eq!("low".parse::<RiskLevel>().unwrap(), RiskLevel::Low);
+        assert_eq!(
+            "network-server".parse::<ThreatProfile>().unwrap(),
+            ThreatProfile::NetworkServer
+        );
+        assert_eq!(
+            "environment".parse::<FailureClass>().unwrap(),
+            FailureClass::Environment
+        );
+        assert!("LOW".parse::<RiskLevel>().is_err());
+        assert!("unknown".parse::<ThreatProfile>().is_err());
+        assert!(bounded_text("  reason  ", "reason").is_ok());
+        assert!(bounded_text(" ", "reason").is_err());
+        assert!(bounded_text(&"x".repeat(501), "reason").is_err());
+    }
+
+    #[test]
+    fn low_risk_retry_requires_and_consumes_one_reconciliation() {
+        let governance = Governance {
+            risk: RiskLevel::Low,
+            threat_profile: ThreatProfile::LocalTrustedUser,
+            reconciliations: vec![],
+        };
+        let mut l = Ledger::new_with_governance("c", "mpd", false, ChangeKind::Fix, governance);
+        let mut failed = pass("Architect");
+        failed.verdict = Verdict::Fail;
+        failed.failure_class = Some(FailureClass::Product);
+        failed.attempt = 1;
+        l.record(Phase::Architecture, failed);
+        assert!(!l.attempt_authorized(Phase::Architecture));
+        l.reconcile(ReconciliationKind::Continue, "fix is ready".into(), None)
+            .unwrap();
+        assert!(l.attempt_authorized(Phase::Architecture));
+        let mut retried = pass("Architect");
+        retried.attempt = 2;
+        l.record(Phase::Architecture, retried);
+        assert!(l.governance.reconciliations[0].consumed);
+    }
+
+    #[test]
+    fn governance_change_retains_history_and_rewinds_only_security_and_downstream() {
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        l.record(Phase::Architecture, pass("Architect"));
+        l.record(Phase::SecurityPlan, pass("Security"));
+        l.record(Phase::Build, pass("Builder"));
+        let history_len = l.history.len();
+        l.reconcile(
+            ReconciliationKind::ThreatProfile,
+            "input is now untrusted".into(),
+            Some("local-untrusted-input".into()),
+        )
+        .unwrap();
+        assert_eq!(l.phase, Phase::SecurityPlan);
+        assert!(l.gates.contains_key(&Phase::Architecture));
+        assert!(!l.gates.contains_key(&Phase::SecurityPlan));
+        assert!(!l.gates.contains_key(&Phase::Build));
+        assert_eq!(l.history.len(), history_len);
+        assert_eq!(
+            l.governance.threat_profile,
+            ThreatProfile::LocalUntrustedInput
+        );
+    }
+
+    #[test]
+    fn backward_clock_duration_clamps_to_zero() {
+        let mut rec = pass("Tester");
+        rec.started_at_epoch_secs = 20;
+        rec.completed_at_epoch_secs = 10;
+        assert_eq!(rec.duration_secs(), 0);
+    }
+
+    #[test]
+    fn next_attempt_saturates_at_usize_max() {
+        assert_eq!(next_attempt_after(usize::MAX), usize::MAX);
+        assert_eq!(next_attempt_after(0), 1);
     }
 
     #[test]

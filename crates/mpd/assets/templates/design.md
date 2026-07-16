@@ -4,6 +4,9 @@
 
 <!-- Background, current state, constraints. -->
 
+This file is the canonical current-state contract. Move superseded drafts and
+reviews to `history/`; do not accumulate contradictory amendments here.
+
 ## Goals / Non-Goals
 
 ## Decisions

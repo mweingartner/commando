@@ -128,11 +128,12 @@ gate <phase>` — so a human, Claude Code, or Codex all drive it identically.
 
 ```
 mpd init [--test <cmd>]              # scaffold openspec/ + mpd schema + install the commit gate
-mpd begin <name> [--ui] [--fix|--chore]   # new change (--ui adds design phases; --fix/--chore skip docs)
+mpd begin <name> [--ui] [--fix|--chore] [--risk low|medium|high] [--threat-profile <profile>]
 mpd status [--change N] [--json]    # current phase, gate verdicts, tasks, archive readiness
 mpd next [--harness ...] [--full] [--json]  # emit the next persona's brief (generic | claude-code | codex)
 mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C]
 mpd resolve <n> | --all             # close open CONDITIONAL-PASS conditions (they block archive)
+mpd reconcile --continue "reason"   # authorize one excess attempt; also --narrow/--risk/--threat-profile
 mpd check [--staged]                # run the secret scan now (+ external scanners/tests unless --staged)
 mpd archive [--yes] [--skip-specs]  # dry-run preview, then fold specs + docs into the record & archive
 mpd doctor [--json]                 # diagnose setup (schema, directives, hook, scanners, test/deploy cmd, allowlist)
@@ -142,6 +143,31 @@ mpd doctor [--json]                 # diagnose setup (schema, directives, hook, 
 changes: they skip the two Documentation phases. `--ui` adds the three Design
 phases. Neither flag bypasses a gate — they only change *which optional phases
 apply*.
+
+### Proportional governance
+
+Every change records a risk level and threat profile. Without flags, UI changes
+default to medium risk, other changes to low risk, and the threat profile is
+`local-trusted-user`; project defaults may be set under `governance` in
+`.mpd/config.json`. Other profiles are `local-untrusted-input`,
+`network-client`, `network-server`, `credential-bearing`, and `high-assurance`.
+
+Every FAIL requires one class: `product`, `test`, `infrastructure`,
+`environment`, or `policy`. Security FAIL additionally requires structured
+`--attacker`, `--capability`, `--boundary`, `--harm`, and `--fix` evidence so a
+blocker states a credible exploit path inside or into the declared profile.
+Out-of-profile defense in depth remains advisory.
+
+Low, medium, and high risk allow one, two, and three attempts per phase before
+an explicit `mpd reconcile` decision is required. Reconciliation authorizes one
+attempt and never advances or erases a failed gate. Changing risk or threat
+profile retains history and rewinds Security plan and downstream gates.
+Artifact guidance is advisory (about two pages for low and eight for medium;
+unbounded for high) across canonical proposal/design/tasks. Superseded prose
+belongs in `history/`.
+
+This release does not cache evidence, enforce commit manifests, publish, or
+attest Git remote parity; those require a separate lifecycle design.
 
 ## The gates are real, not self-reported
 
