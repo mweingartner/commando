@@ -162,6 +162,7 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
         model_fallbacks,
         hermetic_reuse: None,
         closure: None,
+        personas: std::collections::BTreeMap::new(),
     };
     let cfg_path = crate::config::config_path(root);
     if !cfg_path.exists() {

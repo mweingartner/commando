@@ -46,6 +46,117 @@ string_enum!(FailureClass, Product, {
     Product => "product", Test => "test", Infrastructure => "infrastructure",
     Environment => "environment", Policy => "policy"
 });
+// Per-persona tuning knobs (persona-tuning). Both are strengthen-only ordinals:
+// the lowest term is the baseline no-op, and there is deliberately no sub-baseline
+// term, so a user cannot dial a persona weaker through the menus (design.md D2).
+string_enum!(Rigor, Standard, {
+    Standard => "standard", Deep => "deep", Paranoid => "paranoid"
+});
+string_enum!(Depth, Examples, {
+    Examples => "examples", Property => "property", Fuzz => "fuzz"
+});
+
+impl Rigor {
+    /// Total order over rigor (`standard` < `deep` < `paranoid`). Manual, like
+    /// [`RiskLevel::rank`] — `string_enum!` does NOT generate a `rank()`. Used to
+    /// keep composition strengthen-only (a monotonic `max`), never a string
+    /// comparison (design.md Cond 3).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Standard => 0,
+            Self::Deep => 1,
+            Self::Paranoid => 2,
+        }
+    }
+}
+
+impl Depth {
+    /// Total order over Tester depth (`examples` < `property` < `fuzz`). Manual,
+    /// like [`RiskLevel::rank`]. Strengthen-only emphasis (design.md D2/Cond 3).
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Examples => 0,
+            Self::Property => 1,
+            Self::Fuzz => 2,
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn max_rigor(a: Option<Rigor>, b: Option<Rigor>) -> Option<Rigor> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if x.rank() >= y.rank() { x } else { y }),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    }
+}
+
+fn max_depth(a: Option<Depth>, b: Option<Depth>) -> Option<Depth> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if x.rank() >= y.rank() { x } else { y }),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    }
+}
+
+/// The persona tuning that was in force for a brief/gate — the durable, auditable
+/// record that a tuned persona's PASS is not indistinguishable from a full-rigor
+/// PASS (design.md D5). `weakened` is true iff an un-rankable vector was present
+/// (a free-text `directive_append` OR a `modified:true` base directive) — the one
+/// thing mpd cannot prove rigor-preserving, so it is recorded, never blocked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaTuningRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rigor: Option<Rigor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<Depth>,
+    /// A sanitized config `directive_append` was carried in the brief.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub had_append: bool,
+    /// The base directive file for this persona differed from the bundled default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub base_modified: bool,
+    /// `had_append || base_modified` — the un-rankable weakening flag.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub weakened: bool,
+}
+
+impl PersonaTuningRecord {
+    /// Whether this record carries nothing worth recording (the baseline no-op):
+    /// no above-baseline rigor/depth, no append, no modified base. `next` writes a
+    /// `brief_tuning` slot only when this is false (design.md Cond 11 — inertness).
+    pub fn is_baseline(&self) -> bool {
+        self.rigor.map_or(0, Rigor::rank) == 0
+            && self.depth.map_or(0, Depth::rank) == 0
+            && !self.had_append
+            && !self.base_modified
+    }
+
+    /// Merge `other` in the weakest-seen (strengthen-only) direction: booleans OR,
+    /// ordinals `max`. Once `weakened`/`base_modified`/`had_append` is set for an
+    /// attempt, a later non-weakened re-brief can never clear it (design.md Cond 11,
+    /// round-3 F2) — the anti-laundering property.
+    pub fn merge_weakest_seen(&mut self, other: &PersonaTuningRecord) {
+        self.had_append |= other.had_append;
+        self.base_modified |= other.base_modified;
+        self.weakened |= other.weakened;
+        self.rigor = max_rigor(self.rigor, other.rigor);
+        self.depth = max_depth(self.depth, other.depth);
+    }
+}
+
+/// The brief-time tuning `mpd next` recorded for a `(phase, attempt)`, consumed by
+/// `mpd gate` to stamp the receipt from what the brief actually carried — closing
+/// the `next`→`gate` TOCTOU (design.md D5 §2). Inert to every dependency/brief
+/// digest; it gates nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefTuning {
+    pub attempt: usize,
+    pub record: PersonaTuningRecord,
+}
 
 impl RiskLevel {
     pub fn attempt_limit(self) -> usize {
@@ -282,6 +393,12 @@ pub struct GateRecord {
     /// never `valid`, per design.md "Legacy gate has no receipt".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<EvidenceReceipt>,
+    /// The persona tuning in force when this gate was recorded, stamped from the
+    /// brief's recorded determination (design.md D5). Absent on every baseline
+    /// (untuned) gate and every legacy record — a tuned PASS is then no longer
+    /// indistinguishable in the ledger from a full-rigor PASS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_tuning: Option<PersonaTuningRecord>,
 }
 
 impl GateRecord {
@@ -363,6 +480,13 @@ pub struct Ledger {
     /// before this schema existed and for any change not yet archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_closure: Option<ArchiveClosure>,
+    /// Per-phase brief-time persona tuning `mpd next` recorded, keyed by phase with
+    /// the attempt carried inside. Written only when a non-baseline tuning was in
+    /// force (so an untuned ledger is byte-identical), and consumed by `mpd gate`
+    /// to stamp the receipt from what the brief carried (design.md D5 §2 / Cond 11).
+    /// Additive + `#[serde(default)]`; inert to every digest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub brief_tuning: BTreeMap<Phase, BriefTuning>,
 }
 
 impl Ledger {
@@ -402,7 +526,40 @@ impl Ledger {
             waivers: Vec::new(),
             phase_started_at_epoch_secs: now_epoch_secs(),
             archive_closure: None,
+            brief_tuning: BTreeMap::new(),
         }
+    }
+
+    /// Record the brief-time tuning `next` computed for `phase` at `attempt`,
+    /// monotonic weakest-seen: a record for the SAME attempt is MERGED (never
+    /// downgraded — design.md Cond 11, round-3 F2); a different attempt replaces.
+    /// Callers write only when `record.is_baseline()` is false (inertness).
+    pub fn record_brief_tuning(
+        &mut self,
+        phase: Phase,
+        attempt: usize,
+        record: PersonaTuningRecord,
+    ) {
+        match self.brief_tuning.get_mut(&phase) {
+            Some(existing) if existing.attempt == attempt => {
+                existing.record.merge_weakest_seen(&record);
+            }
+            _ => {
+                self.brief_tuning
+                    .insert(phase, BriefTuning { attempt, record });
+            }
+        }
+    }
+
+    /// The brief-time tuning recorded for `phase` iff it matches `attempt` — the
+    /// gate consumes it only on an exact `(phase, attempt)` match, falling back to
+    /// a live determination otherwise so a stale superseded record can never mask
+    /// (design.md Cond 11, round-3 F4).
+    pub fn brief_tuning_for(&self, phase: Phase, attempt: usize) -> Option<&PersonaTuningRecord> {
+        self.brief_tuning
+            .get(&phase)
+            .filter(|bt| bt.attempt == attempt)
+            .map(|bt| &bt.record)
     }
 
     /// Turn on the strict (self-enforcing) tier. Write-once / monotonic: this is
@@ -667,6 +824,7 @@ pub fn set_current(root: &Path, change: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn pass(by: &str) -> GateRecord {
         GateRecord {
@@ -681,6 +839,7 @@ mod tests {
             started_at_epoch_secs: 0,
             completed_at_epoch_secs: 0,
             receipt: None,
+            persona_tuning: None,
         }
     }
 
@@ -967,6 +1126,119 @@ mod tests {
     }
 
     #[test]
+    fn persona_tuning_record_is_baseline_and_merges_weakest_seen() {
+        // is_baseline: nothing above baseline ⇒ true.
+        assert!(PersonaTuningRecord::default().is_baseline());
+        assert!(PersonaTuningRecord {
+            rigor: Some(Rigor::Standard),
+            depth: Some(Depth::Examples),
+            ..Default::default()
+        }
+        .is_baseline());
+        assert!(!PersonaTuningRecord {
+            rigor: Some(Rigor::Deep),
+            ..Default::default()
+        }
+        .is_baseline());
+        assert!(!PersonaTuningRecord {
+            had_append: true,
+            weakened: true,
+            ..Default::default()
+        }
+        .is_baseline());
+
+        // merge_weakest_seen: a later clean record can NEVER downgrade a recorded
+        // weakening (round-3 F2 anti-laundering) — booleans OR, ordinals max.
+        let mut weakened = PersonaTuningRecord {
+            rigor: Some(Rigor::Deep),
+            had_append: true,
+            base_modified: true,
+            weakened: true,
+            ..Default::default()
+        };
+        let clean = PersonaTuningRecord {
+            rigor: Some(Rigor::Standard),
+            ..Default::default()
+        };
+        weakened.merge_weakest_seen(&clean);
+        assert!(weakened.weakened, "a clean merge cannot clear weakened");
+        assert!(weakened.had_append && weakened.base_modified);
+        assert_eq!(
+            weakened.rigor,
+            Some(Rigor::Deep),
+            "rigor is max, never lowered"
+        );
+
+        // A stronger later record raises the ordinal.
+        let mut base = PersonaTuningRecord {
+            rigor: Some(Rigor::Deep),
+            ..Default::default()
+        };
+        base.merge_weakest_seen(&PersonaTuningRecord {
+            rigor: Some(Rigor::Paranoid),
+            ..Default::default()
+        });
+        assert_eq!(base.rigor, Some(Rigor::Paranoid));
+    }
+
+    #[test]
+    fn record_brief_tuning_merges_same_attempt_replaces_other() {
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        let weak = PersonaTuningRecord {
+            had_append: true,
+            weakened: true,
+            ..Default::default()
+        };
+        l.record_brief_tuning(Phase::SecurityCode, 1, weak);
+        // A later non-baseline-but-non-weakened re-brief at the SAME attempt merges
+        // (weakest-seen) — it must NOT downgrade the recorded weakened (round-3 F2).
+        l.record_brief_tuning(
+            Phase::SecurityCode,
+            1,
+            PersonaTuningRecord {
+                rigor: Some(Rigor::Deep),
+                ..Default::default()
+            },
+        );
+        let rec = l.brief_tuning_for(Phase::SecurityCode, 1).unwrap();
+        assert!(rec.weakened, "same-attempt merge preserves weakened");
+        assert_eq!(rec.rigor, Some(Rigor::Deep));
+        // A DIFFERENT attempt replaces (a fresh attempt starts clean).
+        l.record_brief_tuning(
+            Phase::SecurityCode,
+            2,
+            PersonaTuningRecord {
+                rigor: Some(Rigor::Deep),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !l.brief_tuning_for(Phase::SecurityCode, 2).unwrap().weakened,
+            "a new attempt replaces the slot"
+        );
+        // The gate consumes the record ONLY on an exact (phase, attempt) match.
+        assert!(l.brief_tuning_for(Phase::SecurityCode, 99).is_none());
+        assert!(l.brief_tuning_for(Phase::Test, 1).is_none());
+    }
+
+    #[test]
+    fn legacy_ledger_defaults_empty_brief_tuning_and_gate_no_persona_tuning() {
+        let json = r#"{
+            "change": "c", "schema": "mpd", "ui": false, "kind": "fix",
+            "phase": "build",
+            "gates": { "architecture": { "verdict": "pass", "by": "Architect", "at": "2026-07-11" } },
+            "conditions": []
+        }"#;
+        let l: Ledger = serde_json::from_str(json).unwrap();
+        assert!(l.brief_tuning.is_empty());
+        assert_eq!(l.gates[&Phase::Architecture].persona_tuning, None);
+        // An empty brief_tuning + None stamp never serialize (byte-identical).
+        let out = serde_json::to_string(&l).unwrap();
+        assert!(!out.contains("brief_tuning"));
+        assert!(!out.contains("persona_tuning"));
+    }
+
+    #[test]
     fn security_rewind_drops_strict_waivers_for_rewound_phases() {
         // A waiver recorded for a phase at/after Security (plan) is dropped when
         // a governance change rewinds to Security (plan) — exactly as the gate
@@ -1002,5 +1274,91 @@ mod tests {
             vec![Phase::Architecture],
             "only the upstream (non-rewound) waiver survives the rewind"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Anti-laundering property (design.md Cond 11, round-3 F2): for ANY two
+    // `PersonaTuningRecord`s, `merge_weakest_seen` never clears a set
+    // `weakened`/`had_append`/`base_modified` flag and never lowers a
+    // rigor/depth ordinal — the weakest-seen-monotonicity guarantee the hand-
+    // written example test (`persona_tuning_record_is_baseline_and_merges_weakest_seen`)
+    // only samples a few fixed points of.
+    // -----------------------------------------------------------------
+
+    fn arb_pt_rigor() -> impl Strategy<Value = Option<Rigor>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(Rigor::Standard)),
+            Just(Some(Rigor::Deep)),
+            Just(Some(Rigor::Paranoid)),
+        ]
+    }
+
+    fn arb_pt_depth() -> impl Strategy<Value = Option<Depth>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(Depth::Examples)),
+            Just(Some(Depth::Property)),
+            Just(Some(Depth::Fuzz)),
+        ]
+    }
+
+    fn arb_persona_tuning_record() -> impl Strategy<Value = PersonaTuningRecord> {
+        (
+            arb_pt_rigor(),
+            arb_pt_depth(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(rigor, depth, had_append, base_modified, weakened)| {
+                PersonaTuningRecord {
+                    rigor,
+                    depth,
+                    had_append,
+                    base_modified,
+                    weakened,
+                }
+            })
+    }
+
+    proptest! {
+        /// `merge_weakest_seen` is monotone in every field, for arbitrary record
+        /// pairs: each boolean can only ever become MORE true (OR, never AND or
+        /// overwrite), and each ordinal can only ever rise to the max of the two
+        /// inputs, never fall below either side. This is the property that makes
+        /// laundering ("re-brief clean to erase a recorded weakening")
+        /// impossible regardless of which two records are merged, generalizing
+        /// the hand-picked example in
+        /// `persona_tuning_record_is_baseline_and_merges_weakest_seen`.
+        ///
+        /// Non-vacuity (Tester, verified by revert→red→restore): changing
+        /// `self.had_append |= other.had_append` to `self.had_append =
+        /// other.had_append` (a blind overwrite, one field) reddens this test
+        /// immediately with a minimal counterexample
+        /// (`a.had_append=true, b.had_append=false` → merged `false`).
+        #[test]
+        fn merge_weakest_seen_never_downgrades_either_input(
+            mut a in arb_persona_tuning_record(),
+            b in arb_persona_tuning_record(),
+        ) {
+            let before = a.clone();
+            a.merge_weakest_seen(&b);
+
+            // Booleans: the merged value is exactly the OR of both inputs — it
+            // can never be false when either input was true.
+            prop_assert_eq!(a.had_append, before.had_append || b.had_append);
+            prop_assert_eq!(a.base_modified, before.base_modified || b.base_modified);
+            prop_assert_eq!(a.weakened, before.weakened || b.weakened);
+
+            // Ordinals: the merged rank is >= both inputs' ranks (a true max,
+            // never a blind overwrite by whichever side happened to be `other`).
+            let a_rigor_rank = a.rigor.map_or(0, Rigor::rank);
+            prop_assert!(a_rigor_rank >= before.rigor.map_or(0, Rigor::rank));
+            prop_assert!(a_rigor_rank >= b.rigor.map_or(0, Rigor::rank));
+            let a_depth_rank = a.depth.map_or(0, Depth::rank);
+            prop_assert!(a_depth_rank >= before.depth.map_or(0, Depth::rank));
+            prop_assert!(a_depth_rank >= b.depth.map_or(0, Depth::rank));
+        }
     }
 }

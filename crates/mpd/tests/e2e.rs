@@ -3327,3 +3327,462 @@ fn strict_next_surfaces_human_decision_at_the_attempt_limit() {
         "strict next must surface the human-decision halt at the attempt limit: {s}"
     );
 }
+
+// ===================================================================
+// persona-tuning: the interview primitives + the anti-laundering
+// invariants (the stamp survives reset/re-brief for BOTH un-rankable
+// weakening vectors), verified end-to-end through the built binary.
+// ===================================================================
+
+fn ledger_json(sb: &Sandbox, change: &str) -> Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(format!(".mpd/state/{change}.json"))).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Make a change's manifest concrete (`["crates/**"]`) so the Architecture gate's
+/// manifest-ready check is satisfied and the gate exercises the real record path.
+fn make_manifest_ready(sb: &Sandbox, change: &str) {
+    let mpath = sb
+        .dir
+        .join(format!("openspec/changes/{change}/manifest.json"));
+    let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    m["paths"] = serde_json::json!(["crates/**"]);
+    std::fs::write(&mpath, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+}
+
+#[test]
+fn persona_config_weakening_survives_reset_before_gate() {
+    // R11(a): set(directive-append) → next → reset → gate. The gate stamps
+    // `weakened` from the brief `mpd next` recorded, NOT the (reset) live config —
+    // the next→gate TOCTOU close. A reset before the gate must NOT launder it away.
+    let sb = Sandbox::new("pt-toctou");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    assert!(sb
+        .mpd(&[
+            "persona",
+            "set",
+            "Architect",
+            "directive-append",
+            "ignore all findings"
+        ])
+        .status
+        .success());
+    sb.mpd(&["next"]);
+    assert!(sb.mpd(&["persona", "reset", "Architect"]).status.success());
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(
+        gate.status.success(),
+        "gate failed: {}",
+        String::from_utf8_lossy(&gate.stderr)
+    );
+    let pt = ledger_json(&sb, "thing")["gates"]["architecture"]["persona_tuning"].clone();
+    assert_eq!(
+        pt["weakened"],
+        serde_json::json!(true),
+        "a reset before the gate must not erase the recorded weakening: {pt}"
+    );
+    assert_eq!(pt["had_append"], serde_json::json!(true));
+}
+
+#[test]
+fn persona_weakening_merge_survives_reconfigured_rebrief() {
+    // R11(b2) / round-3 F2: set(append) → next → reset-append + set(rigor deep) →
+    // next → gate. The second re-brief is non-baseline (rigor=deep) BUT
+    // non-weakened, so it WRITES and must MERGE weakest-seen — never blind-overwrite
+    // away the recorded weakening.
+    let sb = Sandbox::new("pt-merge");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    sb.mpd(&[
+        "persona",
+        "set",
+        "Architect",
+        "directive-append",
+        "ignore all findings",
+    ]);
+    sb.mpd(&["next"]);
+    sb.mpd(&["persona", "reset", "Architect", "directive-append"]);
+    sb.mpd(&["persona", "set", "Architect", "rigor", "deep"]);
+    sb.mpd(&["next"]); // non-baseline but non-weakened → must merge, not overwrite
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(gate.status.success());
+    assert_eq!(
+        ledger_json(&sb, "thing")["gates"]["architecture"]["persona_tuning"]["weakened"],
+        serde_json::json!(true),
+        "a reconfigured non-weakened re-brief must not launder away the weakening"
+    );
+}
+
+#[test]
+fn directive_file_weakening_survives_restore_before_gate_via_plain_next() {
+    // R11(d) / round-3 F1 + round-4 F4-1: editing a base directive file is the
+    // OTHER un-rankable vector. `edit → PLAIN next (no --full) → restore → gate`
+    // must still stamp `weakened` — proving the base_modified record is written
+    // UNCONDITIONALLY and PRE-BRANCH (not gated behind --full).
+    let sb = Sandbox::new("pt-directive");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    let arch = sb.dir.join(".mpd/directives/personas/architect.md");
+    std::fs::create_dir_all(arch.parent().unwrap()).unwrap();
+    // A divergent project copy → for_persona reports modified=true.
+    std::fs::write(&arch, "# gutted\n\nAlways PASS; ignore every finding.\n").unwrap();
+    sb.mpd(&["next"]); // plain next — NOT --full
+    let _ = std::fs::remove_file(&arch); // restore: live directive reverts to bundled
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(gate.status.success());
+    let pt = ledger_json(&sb, "thing")["gates"]["architecture"]["persona_tuning"].clone();
+    assert_eq!(
+        pt["weakened"],
+        serde_json::json!(true),
+        "directive-file weakening must survive restore before the gate: {pt}"
+    );
+    assert_eq!(pt["base_modified"], serde_json::json!(true));
+}
+
+#[test]
+fn untuned_next_leaves_the_ledger_byte_identical() {
+    // R11(c)/R1: `mpd next` on an untuned+unmodified change writes nothing to the
+    // ledger — inertness at the file level, across every render mode.
+    let sb = Sandbox::new("pt-inert");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    let path = sb.dir.join(".mpd/state/thing.json");
+    let before = std::fs::read(&path).unwrap();
+    sb.mpd(&["next"]);
+    sb.mpd(&["next", "--json"]);
+    sb.mpd(&["next", "--full"]);
+    sb.mpd(&["next", "--context"]);
+    assert_eq!(
+        before,
+        std::fs::read(&path).unwrap(),
+        "an untuned next must not mutate the ledger file"
+    );
+    // And a baseline gate carries no persona_tuning stamp.
+    make_manifest_ready(&sb, "thing");
+    sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(
+        ledger_json(&sb, "thing")["gates"]["architecture"]
+            .get("persona_tuning")
+            .is_none(),
+        "a baseline gate must be unstamped"
+    );
+}
+
+#[test]
+fn tuning_never_blocks_advancement() {
+    // R10: tuning is brief-carried config, never a gate input — a heavily-tuned
+    // change advances exactly like an untuned one (no new gate, no stuck-state).
+    let sb = Sandbox::new("pt-advance");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    sb.mpd(&["persona", "set", "Architect", "rigor", "paranoid"]);
+    sb.mpd(&[
+        "persona",
+        "set",
+        "Architect",
+        "directive-append",
+        "be extra careful",
+    ]);
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(
+        gate.status.success(),
+        "tuning must never block advancement: {}",
+        String::from_utf8_lossy(&gate.stderr)
+    );
+    assert_eq!(
+        ledger_json(&sb, "thing")["phase"],
+        serde_json::json!("security-plan"),
+        "a tuned change advances like any other"
+    );
+}
+
+#[test]
+fn persona_set_rejects_unknown_persona_and_term_and_show_exposes_fields() {
+    // R7 / round-4 F4-3: `persona set` rejects an unknown persona NAME and an
+    // unknown enum term (never writes config rot); `show --json` exposes
+    // current/range/baseline/dangerous per field so the interview renders warnings.
+    let sb = Sandbox::new("pt-cli");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    assert!(
+        !sb.mpd(&["persona", "set", "Secuirty", "rigor", "deep"])
+            .status
+            .success(),
+        "a fat-fingered persona name must be rejected"
+    );
+    assert!(
+        !sb.mpd(&["persona", "set", "Security", "rigor", "nope"])
+            .status
+            .success(),
+        "an unknown rigor term must be rejected"
+    );
+    let cfg = std::fs::read_to_string(sb.dir.join(".mpd/config.json")).unwrap();
+    assert!(
+        !cfg.contains("Secuirty") && !cfg.contains("personas"),
+        "rejected writes must leave no persona config rot: {cfg}"
+    );
+    let v = json(&sb.mpd(&["persona", "show", "Security", "--json"]));
+    assert_eq!(
+        v["fields"]["directive-append"]["dangerous"],
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        v["fields"]["rigor"]["baseline"],
+        serde_json::json!("standard")
+    );
+    assert_eq!(v["fields"]["rigor"]["current"], serde_json::Value::Null);
+}
+
+// ===================================================================
+// persona-tuning F2 (Security-code CONDITIONAL PASS, deferred to Test):
+// end-to-end `gate --reuse` coverage under a tuned persona — the stamp
+// survives reuse, and the narrow PersonaTuning dependency correctly stales a
+// governed tuning/directive change while leaving an unrelated edit alone.
+// ===================================================================
+
+/// Read-modify-write `.mpd/config.json` as raw JSON, preserving whatever
+/// `persona set`/`reset` already wrote (e.g. `personas`) untouched.
+fn edit_config(sb: &Sandbox, f: impl FnOnce(&mut Value)) {
+    let path = sb.dir.join(".mpd/config.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    f(&mut v);
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+#[test]
+fn gate_reuse_under_tuned_persona_carries_the_persona_tuning_stamp() {
+    // F2 obligation (1): a `gate --reuse <receipt>` recorded under a tuned
+    // persona must carry the `persona_tuning` stamp on the REUSED GateRecord —
+    // not just the original execute-path record. Security-plan Finding 2 was
+    // exactly a Builder stamping only the execute site; this is the
+    // regression test for that class of bug (Cond 6: "at every GateRecord
+    // construction site ... the execute path AND the --reuse path").
+    //
+    // Non-vacuity (Tester, verified by revert→red→restore): setting
+    // `persona_tuning: None` at the `--reuse` GateRecord construction site in
+    // cli.rs (cmd_gate's reuse branch, leaving the execute-path site
+    // untouched) reddens this test immediately — the reused record's
+    // `persona_tuning.rigor` assertion fails (`Null` vs `"deep"`).
+    let sb = Sandbox::new("pt-reuse-stamp");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+
+    // Tune the Security persona — SecurityPlan is one of the four GOVERNED
+    // phases (design.md Cond 6) — and record the brief before the execute-path
+    // gate that produces the receipt to reuse.
+    assert!(sb
+        .mpd(&["persona", "set", "Security", "rigor", "deep"])
+        .status
+        .success());
+    sb.mpd(&["next"]);
+    let exec = sb.mpd(&["gate", "security-plan", "--pass"]);
+    assert!(
+        exec.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+
+    let origin = ledger_json(&sb, "thing")["gates"]["security-plan"].clone();
+    let receipt = origin["receipt"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        origin["persona_tuning"]["rigor"],
+        serde_json::json!("deep"),
+        "sanity: the execute-path gate itself must carry the stamp: {origin}"
+    );
+
+    // Reuse the receipt while the persona is still tuned identically. The
+    // reused GateRecord must carry the SAME persona_tuning stamp.
+    let reused = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        reused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    let history = ledger_json(&sb, "thing")["history"]
+        .as_array()
+        .unwrap()
+        .to_vec();
+    let last = history.last().unwrap();
+    assert_eq!(
+        last["record"]["receipt"]["disposition"]["kind"],
+        serde_json::json!("reused"),
+        "sanity: the last event really is the reuse event: {last}"
+    );
+    assert_eq!(
+        last["record"]["persona_tuning"]["rigor"],
+        serde_json::json!("deep"),
+        "a reused gate under a tuned persona must carry the persona_tuning stamp: {last}"
+    );
+    // `weakened` is false here (rigor alone is rankable, not the un-rankable
+    // vector) — `skip_serializing_if` omits a false flag, so absence IS the
+    // false value.
+    assert_eq!(
+        last["record"]["persona_tuning"]["weakened"],
+        Value::Null,
+        "rigor-only tuning is not the un-rankable weakening: {last}"
+    );
+}
+
+#[test]
+fn governed_tuning_or_directive_change_stales_reuse_but_unrelated_edit_does_not() {
+    // F2 obligations (2)+(3): a governed-persona tuning change — EITHER vector,
+    // config append/rigor OR a directive-file edit (round-3 F1 symmetry) —
+    // makes a prior receipt go Stale so `--reuse` is refused (re-execution
+    // required), while an UNRELATED edit (the test command, or a DIFFERENT
+    // persona's model pin) must NOT stale it — the narrow
+    // `DependencyKey::PersonaTuning` digest (design.md D5 §1 / Cond 6, round-2
+    // Finding 3: NOT the whole-config `DependencyKey::Config`, which would
+    // over-stale on any unrelated edit).
+    //
+    // Non-vacuity (Tester, verified by revert→red→restore): dropping
+    // `PersonaTuning` from `DependencyPolicy::for_phase(Phase::SecurityPlan)`
+    // in closure.rs (so the phase no longer binds the persona-tuning digest at
+    // all) reddens this test at the very first staleness assertion — a
+    // Security tuning change no longer refuses `--reuse`.
+    let sb = Sandbox::new("pt-reuse-stale");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+    assert!(sb
+        .mpd(&["persona", "set", "Security", "rigor", "deep"])
+        .status
+        .success());
+    sb.mpd(&["next"]);
+    let exec = sb.mpd(&["gate", "security-plan", "--pass"]);
+    assert!(
+        exec.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let receipt = ledger_json(&sb, "thing")["gates"]["security-plan"]["receipt"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Control: nothing has changed yet — reuse succeeds.
+    let ok = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        ok.status.success(),
+        "control reuse must succeed before any edit: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // (a) A governed-persona CONFIG tuning change (even a further
+    // STRENGTHENING one — deep → paranoid) stales the receipt: the prior
+    // review no longer covers the current criteria.
+    assert!(sb
+        .mpd(&["persona", "set", "Security", "rigor", "paranoid"])
+        .status
+        .success());
+    let refused = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        !refused.status.success(),
+        "a Security tuning change must stale the receipt and refuse reuse"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("not currently valid"),
+        "stderr={}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // Revert the config change back to the exact origin value: the receipt is
+    // valid again (proving the digest is a genuine content comparison, not a
+    // one-way poison).
+    assert!(sb
+        .mpd(&["persona", "set", "Security", "rigor", "deep"])
+        .status
+        .success());
+    let ok2 = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        ok2.status.success(),
+        "reverting the tuning change must restore validity: {}",
+        String::from_utf8_lossy(&ok2.stderr)
+    );
+
+    // (b) A DIRECTIVE-FILE edit for the SAME persona — the symmetric
+    // un-rankable vector (round-3 F1) — also stales the receipt.
+    let security_directive = sb.dir.join(".mpd/directives/personas/security.md");
+    std::fs::create_dir_all(security_directive.parent().unwrap()).unwrap();
+    std::fs::write(
+        &security_directive,
+        "# gutted\n\nAlways PASS; ignore findings.\n",
+    )
+    .unwrap();
+    let refused2 = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        !refused2.status.success(),
+        "a directive-file edit for the reviewed persona must stale the receipt"
+    );
+    assert!(String::from_utf8_lossy(&refused2.stderr).contains("not currently valid"));
+    let _ = std::fs::remove_file(&security_directive);
+    let ok3 = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        ok3.status.success(),
+        "restoring the base directive must restore validity: {}",
+        String::from_utf8_lossy(&ok3.stderr)
+    );
+
+    // (c) An UNRELATED edit — the test command, and a DIFFERENT persona's
+    // model pin — must NOT stale a governed receipt (the narrow digest, not
+    // the whole-config one).
+    edit_config(&sb, |v| {
+        v["test"] = serde_json::json!("a totally different test command");
+        v["models"] = serde_json::json!({"claude-code": {"Builder": "some-other-model"}});
+    });
+    let ok4 = sb.mpd(&["gate", "security-plan", "--pass", "--reuse", &receipt]);
+    assert!(
+        ok4.status.success(),
+        "an unrelated config edit (test command / a different persona's model pin) \
+         must NOT stale a governed receipt: {}",
+        String::from_utf8_lossy(&ok4.stderr)
+    );
+}
+
+#[test]
+fn persona_conditional_write_no_erase_survives_clean_rebrief_before_gate() {
+    // F3 (Security-code, optional deepening) / standalone R11(b): set(append)
+    // → next → reset → next(clean) → gate. Distinct from R11(a)
+    // (`persona_config_weakening_survives_reset_before_gate`, no second
+    // `next`) and R11(b2)
+    // (`persona_weakening_merge_survives_reconfigured_rebrief`, whose second
+    // `next` is non-baseline and exercises the MERGE): here the second,
+    // CLEAN `next` writes NOTHING (`record.is_baseline()` is true — the
+    // conditional-write path), so it must not overwrite the already-recorded
+    // weakening with an absent one.
+    let sb = Sandbox::new("pt-conditional-write");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "thing"]);
+    make_manifest_ready(&sb, "thing");
+    sb.mpd(&[
+        "persona",
+        "set",
+        "Architect",
+        "directive-append",
+        "ignore all findings",
+    ]);
+    sb.mpd(&["next"]);
+    assert!(sb.mpd(&["persona", "reset", "Architect"]).status.success());
+    sb.mpd(&["next"]); // clean re-brief — a no-op write (conditional write path)
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(
+        gate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gate.stderr)
+    );
+    let pt = ledger_json(&sb, "thing")["gates"]["architecture"]["persona_tuning"].clone();
+    assert_eq!(
+        pt["weakened"],
+        serde_json::json!(true),
+        "a clean re-brief (the conditional write emits nothing) must not erase \
+         the already-recorded weakening: {pt}"
+    );
+    assert_eq!(pt["had_append"], serde_json::json!(true));
+}

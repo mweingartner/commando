@@ -1,0 +1,684 @@
+{
+  "change": "persona-tuning",
+  "schema": "mpd",
+  "ui": false,
+  "kind": "feature",
+  "phase": "done",
+  "gates": {
+    "architecture": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "design.md#conditions-for-builder",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784324074,
+      "completed_at_epoch_secs": 1784324261,
+      "receipt": {
+        "id": "8cb44eb22571ed97f10254913be179723ab44906d960ba0c8a6de5e8a6c02912",
+        "schema": 1,
+        "phase": "architecture",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+            "design-artifacts": "d143c67e80d2a882a3766eb94f32ec55b691e76a48f9b23e8736a3c752780d40"
+          }
+        }
+      }
+    },
+    "security-plan": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "security-plan.md",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784324261,
+      "completed_at_epoch_secs": 1784328097,
+      "receipt": {
+        "id": "5a11f08bcf64fcbdef4025b499463d6a02ca98915ef5ad48a9c885a63c9b2659",
+        "schema": 1,
+        "phase": "security-plan",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "source": "2a52c63bd8c762d57d30b9e96f6673c82ec4df37f68822a7b481dbf155b12d99",
+            "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+            "design-artifacts": "9b5dae2703b6d7cf1ab6f34ea650e3fdec56be21d6825170bfeed5547073bc50"
+          }
+        }
+      }
+    },
+    "build": {
+      "verdict": "pass",
+      "by": "Builder",
+      "evidence": "tasks.md",
+      "checks": {
+        "tests_passed": 420,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784328097,
+      "completed_at_epoch_secs": 1784329816,
+      "receipt": {
+        "id": "31ac1c79d8eb3fdb4141d1511c8bcba3fb574d9f0f44fb0df62d53c5677ee1fb",
+        "schema": 1,
+        "phase": "build",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "source": "31419475187f635be769c3aa2a1abb02cd9a8e6f27546cfd46cdc86e2cb502f0",
+            "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+            "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+            "produced-artifact": "31419475187f635be769c3aa2a1abb02cd9a8e6f27546cfd46cdc86e2cb502f0"
+          }
+        }
+      }
+    },
+    "security-code": {
+      "verdict": "conditional-pass",
+      "by": "Security",
+      "evidence": "security-code.md",
+      "checks": {
+        "secrets_clean": true,
+        "scanner": "builtin+gitleaks"
+      },
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784329824,
+      "completed_at_epoch_secs": 1784330639,
+      "receipt": {
+        "id": "ce19e04ffd65b4cdba94ccd213c97a308fdfa66f12498fd2c3844db9d7a7b2d6",
+        "schema": 1,
+        "phase": "security-code",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "source": "368d114d5355ea29d5609cba45078a681a8bdcc821fbef9e6ad56d5ff9726515",
+            "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+            "design-artifacts": "559215ea9da9f3f7df479e5e16c5ccaaeef8b296b5452c588e0871b52efe94d3",
+            "scanner-identity": "668f4bbf5c7cc646f92c8ced8ea28ebd07ba00afe3b95d21a08449df199a7224",
+            "allowlist-digest": "dbed088396a9c2b3a8f9a66e8c0ae90e17a871a982494f6ed29765330b4dd3a1"
+          }
+        }
+      }
+    },
+    "test": {
+      "verdict": "pass",
+      "by": "Tester",
+      "evidence": "test.md",
+      "checks": {
+        "tests_passed": 428,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784330647,
+      "completed_at_epoch_secs": 1784331654,
+      "receipt": {
+        "id": "ade9118bd22299b678d1ae91af0a2f16018f72b0892a5380828564750a3e5df0",
+        "schema": 1,
+        "phase": "test",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "source": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+            "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+            "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+            "produced-artifact": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15"
+          }
+        }
+      }
+    },
+    "documentation": {
+      "verdict": "pass",
+      "by": "Documenter",
+      "evidence": "documentation.md",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784331662,
+      "completed_at_epoch_secs": 1784331722,
+      "receipt": {
+        "id": "970f9e1493cf3e166c127942a6fb8a2882148cacd50ebc223380e073b1c2e260",
+        "schema": 1,
+        "phase": "documentation",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "shipped-behavior": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+            "documentation": "8e8f92edfa4e43fae64e110eda00026e9d29e7a3665d3dd8b20a9d333fef781b"
+          }
+        }
+      }
+    },
+    "deploy": {
+      "verdict": "pass",
+      "by": "main-session",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784331723,
+      "completed_at_epoch_secs": 1784331781,
+      "receipt": {
+        "id": "9de21431c64ec2af89685b8851d486f37a5952465bdc9bcdd6c0c40336684113",
+        "schema": 1,
+        "phase": "deploy",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "source": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+            "produced-artifact": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+            "deploy-command": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      }
+    },
+    "doc-validation": {
+      "verdict": "pass",
+      "by": "Architect & Designer",
+      "evidence": "doc-validation.md",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784331781,
+      "completed_at_epoch_secs": 1784331874,
+      "receipt": {
+        "id": "ea6076810049043fb440637a4ccb3e0a4408bc89c9bf128daff54e65f3f80890",
+        "schema": 1,
+        "phase": "doc-validation",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+            "shipped-behavior": "a6bd4b76ce71247458795467dede2d2ac13610a4f7b49128d1da5696a1ee2075",
+            "documentation": "8e8f92edfa4e43fae64e110eda00026e9d29e7a3665d3dd8b20a9d333fef781b",
+            "persona-tuning": "e48b22dd7aa27e02a9a0ad38c98bc07383c61deeb896eb2872208db4f07324b8"
+          }
+        }
+      }
+    }
+  },
+  "conditions": [
+    {
+      "text": "F2: add end-to-end reuse-path tests (stamp on a reused gate under a tuned persona; a governed-persona tuning/directive change re-executes --reuse; an unrelated test/models edit does not stale)",
+      "owner": "Security",
+      "closed": true
+    }
+  ],
+  "history": [
+    {
+      "phase": "architecture",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect",
+        "evidence": "design.md#conditions-for-builder",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784324074,
+        "completed_at_epoch_secs": 1784324261,
+        "receipt": {
+          "id": "8cb44eb22571ed97f10254913be179723ab44906d960ba0c8a6de5e8a6c02912",
+          "schema": 1,
+          "phase": "architecture",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+              "design-artifacts": "d143c67e80d2a882a3766eb94f32ec55b691e76a48f9b23e8736a3c752780d40"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "security-plan",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "security-plan.md",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784324261,
+        "completed_at_epoch_secs": 1784328097,
+        "receipt": {
+          "id": "5a11f08bcf64fcbdef4025b499463d6a02ca98915ef5ad48a9c885a63c9b2659",
+          "schema": 1,
+          "phase": "security-plan",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "source": "2a52c63bd8c762d57d30b9e96f6673c82ec4df37f68822a7b481dbf155b12d99",
+              "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+              "design-artifacts": "9b5dae2703b6d7cf1ab6f34ea650e3fdec56be21d6825170bfeed5547073bc50"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "build",
+      "record": {
+        "verdict": "pass",
+        "by": "Builder",
+        "evidence": "tasks.md",
+        "checks": {
+          "tests_passed": 420,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784328097,
+        "completed_at_epoch_secs": 1784329816,
+        "receipt": {
+          "id": "31ac1c79d8eb3fdb4141d1511c8bcba3fb574d9f0f44fb0df62d53c5677ee1fb",
+          "schema": 1,
+          "phase": "build",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "source": "31419475187f635be769c3aa2a1abb02cd9a8e6f27546cfd46cdc86e2cb502f0",
+              "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+              "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+              "produced-artifact": "31419475187f635be769c3aa2a1abb02cd9a8e6f27546cfd46cdc86e2cb502f0"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "conditional-pass",
+        "by": "Security",
+        "evidence": "security-code.md",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784329824,
+        "completed_at_epoch_secs": 1784330639,
+        "receipt": {
+          "id": "ce19e04ffd65b4cdba94ccd213c97a308fdfa66f12498fd2c3844db9d7a7b2d6",
+          "schema": 1,
+          "phase": "security-code",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "source": "368d114d5355ea29d5609cba45078a681a8bdcc821fbef9e6ad56d5ff9726515",
+              "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+              "design-artifacts": "559215ea9da9f3f7df479e5e16c5ccaaeef8b296b5452c588e0871b52efe94d3",
+              "scanner-identity": "668f4bbf5c7cc646f92c8ced8ea28ebd07ba00afe3b95d21a08449df199a7224",
+              "allowlist-digest": "dbed088396a9c2b3a8f9a66e8c0ae90e17a871a982494f6ed29765330b4dd3a1"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "test",
+      "record": {
+        "verdict": "pass",
+        "by": "Tester",
+        "evidence": "test.md",
+        "checks": {
+          "tests_passed": 428,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784330647,
+        "completed_at_epoch_secs": 1784331654,
+        "receipt": {
+          "id": "ade9118bd22299b678d1ae91af0a2f16018f72b0892a5380828564750a3e5df0",
+          "schema": 1,
+          "phase": "test",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "source": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+              "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+              "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+              "produced-artifact": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "documentation",
+      "record": {
+        "verdict": "pass",
+        "by": "Documenter",
+        "evidence": "documentation.md",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784331662,
+        "completed_at_epoch_secs": 1784331722,
+        "receipt": {
+          "id": "970f9e1493cf3e166c127942a6fb8a2882148cacd50ebc223380e073b1c2e260",
+          "schema": 1,
+          "phase": "documentation",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "shipped-behavior": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+              "documentation": "8e8f92edfa4e43fae64e110eda00026e9d29e7a3665d3dd8b20a9d333fef781b"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main-session",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784331723,
+        "completed_at_epoch_secs": 1784331781,
+        "receipt": {
+          "id": "9de21431c64ec2af89685b8851d486f37a5952465bdc9bcdd6c0c40336684113",
+          "schema": 1,
+          "phase": "deploy",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "source": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+              "produced-artifact": "b093427143f9237db2afa5379e86c8d349666c917c4668a90d6bc9a51b0c3a15",
+              "deploy-command": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "doc-validation",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect & Designer",
+        "evidence": "doc-validation.md",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784331781,
+        "completed_at_epoch_secs": 1784331874,
+        "receipt": {
+          "id": "ea6076810049043fb440637a4ccb3e0a4408bc89c9bf128daff54e65f3f80890",
+          "schema": 1,
+          "phase": "doc-validation",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "7e992fac2029ab5b9981e685ebcd6ffa927dff31da4da83cb6412dac0d6213e4",
+              "shipped-behavior": "a6bd4b76ce71247458795467dede2d2ac13610a4f7b49128d1da5696a1ee2075",
+              "documentation": "8e8f92edfa4e43fae64e110eda00026e9d29e7a3665d3dd8b20a9d333fef781b",
+              "persona-tuning": "e48b22dd7aa27e02a9a0ad38c98bc07383c61deeb896eb2872208db4f07324b8"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "governance": {
+    "risk": "medium",
+    "threat_profile": "local-trusted-user",
+    "reconciliations": []
+  },
+  "strict": true,
+  "waivers": [],
+  "phase_started_at_epoch_secs": 1784331875,
+  "archive_closure": {
+    "base_commit": "c26b62af4290efbabbb87667624fa0abc0c1d58a",
+    "archive_path": "openspec/changes/archive/2026-07-17-persona-tuning",
+    "transaction_id": "5954dab5d1af5ee66328d8f7132ff749b0400d48d1c45928decac97bffc3541a",
+    "allowed_paths": [
+      ".mpd/**",
+      ".mpd/state/persona-tuning.json",
+      "Cargo.lock",
+      "Cargo.toml",
+      "README.md",
+      "crates/**",
+      "docs/persona-tuning.md",
+      "openspec/**",
+      "openspec/changes/archive/2026-07-17-persona-tuning",
+      "openspec/changes/persona-tuning"
+    ],
+    "system_paths": [
+      ".mpd/.gitignore",
+      ".mpd/config.json",
+      ".mpd/directives/personas/architect.md",
+      ".mpd/directives/personas/builder.md",
+      ".mpd/directives/personas/designer.md",
+      ".mpd/directives/personas/documenter.md",
+      ".mpd/directives/personas/security.md",
+      ".mpd/directives/personas/tester.md",
+      ".mpd/directives/protocol.md",
+      ".mpd/secret-allowlist.json",
+      ".mpd/state/bundle-directives-configurable-models.json",
+      ".mpd/state/content-addressed-release-closure.json",
+      ".mpd/state/gate-history-and-guards.json",
+      ".mpd/state/improve-mpd-process-governance.json",
+      ".mpd/state/persona-tuning.json",
+      ".mpd/state/promote-to-strict.json",
+      ".mpd/state/self-enforcing-pipeline.json",
+      "Cargo.lock",
+      "Cargo.toml",
+      "README.md",
+      "crates/mpd/Cargo.toml",
+      "crates/mpd/assets/directives/personas/architect.md",
+      "crates/mpd/assets/directives/personas/builder.md",
+      "crates/mpd/assets/directives/personas/designer.md",
+      "crates/mpd/assets/directives/personas/documenter.md",
+      "crates/mpd/assets/directives/personas/security.md",
+      "crates/mpd/assets/directives/personas/tester.md",
+      "crates/mpd/assets/directives/protocol.md",
+      "crates/mpd/assets/mpd.schema.yaml",
+      "crates/mpd/assets/templates/design.md",
+      "crates/mpd/assets/templates/documentation.md",
+      "crates/mpd/assets/templates/judgment/design-review.md",
+      "crates/mpd/assets/templates/judgment/design-signoff.md",
+      "crates/mpd/assets/templates/judgment/doc-validation.md",
+      "crates/mpd/assets/templates/judgment/security-code.md",
+      "crates/mpd/assets/templates/judgment/security-plan.md",
+      "crates/mpd/assets/templates/judgment/test.md",
+      "crates/mpd/assets/templates/proposal.md",
+      "crates/mpd/assets/templates/spec.md",
+      "crates/mpd/assets/templates/tasks.md",
+      "crates/mpd/proptest-regressions/cli.txt",
+      "crates/mpd/src/allowlist.rs",
+      "crates/mpd/src/checks/mod.rs",
+      "crates/mpd/src/checks/secrets.rs",
+      "crates/mpd/src/checks/tests_runner.rs",
+      "crates/mpd/src/cli.rs",
+      "crates/mpd/src/closure.rs",
+      "crates/mpd/src/config.rs",
+      "crates/mpd/src/digest.rs",
+      "crates/mpd/src/directives.rs",
+      "crates/mpd/src/git.rs",
+      "crates/mpd/src/githooks.rs",
+      "crates/mpd/src/harness.rs",
+      "crates/mpd/src/ledger.rs",
+      "crates/mpd/src/main.rs",
+      "crates/mpd/src/pathmatch.rs",
+      "crates/mpd/src/personas.rs",
+      "crates/mpd/src/phase.rs",
+      "crates/mpd/src/scaffold.rs",
+      "crates/mpd/tests/e2e.rs",
+      "crates/openspec-core/Cargo.toml",
+      "crates/openspec-core/src/date.rs",
+      "crates/openspec-core/src/digest.rs",
+      "crates/openspec-core/src/error.rs",
+      "crates/openspec-core/src/lib.rs",
+      "crates/openspec-core/src/merge.rs",
+      "crates/openspec-core/src/model.rs",
+      "crates/openspec-core/src/names.rs",
+      "crates/openspec-core/src/parse.rs",
+      "crates/openspec-core/src/project.rs",
+      "crates/openspec-core/src/render.rs",
+      "crates/openspec-core/src/schema.rs",
+      "crates/openspec-core/src/transaction.rs",
+      "crates/openspec-core/src/validate.rs",
+      "crates/openspec-core/tests/fidelity.rs",
+      "crates/openspec-core/tests/fixtures/all-sections.delta.md",
+      "crates/openspec-core/tests/fixtures/cli-archive.spec.md",
+      "crates/openspec-core/tests/fixtures/fenced-torture.spec.md",
+      "crates/openspec-core/tests/fixtures/openspec-conventions.spec.md",
+      "crates/openspec-core/tests/fixtures/real-delta.cli-validate.md",
+      "crates/openspec-core/tests/fixtures/spec-driven.schema.yaml",
+      "crates/openspec-core/tests/merge_tests.rs",
+      "crates/openspec-core/tests/nonfunctional.rs",
+      "crates/openspec-core/tests/parse_edge_cases.rs",
+      "crates/openspec-core/tests/project_tests.rs",
+      "crates/openspec-core/tests/props.rs",
+      "crates/openspec-core/tests/security_tests.rs",
+      "docs/persona-tuning.md",
+      "openspec/AGENTS.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/.openspec.yaml",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/design.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/documentation.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/proposal.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/specs/directives/spec.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/specs/model-config/spec.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/tasks.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/.openspec.yaml",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/design.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/documentation.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/proposal.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/tasks.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/.openspec.yaml",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/design-signoff.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/design.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/doc-validation.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/documentation.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/proposal.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/security-code.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/security-plan.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/specs/directives/spec.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/specs/gate-evidence/spec.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/specs/process-governance/spec.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/tasks.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/test.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/.openspec.yaml",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/archive-transaction.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/design.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/documentation.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/manifest.json",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/proposal.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/security-plan.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/specs/change-manifest/spec.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/specs/evidence-reuse/spec.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/specs/remote-parity/spec.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/tasks.md",
+      "openspec/changes/archive/2026-07-17-persona-tuning",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/.openspec.yaml",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/design.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/doc-validation.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/documentation.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/manifest.json",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/proposal.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/security-code.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/security-plan.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/tasks.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict/test.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/.openspec.yaml",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/design.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/doc-validation.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/documentation.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/manifest.json",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/proposal.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/security-code.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/security-plan.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/tasks.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/test.md",
+      "openspec/changes/persona-tuning",
+      "openspec/changes/persona-tuning/.openspec.yaml",
+      "openspec/changes/persona-tuning/design.md",
+      "openspec/changes/persona-tuning/doc-validation.md",
+      "openspec/changes/persona-tuning/documentation.md",
+      "openspec/changes/persona-tuning/manifest.json",
+      "openspec/changes/persona-tuning/proposal.md",
+      "openspec/changes/persona-tuning/security-code.md",
+      "openspec/changes/persona-tuning/security-plan.md",
+      "openspec/changes/persona-tuning/tasks.md",
+      "openspec/changes/persona-tuning/test.md",
+      "openspec/project.md",
+      "openspec/schemas/mpd/schema.yaml",
+      "openspec/schemas/mpd/templates/design.md",
+      "openspec/schemas/mpd/templates/documentation.md",
+      "openspec/schemas/mpd/templates/proposal.md",
+      "openspec/schemas/mpd/templates/spec.md",
+      "openspec/schemas/mpd/templates/tasks.md",
+      "openspec/specs/change-manifest/spec.md",
+      "openspec/specs/directives/spec.md",
+      "openspec/specs/evidence-reuse/spec.md",
+      "openspec/specs/gate-evidence/spec.md",
+      "openspec/specs/model-config/spec.md",
+      "openspec/specs/process-governance/spec.md",
+      "openspec/specs/remote-parity/spec.md"
+    ],
+    "post_archive_digest": "40366ca1002a83d2a75b5becc36a8da172806b85f741121050ac654810fe7ad9",
+    "archived_at": 1784331899
+  }
+}

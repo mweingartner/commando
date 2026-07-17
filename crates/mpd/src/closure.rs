@@ -106,6 +106,13 @@ pub enum DependencyKey {
     /// Hermetic-reuse-only: a declared project-relative external input
     /// digest.
     HermeticInput,
+    /// A phase persona's effective instructions — its config tuning
+    /// (`personas[tuning_key]`) plus its resolved base-directive text. Bound by
+    /// the governed phases so a receipt stales if the persona's directive changed
+    /// (config append OR directive-file edit), never on an unrelated config edit
+    /// (design.md persona-tuning D5 §1). Added last so no existing variant's
+    /// discriminant/ordering shifts.
+    PersonaTuning,
 }
 
 impl DependencyKey {
@@ -133,6 +140,7 @@ impl DependencyKey {
             HermeticExecutable => "hermetic-executable",
             HermeticEnvironment => "hermetic-environment",
             HermeticInput => "hermetic-input",
+            PersonaTuning => "persona-tuning",
         }
     }
 }
@@ -791,12 +799,14 @@ impl DependencyPolicy {
                 &[Scope, DesignArtifacts, Governance]
             }
             Phase::Architecture => &[Scope, DesignArtifacts, Governance],
-            // Security (plan) binds Architecture's set plus source.
-            Phase::SecurityPlan => &[Scope, DesignArtifacts, Governance, Source],
-            // Build/Test bind source, test command, toolchain, and produced
-            // artifact digests; both may additionally bind the hermetic keys
-            // under an explicit project opt-in.
-            Phase::Build | Phase::Test => &[
+            // Security (plan) binds Architecture's set plus source, plus the
+            // persona's effective directive (persona-tuning).
+            Phase::SecurityPlan => &[Scope, DesignArtifacts, Governance, Source, PersonaTuning],
+            // Build binds source, test command, toolchain, and produced artifact
+            // digests; it may additionally bind the hermetic keys under an
+            // explicit project opt-in. (Build is not in the governed persona-tuning
+            // set — its output is re-verified by the bound Security-code + Test.)
+            Phase::Build => &[
                 Scope,
                 Source,
                 TestCommand,
@@ -807,8 +817,23 @@ impl DependencyPolicy {
                 HermeticEnvironment,
                 HermeticInput,
             ],
+            // Test shares Build's shape plus the persona's effective directive
+            // (persona-tuning): a Tester directive change stales a Test receipt.
+            Phase::Test => &[
+                Scope,
+                Source,
+                TestCommand,
+                Toolchain,
+                ProducedArtifact,
+                PersonaTuning,
+                HermeticPlatform,
+                HermeticExecutable,
+                HermeticEnvironment,
+                HermeticInput,
+            ],
             // Security (code) binds Security's set plus scanner identities
-            // and the allowlist digest, and is also hermetic-eligible.
+            // and the allowlist digest, the persona directive, and is also
+            // hermetic-eligible.
             Phase::SecurityCode => &[
                 Scope,
                 DesignArtifacts,
@@ -816,6 +841,7 @@ impl DependencyPolicy {
                 Source,
                 ScannerIdentity,
                 AllowlistDigest,
+                PersonaTuning,
                 HermeticPlatform,
                 HermeticExecutable,
                 HermeticEnvironment,
@@ -826,9 +852,9 @@ impl DependencyPolicy {
             // Deploy binds source/build artifacts and the deploy command; it
             // is fixed always-execute and never reusable (see reuse_offer).
             Phase::Deploy => &[Scope, Source, ProducedArtifact, DeployCommand],
-            // Doc Validation binds the same relevant artifacts Documentation
-            // produced.
-            Phase::DocValidation => &[Scope, ShippedBehavior, Documentation],
+            // Doc Validation binds the artifacts Documentation produced plus the
+            // (composite) persona's effective directive (persona-tuning).
+            Phase::DocValidation => &[Scope, ShippedBehavior, Documentation, PersonaTuning],
             Phase::Done => &[],
         }
     }
@@ -1279,6 +1305,37 @@ fn digest_named_bytes(domain: &str, items: &[(&str, Vec<u8>)]) -> Result<Digest,
     digest::canonical_digest(domain, 1, entries).map_err(|e| e.to_string())
 }
 
+/// Digest a phase persona's **effective instructions** — its config tuning
+/// (`personas[tuning_key(phase)]`) plus its resolved base-directive text (both
+/// parts for the composite Doc-Validation persona). Bound by the governed phases
+/// so a persona directive change (config append OR directive-file edit) stales a
+/// reused receipt, while an unrelated config edit does not (design.md D5 §1). The
+/// directive read is symlink-refusing (`for_persona`), so the digest is
+/// deterministic given disk state and never reads through a redirected target.
+fn persona_tuning_digest(
+    root: &Path,
+    config: &crate::config::Config,
+    phase: Phase,
+) -> Result<Digest, String> {
+    let cfg_bytes = config
+        .persona_tuning(phase.tuning_key())
+        .map(|t| serde_json::to_vec(t).unwrap_or_default())
+        .unwrap_or_default();
+    let mut directive = Vec::new();
+    for name in phase.tuning_personas() {
+        if let Some(d) = crate::directives::for_persona(root, name) {
+            directive.extend_from_slice(name.as_bytes());
+            directive.push(0);
+            directive.extend_from_slice(d.text.as_bytes());
+            directive.push(0);
+        }
+    }
+    digest_named_bytes(
+        "persona-tuning",
+        &[("config", cfg_bytes), ("directive", directive)],
+    )
+}
+
 fn source_digest(
     root: &Path,
     manifest: &ChangeManifest,
@@ -1451,6 +1508,7 @@ pub fn capture_dependency_values(
     ));
     let scanner_identity = Digest::of_bytes(b"builtin+available-external-scanners-v1");
     let allowlist = Digest::of_bytes(&read_optional(root, ".mpd/secret-allowlist.json"));
+    let persona_tuning = persona_tuning_digest(root, config, phase)?;
 
     let mut values = DependencyValues::new()
         .with(DependencyKey::Scope, scope)
@@ -1468,7 +1526,8 @@ pub fn capture_dependency_values(
         .with(DependencyKey::AllowlistDigest, allowlist)
         .with(DependencyKey::DeployCommand, deploy_command)
         .with(DependencyKey::ShippedBehavior, source)
-        .with(DependencyKey::Documentation, documentation);
+        .with(DependencyKey::Documentation, documentation)
+        .with(DependencyKey::PersonaTuning, persona_tuning);
 
     if execution_bearing(phase) {
         if let Some(policy) = config.hermetic_reuse_policy().filter(|p| p.is_complete()) {
@@ -2216,6 +2275,7 @@ mod tests {
             DependencyKey::HermeticExecutable,
             DependencyKey::HermeticEnvironment,
             DependencyKey::HermeticInput,
+            DependencyKey::PersonaTuning,
         ];
         for key in all {
             let json = serde_json::to_string(&key).unwrap();
@@ -2238,7 +2298,8 @@ mod tests {
                 | DependencyKey::HermeticPlatform
                 | DependencyKey::HermeticExecutable
                 | DependencyKey::HermeticEnvironment
-                | DependencyKey::HermeticInput => {}
+                | DependencyKey::HermeticInput
+                | DependencyKey::PersonaTuning => {}
             }
         }
     }
@@ -2265,6 +2326,7 @@ mod tests {
             DependencyKey::HermeticExecutable,
             DependencyKey::HermeticEnvironment,
             DependencyKey::HermeticInput,
+            DependencyKey::PersonaTuning,
         ] {
             let tag = serde_json::to_string(&key).unwrap();
             assert_eq!(tag, format!("\"{}\"", key.label()));
@@ -2523,7 +2585,7 @@ mod dependency_policy_tests {
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::SecurityPlan),
-            &[Scope, DesignArtifacts, Governance, Source]
+            &[Scope, DesignArtifacts, Governance, Source, PersonaTuning]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::Build),
@@ -2541,8 +2603,19 @@ mod dependency_policy_tests {
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::Test),
-            DependencyPolicy::for_phase(Phase::Build),
-            "Build and Test share the same policy shape"
+            &[
+                Scope,
+                Source,
+                TestCommand,
+                Toolchain,
+                ProducedArtifact,
+                PersonaTuning,
+                HermeticPlatform,
+                HermeticExecutable,
+                HermeticEnvironment,
+                HermeticInput
+            ],
+            "Test shares Build's shape plus PersonaTuning (governed set)"
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::SecurityCode),
@@ -2553,6 +2626,7 @@ mod dependency_policy_tests {
                 Source,
                 ScannerIdentity,
                 AllowlistDigest,
+                PersonaTuning,
                 HermeticPlatform,
                 HermeticExecutable,
                 HermeticEnvironment,
@@ -2573,7 +2647,7 @@ mod dependency_policy_tests {
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::DocValidation),
-            &[Scope, ShippedBehavior, Documentation]
+            &[Scope, ShippedBehavior, Documentation, PersonaTuning]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::Done),
@@ -2593,14 +2667,62 @@ mod dependency_policy_tests {
     fn earliest_available(key: DependencyKey) -> Phase {
         use DependencyKey::*;
         match key {
+            // Config-like / directive inputs available from the start.
             Scope | Source | Governance | Config | DesignArtifacts | TestCommand | Toolchain
-            | DeployCommand | HermeticPlatform | HermeticExecutable | HermeticEnvironment
-            | HermeticInput => Phase::DesignMock,
+            | DeployCommand | PersonaTuning | HermeticPlatform | HermeticExecutable
+            | HermeticEnvironment | HermeticInput => Phase::DesignMock,
             ProducedArtifact => Phase::Build,
             ScannerIdentity | AllowlistDigest => Phase::SecurityCode,
             ShippedBehavior => Phase::Test,
             Documentation => Phase::Documentation,
         }
+    }
+
+    #[test]
+    fn persona_tuning_digest_is_narrow_to_the_persona_not_the_whole_config() {
+        // R6b / round-2 F3: the PersonaTuning digest covers only THIS persona's
+        // effective directive (config tuning + base directive text), so an
+        // unrelated config edit (test command) does NOT stale it, while a change to
+        // the persona's tuning DOES.
+        let dir = std::env::temp_dir().join(format!("mpd-ptd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = crate::config::Config {
+            test: Some("cargo test".to_string()),
+            ..Default::default()
+        };
+        let unrelated = crate::config::Config {
+            test: Some("a totally different command".to_string()),
+            ..base.clone()
+        };
+        let d_base = persona_tuning_digest(&dir, &base, Phase::SecurityCode).unwrap();
+        assert_eq!(
+            d_base,
+            persona_tuning_digest(&dir, &unrelated, Phase::SecurityCode).unwrap(),
+            "an unrelated config edit must NOT stale the persona-tuning digest"
+        );
+
+        let mut tuned = base.clone();
+        tuned.personas.insert(
+            "Security".to_string(),
+            crate::config::PersonaTuning {
+                directive_append: Some("also check IMAP cleartext".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            d_base,
+            persona_tuning_digest(&dir, &tuned, Phase::SecurityCode).unwrap(),
+            "a Security tuning change MUST stale the persona-tuning digest"
+        );
+        // But that Security tuning does NOT stale a DIFFERENT persona's digest.
+        assert_eq!(
+            persona_tuning_digest(&dir, &base, Phase::Test).unwrap(),
+            persona_tuning_digest(&dir, &tuned, Phase::Test).unwrap(),
+            "tuning Security must not stale the Tester's digest"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

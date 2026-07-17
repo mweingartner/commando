@@ -12,10 +12,40 @@
 //! Luna (GPT-5.6, lightest) exists but is not assigned by default.
 
 use crate::config::Config;
-use crate::ledger::{Governance, RiskLevel};
+use crate::ledger::{Depth, Governance, Rigor, RiskLevel};
 use crate::personas;
 use crate::phase::Phase;
 use serde::Serialize;
+
+/// Ordinal rank of a reasoning-effort label (`medium` < `high` < `max`). Effort
+/// composition MUST compare on this rank, NEVER on `String` order — lexically
+/// `"high" < "max" < "medium"`, so a naive `String::max` would select the WEAKEST
+/// (`"medium"`) over `"high"`, a strengthen-only inversion (design.md Cond 3,
+/// round-3 F3).
+fn effort_rank(effort: &str) -> u8 {
+    match effort {
+        "max" => 2,
+        "high" => 1,
+        _ => 0, // "medium" and any unexpected value are the baseline rank
+    }
+}
+
+/// The stronger of two effort labels by [`effort_rank`] (never `String::max`).
+fn max_effort<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if effort_rank(a) >= effort_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+fn is_one(n: &usize) -> bool {
+    *n == 1
+}
+
+fn is_not(b: &bool) -> bool {
+    !*b
+}
 
 /// The instruction set for the next phase.
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +90,27 @@ pub struct NextBrief {
     pub attempt_authorization: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_warning: Option<String>,
+    // --- persona tuning (design.md persona-tuning) ---
+    // All five carry `skip_serializing_if` so an untuned brief's `--json` envelope
+    // is byte-identical at baseline (design.md Cond 1).
+    /// Reasoning-effort override, Some ONLY when tuning/floor raised it above the
+    /// tier baseline (`high` or `max`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Reviewer count the harness spawns for this persona (≥1, ≤4). Omitted at 1.
+    #[serde(skip_serializing_if = "is_one")]
+    pub reviewers: usize,
+    /// A sanitized directive overlay to append AFTER the base directive (never
+    /// replacing it). The one un-rankable knob.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directive_append: Option<String>,
+    /// True when an un-rankable weakening vector was in force (a `directive_append`
+    /// OR a `modified:true` base directive) — recorded on the gate receipt for audit.
+    #[serde(skip_serializing_if = "is_not")]
+    pub weakened: bool,
+    /// A human note describing the tuning in force. Omitted at baseline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tuning_note: Option<String>,
 }
 
 /// Resolve `(model, fallback_note)` for a phase under a harness. A per-persona
@@ -122,6 +173,144 @@ pub fn model_for_governed(
     (deep, deep_note, true)
 }
 
+/// The resolved, governed persona tuning for a phase. **Config-only** — it sees
+/// only `cfg`, so `had_append` is the CONFIG half of the un-rankable weakening
+/// flag; the directive `base_modified` half needs `root` and is folded in by `mpd
+/// next` (design.md D4/Cond 9). It only ever STRENGTHENS: the ordinal knobs have
+/// no sub-baseline term (D2), effort composes as a monotonic `max` over
+/// [`effort_rank`] (never `String` order, Cond 3), and at `risk=High` the effort
+/// floor raises the adversarial set with no model clause (Cond 4). It is a
+/// resolution-time overlay, NEVER a gate verdict, and never blocks advancement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedTuning {
+    /// Effort override, Some ONLY when raised above the tier baseline.
+    pub effort: Option<String>,
+    /// Reviewer count (≥1, ≤4), additive; never gates the DocValidation dual.
+    pub reviewers: usize,
+    /// The resolved rigor knob (for the record).
+    pub rigor: Option<Rigor>,
+    /// The resolved depth knob (Tester emphasis; None off the Test phase).
+    pub depth: Option<Depth>,
+    /// The sanitized directive overlay (terminal_safe + length-capped), if any.
+    pub directive_append: Option<String>,
+    /// Whether a sanitized append is carried (config half of `weakened`).
+    pub had_append: bool,
+    /// A human note describing the tuning/floor in force, if anything is non-baseline.
+    pub tuning_note: Option<String>,
+}
+
+/// Length cap for a sanitized `directive_append`; an oversized overlay degrades to
+/// `None` (dropped) rather than bloating the brief (design.md Cond 5).
+const MAX_DIRECTIVE_APPEND: usize = 2000;
+
+/// Resolve the governed persona tuning for `phase` at `risk`. See [`ResolvedTuning`].
+pub fn resolve_tuning_governed(cfg: &Config, phase: Phase, risk: RiskLevel) -> ResolvedTuning {
+    let tuning = cfg.persona_tuning(phase.tuning_key());
+    let baseline = if phase.is_deep() { "high" } else { "medium" };
+
+    // rigor knob → effort (standard/none → baseline; deep → high; paranoid → max)
+    let rigor = tuning.and_then(|t| t.rigor);
+    let rigor_effort = match rigor.map(Rigor::rank) {
+        Some(2) => "max",
+        Some(1) => "high",
+        _ => baseline,
+    };
+
+    // depth (Tester only) → emphasis + an effort nudge; ignored off the Test phase.
+    let depth = if matches!(phase, Phase::Test) {
+        tuning.and_then(|t| t.depth)
+    } else {
+        None
+    };
+    let depth_effort = if depth.map_or(0, Depth::rank) >= 1 {
+        "high"
+    } else {
+        baseline
+    };
+
+    // High-risk effort floor for the adversarial set — a governance escalation
+    // parallel to the model bump, WITHOUT `model_for_governed`'s model-equality
+    // clause (round-2 F1): a custom model pin must NOT disable the floor.
+    let floor_eligible = risk == RiskLevel::High
+        && matches!(
+            phase,
+            Phase::SecurityPlan | Phase::SecurityCode | Phase::Test | Phase::DocValidation
+        );
+    let floor_effort = if floor_eligible { "high" } else { baseline };
+
+    // Compose by a monotonic `max` on the ordinal rank (NEVER String order).
+    let composed = [rigor_effort, depth_effort, floor_effort]
+        .into_iter()
+        .fold(baseline, max_effort);
+    let effort = (effort_rank(composed) > effort_rank(baseline)).then(|| composed.to_string());
+
+    // reviewers: paranoid on an adversarial-review persona → 2, else 1; clamp ≤4.
+    // Purely additive — never gates DocValidation's structural dual (Cond 8).
+    let review_persona = matches!(
+        phase,
+        Phase::SecurityPlan
+            | Phase::SecurityCode
+            | Phase::DesignReview
+            | Phase::DesignSignoff
+            | Phase::DocValidation
+    );
+    let reviewers = if rigor == Some(Rigor::Paranoid) && review_persona {
+        2usize
+    } else {
+        1
+    }
+    .min(4);
+
+    // directive_append: sanitize (terminal_safe) + length cap. Oversized → None
+    // (dropped); a value that sanitizes to empty applies nothing (weakened stays
+    // false — design.md Cond 5).
+    let directive_append = tuning
+        .and_then(|t| t.directive_append.as_deref())
+        .and_then(|raw| {
+            if raw.chars().count() > MAX_DIRECTIVE_APPEND {
+                return None;
+            }
+            let safe = terminal_safe(raw);
+            let safe = safe.trim();
+            (!safe.is_empty()).then(|| safe.to_string())
+        });
+    let had_append = directive_append.is_some();
+
+    // A human note: accurate about whether the change is persona config or the
+    // pure governance floor (so an untuned High-risk brief doesn't claim tuning).
+    let has_config = rigor.is_some() || depth.is_some() || had_append;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(e) = &effort {
+        parts.push(format!("effort {e}"));
+    }
+    if reviewers > 1 {
+        parts.push(format!("{reviewers} reviewers"));
+    }
+    if let Some(d) = depth {
+        parts.push(format!("test depth {}", d.label()));
+    }
+    if had_append {
+        parts.push("directive overlay (un-rankable — recorded)".to_string());
+    }
+    let tuning_note = if parts.is_empty() {
+        None
+    } else if has_config {
+        Some(format!("persona tuning: {}", parts.join("; ")))
+    } else {
+        Some(format!("risk=high floor: {}", parts.join("; ")))
+    };
+
+    ResolvedTuning {
+        effort,
+        reviewers,
+        rigor,
+        depth,
+        directive_append,
+        had_append,
+        tuning_note,
+    }
+}
+
 /// The built-in default model for a harness/tier when config is silent. The
 /// harness-neutral `generic` reports the tier name rather than a concrete model.
 fn builtin_default(harness: &str, deep: bool) -> &'static str {
@@ -176,6 +365,10 @@ pub fn brief(
     let persona = phase.persona();
     let (model, model_note, deep_tier_bump) =
         model_for_governed(cfg, harness, phase, governance.risk);
+    // Config-only tuning; `mpd next` folds the directive `base_modified` half into
+    // `weakened` after this (Cond 9). `brief()` has a single call site, so there is
+    // no brief-vs-record split-brain (round-4).
+    let tuning = resolve_tuning_governed(cfg, phase, governance.risk);
     NextBrief {
         change: change.to_string(),
         phase: phase.slug().to_string(),
@@ -200,6 +393,13 @@ pub fn brief(
         reconciliation_required,
         attempt_authorization,
         artifact_warning,
+        effort: tuning.effort,
+        reviewers: tuning.reviewers,
+        directive_append: tuning.directive_append,
+        // Config half of the un-rankable weakening flag; `mpd next` ORs in the
+        // directive `base_modified` half before rendering/recording (Cond 9/11).
+        weakened: tuning.had_append,
+        tuning_note: tuning.tuning_note,
     }
 }
 
@@ -239,6 +439,22 @@ fn governance_lines(b: &NextBrief) -> String {
             b.persona, b.model
         ));
     }
+    if let Some(note) = &b.tuning_note {
+        out.push_str(&format!("  {}\n", terminal_safe(note)));
+    }
+    if b.weakened {
+        out.push_str(
+            "  ⚠ persona weakened by an un-rankable directive override — recorded on the gate receipt for audit.\n",
+        );
+        // Strict advisory (Cond 12): a weakened Security/Doc-Validation gate under
+        // the strict tier gets the louder human-decision surfacing — still no gate,
+        // no CONDITIONAL, no stuck-state.
+        if b.strict && matches!(b.persona.as_str(), "Security" | "Architect & Designer") {
+            out.push_str(
+                "  human decision: this weakening is recorded, not blocked — a human should confirm it before trusting this gate.\n",
+            );
+        }
+    }
     if let Some(w) = &b.artifact_warning {
         out.push_str(&format!("  Warning: {}\n", terminal_safe(w)));
     }
@@ -246,6 +462,20 @@ fn governance_lines(b: &NextBrief) -> String {
         out.push_str("  Blocking FAIL requires attacker, prerequisite capability, crossed boundary, concrete harm, and exact fix. Out-of-profile hardening is advisory unless it crosses into the declared profile.\n");
     }
     out
+}
+
+/// The persona's guidance with the tuned directive overlay appended AFTER it under
+/// an explicit header (never replacing the base directive — design.md Cond 5). The
+/// overlay text is already sanitized (terminal_safe + length-capped) at resolve.
+fn guidance_with_overlay(b: &NextBrief) -> String {
+    match &b.directive_append {
+        Some(text) => format!(
+            "{}\n\n  ── persona directive overlay (apply AFTER the base directive) ──\n  {}",
+            b.guidance,
+            terminal_safe(text).replace('\n', "\n  ")
+        ),
+        None => b.guidance.clone(),
+    }
 }
 
 /// The model line, including any fallback note.
@@ -272,7 +502,7 @@ pub fn render_generic(b: &NextBrief) -> String {
             b.artifacts.join(", ")
         ));
     }
-    out.push_str(&format!("\n  {}\n", b.guidance));
+    out.push_str(&format!("\n  {}\n", guidance_with_overlay(b)));
     out.push_str(&format!("\n  Gate: {}\n", b.gate));
     out.push_str(&format!("  When done: {}\n", b.gate_command));
     out
@@ -281,10 +511,11 @@ pub fn render_generic(b: &NextBrief) -> String {
 /// Render a brief as Claude Code subagent spawn instructions.
 pub fn render_claude_code(b: &NextBrief) -> String {
     let governance = governance_lines(b);
+    let guidance = guidance_with_overlay(b);
     if b.persona == "main-session" || b.persona == "-" {
         return format!(
             "▸ {} — {}\n{}  Handle in the main session (no subagent).\n\n  {}\n\n  When done: {}\n",
-            b.label, b.change, governance, b.guidance, b.gate_command
+            b.label, b.change, governance, guidance, b.gate_command
         );
     }
     if b.dual {
@@ -299,7 +530,7 @@ pub fn render_claude_code(b: &NextBrief) -> String {
             change = b.change,
             governance = governance,
             model = model_line(b),
-            guidance = b.guidance,
+            guidance = guidance,
             cmd = b.gate_command,
         );
     }
@@ -320,7 +551,7 @@ pub fn render_claude_code(b: &NextBrief) -> String {
         governance = governance,
         persona_lc = b.persona.to_ascii_lowercase(),
         model = model_line(b),
-        guidance = b.guidance,
+        guidance = guidance,
         artifacts = artifacts,
         gate = b.gate,
         cmd = b.gate_command,
@@ -332,10 +563,11 @@ pub fn render_claude_code(b: &NextBrief) -> String {
 /// on the tier's GPT-5.6 model.
 pub fn render_codex(b: &NextBrief) -> String {
     let governance = governance_lines(b);
+    let guidance = guidance_with_overlay(b);
     if b.persona == "main-session" || b.persona == "-" {
         return format!(
             "▸ {} — {}\n{}  Handle in the current Codex session (no persona switch).\n\n  {}\n\n  When done: {}\n",
-            b.label, b.change, governance, b.guidance, b.gate_command
+            b.label, b.change, governance, guidance, b.gate_command
         );
     }
     if b.dual {
@@ -352,7 +584,7 @@ pub fn render_codex(b: &NextBrief) -> String {
             change = b.change,
             governance = governance,
             model = b.model,
-            guidance = b.guidance,
+            guidance = guidance,
             cmd = b.gate_command,
         );
     }
@@ -375,7 +607,7 @@ pub fn render_codex(b: &NextBrief) -> String {
         persona = b.persona,
         model = b.model,
         artifacts = artifacts,
-        guidance = b.guidance,
+        guidance = guidance,
         gate = b.gate,
         cmd = b.gate_command,
     )
@@ -543,6 +775,393 @@ mod tests {
                 ("my-strong-model", false),
                 "a custom pin must survive the high-risk bump on {phase:?}"
             );
+        }
+    }
+
+    fn cfg_with(persona: &str, tuning: crate::config::PersonaTuning) -> Config {
+        let mut personas = BTreeMap::new();
+        personas.insert(persona.to_string(), tuning);
+        Config {
+            personas,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn resolve_tuning_baseline_is_inert() {
+        // R1: an untuned config at the default risk resolves to nothing — no
+        // effort override, one reviewer, no append, no note. The brief's --json
+        // then omits every tuning field (byte-identical baseline).
+        let t = resolve_tuning_governed(&Config::default(), Phase::SecurityCode, RiskLevel::Medium);
+        assert_eq!(t.effort, None);
+        assert_eq!(t.reviewers, 1);
+        assert!(!t.had_append && t.directive_append.is_none());
+        assert_eq!(t.tuning_note, None);
+
+        let b = brief(
+            &Config::default(),
+            "c",
+            Phase::SecurityCode,
+            "claude-code",
+            &Governance::default(),
+            true,
+            1,
+            false,
+            None,
+            None,
+        );
+        let json = serde_json::to_string(&b).unwrap();
+        for field in [
+            "\"effort\"",
+            "\"reviewers\"",
+            "\"weakened\"",
+            "\"directive_append\"",
+            "\"tuning_note\"",
+        ] {
+            assert!(!json.contains(field), "baseline --json must omit {field}");
+        }
+    }
+
+    #[test]
+    fn high_risk_floors_effort_for_the_adversarial_set_without_a_model_clause() {
+        // R4 / R4b: at risk=High the floor raises Security/Tester effort to `high`,
+        // and — unlike the model bump — has NO model-equality clause, so a CUSTOM
+        // MODEL PIN cannot disable it (round-2 F1). rigor=standard is still floored.
+        let mut personas = BTreeMap::new();
+        personas.insert(
+            "Security".to_string(),
+            crate::config::PersonaTuning {
+                rigor: Some(Rigor::Standard),
+                ..Default::default()
+            },
+        );
+        let mut models = ModelMap::new();
+        let mut m = BTreeMap::new();
+        m.insert("Security".to_string(), "my-fast-model".to_string());
+        models.insert("claude-code".to_string(), m);
+        let cfg = Config {
+            personas,
+            models,
+            ..Config::default()
+        };
+        for phase in [Phase::SecurityPlan, Phase::SecurityCode, Phase::Test] {
+            assert_eq!(
+                resolve_tuning_governed(&cfg, phase, RiskLevel::High)
+                    .effort
+                    .as_deref(),
+                Some("high"),
+                "{phase:?}: floor must raise medium→high even with a custom model pin"
+            );
+            // Below High, no floor: standard rigor is the baseline no-op.
+            assert_eq!(
+                resolve_tuning_governed(&cfg, phase, RiskLevel::Medium).effort,
+                None,
+                "{phase:?}: no floor below High"
+            );
+        }
+        // DocValidation is deep-tier (baseline high), so its floor is a no-op.
+        assert_eq!(
+            resolve_tuning_governed(&Config::default(), Phase::DocValidation, RiskLevel::High)
+                .effort,
+            None
+        );
+    }
+
+    #[test]
+    fn effort_composition_uses_ordinal_rank_not_string_order() {
+        // R4c / round-3 F3: `deep` rigor → `high`, `paranoid` → `max`. A String::max
+        // would wrongly pick "medium" over "high" (lexically "high" < "medium"), a
+        // strengthen-only INVERSION — the ordinal rank prevents it.
+        let deep = cfg_with(
+            "Security",
+            crate::config::PersonaTuning {
+                rigor: Some(Rigor::Deep),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolve_tuning_governed(&deep, Phase::SecurityCode, RiskLevel::Medium)
+                .effort
+                .as_deref(),
+            Some("high"),
+            "deep must resolve to high, never the lexically-larger medium"
+        );
+        let paranoid = cfg_with(
+            "Security",
+            crate::config::PersonaTuning {
+                rigor: Some(Rigor::Paranoid),
+                ..Default::default()
+            },
+        );
+        let t = resolve_tuning_governed(&paranoid, Phase::SecurityCode, RiskLevel::Medium);
+        assert_eq!(t.effort.as_deref(), Some("max"));
+        assert_eq!(
+            t.reviewers, 2,
+            "paranoid on a review persona adds a reviewer"
+        );
+    }
+
+    #[test]
+    fn depth_is_test_only_and_reviewers_are_additive_and_clamped() {
+        // R3/R8/R12: depth applies only to Test; a paranoid non-review persona
+        // (Builder) never adds a reviewer; reviewers never exceed the additive max.
+        let depth = crate::config::PersonaTuning {
+            depth: Some(Depth::Fuzz),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_tuning_governed(
+                &cfg_with("Security", depth.clone()),
+                Phase::SecurityCode,
+                RiskLevel::Medium
+            )
+            .depth,
+            None,
+            "depth is ignored off the Test phase"
+        );
+        let on_test =
+            resolve_tuning_governed(&cfg_with("Tester", depth), Phase::Test, RiskLevel::Medium);
+        assert_eq!(on_test.depth, Some(Depth::Fuzz));
+        assert_eq!(
+            on_test.effort.as_deref(),
+            Some("high"),
+            "fuzz nudges effort up"
+        );
+
+        let paranoid_builder = cfg_with(
+            "Builder",
+            crate::config::PersonaTuning {
+                rigor: Some(Rigor::Paranoid),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolve_tuning_governed(&paranoid_builder, Phase::Build, RiskLevel::Medium).reviewers,
+            1,
+            "a non-review persona never adds a reviewer"
+        );
+    }
+
+    #[test]
+    fn directive_append_is_sanitized_oversized_dropped_and_weakened_iff_carried() {
+        // R5: control chars are stripped in place (still carried → weakened); an
+        // oversized overlay degrades to None (dropped → NOT weakened); an overlay
+        // that sanitizes to empty applies nothing (NOT weakened).
+        let ctrl = cfg_with(
+            "Security",
+            crate::config::PersonaTuning {
+                directive_append: Some("check IMAP\u{1b}]8cleartext".to_string()),
+                ..Default::default()
+            },
+        );
+        let t = resolve_tuning_governed(&ctrl, Phase::SecurityCode, RiskLevel::Medium);
+        assert!(t.had_append);
+        assert_eq!(t.directive_append.as_deref(), Some("check IMAP]8cleartext"));
+
+        let oversized = cfg_with(
+            "Security",
+            crate::config::PersonaTuning {
+                directive_append: Some("A".repeat(MAX_DIRECTIVE_APPEND + 1)),
+                ..Default::default()
+            },
+        );
+        let t = resolve_tuning_governed(&oversized, Phase::SecurityCode, RiskLevel::Medium);
+        assert!(
+            !t.had_append && t.directive_append.is_none(),
+            "oversized → dropped, not weakened"
+        );
+
+        let blank = cfg_with(
+            "Security",
+            crate::config::PersonaTuning {
+                directive_append: Some("   \t  ".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !resolve_tuning_governed(&blank, Phase::SecurityCode, RiskLevel::Medium).had_append,
+            "an overlay that sanitizes to empty applies nothing"
+        );
+    }
+
+    #[test]
+    fn doc_validation_dual_is_phase_derived_not_reviewer_gated() {
+        // R8/R12: DocValidation's structural dual (spawn Architect + Designer) is
+        // derived from the phase, independent of any `reviewers` count.
+        let b = brief(
+            &Config::default(),
+            "c",
+            Phase::DocValidation,
+            "claude-code",
+            &Governance::default(),
+            true,
+            1,
+            false,
+            None,
+            None,
+        );
+        assert!(b.dual, "the DocValidation dual is phase-derived");
+    }
+
+    // -----------------------------------------------------------------
+    // Effort-composition property (design.md Cond 3 / D4): for ANY
+    // (rigor, depth, risk, phase), `resolve_tuning_governed` never yields an
+    // effort ranked below the phase's tier baseline, and is monotonic in
+    // rigor rank — the strengthen-only guarantee, generalized beyond the
+    // hand-picked examples above.
+    // -----------------------------------------------------------------
+
+    fn arb_phase() -> impl Strategy<Value = Phase> {
+        prop_oneof![
+            Just(Phase::DesignMock),
+            Just(Phase::Architecture),
+            Just(Phase::DesignReview),
+            Just(Phase::SecurityPlan),
+            Just(Phase::Build),
+            Just(Phase::SecurityCode),
+            Just(Phase::DesignSignoff),
+            Just(Phase::Test),
+            Just(Phase::Documentation),
+            Just(Phase::Deploy),
+            Just(Phase::DocValidation),
+        ]
+    }
+
+    fn arb_risk() -> impl Strategy<Value = RiskLevel> {
+        prop_oneof![
+            Just(RiskLevel::Low),
+            Just(RiskLevel::Medium),
+            Just(RiskLevel::High),
+        ]
+    }
+
+    fn arb_rigor_opt() -> impl Strategy<Value = Option<Rigor>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(Rigor::Standard)),
+            Just(Some(Rigor::Deep)),
+            Just(Some(Rigor::Paranoid)),
+        ]
+    }
+
+    fn arb_depth_opt() -> impl Strategy<Value = Option<Depth>> {
+        prop_oneof![
+            Just(None),
+            Just(Some(Depth::Examples)),
+            Just(Some(Depth::Property)),
+            Just(Some(Depth::Fuzz)),
+        ]
+    }
+
+    /// A config tuning exactly one persona (keyed by `phase.tuning_key()`) with
+    /// the given rigor/depth, no append.
+    fn cfg_tuned(phase: Phase, rigor: Option<Rigor>, depth: Option<Depth>) -> Config {
+        let mut personas = BTreeMap::new();
+        personas.insert(
+            phase.tuning_key().to_string(),
+            crate::config::PersonaTuning {
+                rigor,
+                depth,
+                directive_append: None,
+            },
+        );
+        Config {
+            personas,
+            ..Config::default()
+        }
+    }
+
+    fn tier_baseline(phase: Phase) -> &'static str {
+        if phase.is_deep() {
+            "high"
+        } else {
+            "medium"
+        }
+    }
+
+    proptest! {
+        /// The resolved effort is NEVER ranked below the phase's tier baseline,
+        /// for any (rigor, depth, risk, phase) combination — the composition is
+        /// a monotonic `max` over the baseline, so it can only ever raise.
+        #[test]
+        fn resolved_effort_never_ranked_below_tier_baseline(
+            phase in arb_phase(),
+            risk in arb_risk(),
+            rigor in arb_rigor_opt(),
+            depth in arb_depth_opt(),
+        ) {
+            let cfg = cfg_tuned(phase, rigor, depth);
+            let baseline = tier_baseline(phase);
+            let t = resolve_tuning_governed(&cfg, phase, risk);
+            let effective = t.effort.as_deref().unwrap_or(baseline);
+            prop_assert!(
+                effort_rank(effective) >= effort_rank(baseline),
+                "phase={phase:?} risk={risk:?} rigor={rigor:?} depth={depth:?} \
+                 resolved {effective:?} ranked below baseline {baseline:?}"
+            );
+        }
+
+        /// Monotonic in rigor rank: for a fixed (depth, risk, phase), raising
+        /// rigor's ordinal rank can only raise (never lower) the resolved
+        /// effort's rank — a `deep` persona never yields weaker effort than a
+        /// `standard` one, and `paranoid` never weaker than `deep` (the
+        /// specific case the design calls out is subsumed by this general
+        /// property over arbitrary rigor pairs).
+        #[test]
+        fn resolved_effort_is_monotonic_in_rigor_rank(
+            phase in arb_phase(),
+            risk in arb_risk(),
+            depth in arb_depth_opt(),
+            r1 in arb_rigor_opt(),
+            r2 in arb_rigor_opt(),
+        ) {
+            let (lo, hi) = if r1.map_or(0, Rigor::rank) <= r2.map_or(0, Rigor::rank) {
+                (r1, r2)
+            } else {
+                (r2, r1)
+            };
+            let baseline = tier_baseline(phase);
+            let rank_lo = effort_rank(
+                resolve_tuning_governed(&cfg_tuned(phase, lo, depth), phase, risk)
+                    .effort
+                    .as_deref()
+                    .unwrap_or(baseline),
+            );
+            let rank_hi = effort_rank(
+                resolve_tuning_governed(&cfg_tuned(phase, hi, depth), phase, risk)
+                    .effort
+                    .as_deref()
+                    .unwrap_or(baseline),
+            );
+            prop_assert!(
+                rank_hi >= rank_lo,
+                "phase={phase:?} risk={risk:?} depth={depth:?} lo={lo:?}->{rank_lo} hi={hi:?}->{rank_hi}"
+            );
+        }
+
+        /// A paranoid persona never resolves to weaker effort than a deep one,
+        /// across every (phase, risk, depth) — the concrete instance of
+        /// monotonicity the design's Risk/Trade-offs section calls out by name.
+        #[test]
+        fn paranoid_never_yields_effort_weaker_than_deep(
+            phase in arb_phase(),
+            risk in arb_risk(),
+            depth in arb_depth_opt(),
+        ) {
+            let baseline = tier_baseline(phase);
+            let deep_rank = effort_rank(
+                resolve_tuning_governed(&cfg_tuned(phase, Some(Rigor::Deep), depth), phase, risk)
+                    .effort
+                    .as_deref()
+                    .unwrap_or(baseline),
+            );
+            let paranoid_rank = effort_rank(
+                resolve_tuning_governed(&cfg_tuned(phase, Some(Rigor::Paranoid), depth), phase, risk)
+                    .effort
+                    .as_deref()
+                    .unwrap_or(baseline),
+            );
+            prop_assert!(paranoid_rank >= deep_rank);
         }
     }
 

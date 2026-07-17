@@ -167,6 +167,39 @@ review phases (Security, Build, Test, Documentation) get the standard model — 
 lets you override per persona in `.mpd/config.json` (`models`, `model_fallbacks`)
 as models evolve. `mpd next --harness <h>` prints the resolved model per phase.
 
+## Persona tuning (behavior, not just model)
+
+Beyond the model, each persona's behavior is tunable in `.mpd/config.json`
+(`personas`), and mpd carries the resolved tuning into the `mpd next` brief. The
+knobs are strengthen-only: `rigor` (`standard|deep|paranoid`) raises reasoning
+effort + reviewers; `depth` (`examples|property|fuzz`, Tester only) adds test
+emphasis; `directive_append` overlays a project instruction AFTER the bundled
+directive (never replacing it). At `risk=high` the adversarial set
+(Security/Tester/Doc-Validation) is floored to deep effort regardless of any pin.
+
+**Harness contract (apply the BRIEF, never re-read config):**
+- Apply the brief's `effort`, `reviewers`, and `directive_append` fields as
+  emitted by `mpd next`. Do NOT re-read `.mpd/config.json` yourself — mpd has
+  already sanitized (`terminal_safe` + length cap) and floored the values; a raw
+  re-read bypasses those guards.
+- `directive_append` (and a locally-modified base directive) is *un-rankable* —
+  mpd cannot prove it rigor-preserving, so it is RECORDED (`weakened` on the brief
+  and on every gate receipt), never blocked. When a brief is `weakened`, treat the
+  gate as a human-review point; the record is the audit tooth.
+- **Record the gate BEFORE any `mpd persona set`/`reset`** within a change. mpd
+  stamps a gate from the brief it recorded for the current `(phase, attempt)`; a
+  tune-down mid-phase is recorded, but the honest order keeps the audit trail clean.
+
+**The interview (any harness, any time the user asks to tune personas):** loop the
+tunable personas and, for each, read `mpd persona show <persona> --json` (it
+returns each field's current value, allowed range, baseline, and a `dangerous`
+flag). Ask the user, surfacing the current value and the range, and a clear ⚠ when
+they choose the un-rankable `directive-append`. Record each answer with
+`mpd persona set <persona> <field> <value>` (which validates the name + term and
+warns on the dangerous knob) — or `mpd persona reset <persona> [field]`. The
+danger classification and the write both live in mpd, so an interview-set value and
+a hand-edited one are guarded identically.
+
 ## Working principles (apply proportionately)
 
 - **Speak the domain's language.** Use the user's exact terms in code, specs,

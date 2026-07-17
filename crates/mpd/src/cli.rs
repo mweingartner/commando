@@ -262,6 +262,47 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// Inspect or tune per-persona behavior — the interview primitives a harness
+    /// drives (show current/range, warn on the un-rankable change, record).
+    Persona {
+        #[command(subcommand)]
+        command: PersonaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PersonaCommand {
+    /// List every tunable persona with its current tuning.
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one persona: per field the current value, range, baseline, and danger.
+    Show {
+        /// Persona (Architect|Designer|Security|Builder|Tester|Documenter|DocValidation).
+        persona: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set a persona field (`rigor`|`depth`|`directive-append`). Rejects an unknown
+    /// persona name or enum term; warns loudly on the un-rankable `directive-append`.
+    Set {
+        /// Persona display name (or `DocValidation`).
+        persona: String,
+        /// Field: `rigor`, `depth`, or `directive-append`.
+        field: String,
+        /// Value (an enum term for rigor/depth; free text for directive-append).
+        value: String,
+    },
+    /// Clear a persona's tuning back to baseline — a single `field`, or all of it.
+    Reset {
+        /// Persona display name (or `DocValidation`).
+        persona: String,
+        /// The field to clear; omit to clear the whole persona entry.
+        field: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -389,6 +430,7 @@ pub fn run() -> i32 {
         Command::Use { change } => cmd_use(change),
         Command::Strict { change } => cmd_strict(change),
         Command::Doctor { json, fix } => cmd_doctor(json, fix),
+        Command::Persona { command } => cmd_persona(command),
     };
     match result {
         Ok(code) => code,
@@ -1062,7 +1104,7 @@ fn cmd_next(
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
-    let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
     let release_closure = release_closure_facts(&root, &change, &ledger);
     if ledger.phase == Phase::Done {
         if json {
@@ -1096,7 +1138,7 @@ fn cmd_next(
     let cfg = Config::load(&root);
     let page_warning =
         artifact_budget(&Project::new(&root), &change, ledger.governance.risk).warning;
-    let brief = harness::brief(
+    let mut brief = harness::brief(
         &cfg,
         &change,
         ledger.phase,
@@ -1110,6 +1152,48 @@ fn cmd_next(
             .map(|r| r.kind.label().to_string()),
         page_warning,
     );
+
+    // Resolve the phase persona's base directive(s) ONCE (round-4 F4-2), shared
+    // with the `--full` display below. `base_modified` (a divergent base directive
+    // file — the second un-rankable weakening vector) is folded into the brief's
+    // `weakened` flag and RECORDED into `brief_tuning` UNCONDITIONALLY and
+    // PRE-BRANCH here — before the `--json`/`--context`/`--full` branches — so a
+    // plain `mpd next` still records it (round-4 F4-1). A gate-time live re-read
+    // would re-open the `edit directive → next → restore → gate` TOCTOU (round-3 F1).
+    let phase_directives: Vec<(String, crate::directives::Directive)> = ledger
+        .phase
+        .tuning_personas()
+        .into_iter()
+        .filter_map(|n| crate::directives::for_persona(&root, n).map(|d| (n.to_string(), d)))
+        .collect();
+    let base_modified = phase_directives.iter().any(|(_, d)| d.modified);
+    if base_modified {
+        brief.weakened = true;
+        let msg = "modified base directive (un-rankable — recorded)";
+        brief.tuning_note = Some(match brief.tuning_note.take() {
+            Some(n) => format!("{n}; {msg}"),
+            None => format!("persona tuning: {msg}"),
+        });
+    }
+    // Record the brief-time weakening determination (config tuning + base_modified)
+    // for (phase, attempt), monotonic weakest-seen; only when non-baseline, so an
+    // untuned+unmodified project's ledger is byte-unchanged by `next` (Cond 11).
+    {
+        let resolved = harness::resolve_tuning_governed(&cfg, ledger.phase, ledger.governance.risk);
+        let record = ledger::PersonaTuningRecord {
+            rigor: resolved.rigor,
+            depth: resolved.depth,
+            had_append: resolved.had_append,
+            base_modified,
+            weakened: resolved.had_append || base_modified,
+        };
+        if !record.is_baseline() {
+            let attempt = ledger.next_attempt(ledger.phase);
+            let phase = ledger.phase;
+            ledger.record_brief_tuning(phase, attempt, record);
+            ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+        }
+    }
     let evidence_hint = ledger
         .history
         .iter()
@@ -1140,20 +1224,14 @@ fn cmd_next(
             })
         });
 
-    // With --full, resolve the phase persona's directive(s). A composite persona
-    // (Doc Validation = "Architect & Designer") resolves its parts.
-    let directives: Vec<(String, crate::directives::Directive)> = if full {
-        let names: Vec<&str> = if ledger.phase.is_doc_validation() {
-            vec!["Architect", "Designer"]
-        } else {
-            vec![brief.persona.as_str()]
-        };
-        names
-            .into_iter()
-            .filter_map(|n| crate::directives::for_persona(&root, n).map(|d| (n.to_string(), d)))
-            .collect()
+    // With --full, inline the phase persona's directive(s) — the SAME resolution
+    // used for `base_modified` above (resolved once, round-4 F4-2). A composite
+    // persona (Doc Validation) already resolved its two parts.
+    let no_directives: Vec<(String, crate::directives::Directive)> = Vec::new();
+    let directives: &Vec<(String, crate::directives::Directive)> = if full {
+        &phase_directives
     } else {
-        Vec::new()
+        &no_directives
     };
 
     if json {
@@ -1222,7 +1300,7 @@ fn cmd_next(
                 .unwrap_or_default()
         );
     }
-    for (persona, d) in &directives {
+    for (persona, d) in directives {
         if d.modified {
             println!(
                 "\n⚠  project directive for {persona} differs from the bundled default — \
@@ -1232,6 +1310,42 @@ fn cmd_next(
         println!("\n───── directive: {persona} ─────\n{}", d.text);
     }
     Ok(0)
+}
+
+/// The persona-tuning stamp for a gate on `(phase, attempt)`. It derives the
+/// stamp from the brief `mpd next` recorded for this exact `(phase, attempt)` when
+/// present — closing the `next`→`gate` TOCTOU (design.md Cond 11) — and falls back
+/// to a LIVE determination (config tuning + directive `base_modified`) only when no
+/// matching brief was recorded (a manual `gate` with no preceding `next`, or a
+/// stale superseded record). Returns `None` at baseline (untuned + unmodified), so
+/// a baseline gate is unstamped and byte-identical. Note: the fallback recomputes
+/// from config + directives (NO gate-time-only source), and it is the ONLY
+/// directive read in the stamp path — there is no `directives::for_persona` call in
+/// the `GateRecord` construction itself (round-4 F4-1).
+fn persona_tuning_stamp(
+    root: &Path,
+    cfg: &Config,
+    ledger: &ledger::Ledger,
+    phase: Phase,
+    attempt: usize,
+) -> Option<ledger::PersonaTuningRecord> {
+    if let Some(rec) = ledger.brief_tuning_for(phase, attempt) {
+        return (!rec.is_baseline()).then(|| rec.clone());
+    }
+    let resolved = harness::resolve_tuning_governed(cfg, phase, ledger.governance.risk);
+    let base_modified = phase
+        .tuning_personas()
+        .into_iter()
+        .filter_map(|n| crate::directives::for_persona(root, n))
+        .any(|d| d.modified);
+    let record = ledger::PersonaTuningRecord {
+        rigor: resolved.rigor,
+        depth: resolved.depth,
+        had_append: resolved.had_append,
+        base_modified,
+        weakened: resolved.had_append || base_modified,
+    };
+    (!record.is_baseline()).then_some(record)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1349,6 +1463,10 @@ fn cmd_gate(
         return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), ledger.governance.risk));
     }
     let attempt = ledger.next_attempt(phase);
+    // The persona-tuning stamp for this gate — from the brief `mpd next` recorded
+    // for this exact (phase, attempt), else a live fallback (design.md Cond 11).
+    // Computed once and applied at BOTH GateRecord sites (reuse + execute, Cond 6).
+    let persona_stamp = persona_tuning_stamp(&root, &Config::load(&root), &ledger, phase, attempt);
     let completed = ledger::now_epoch_secs();
     let mut checks_summary: Option<CheckSummary> = None;
 
@@ -1418,6 +1536,7 @@ fn cmd_gate(
                 started_at_epoch_secs: completed,
                 completed_at_epoch_secs: completed,
                 receipt: Some(receipt),
+                persona_tuning: persona_stamp.clone(),
             },
         );
         ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
@@ -1625,6 +1744,7 @@ fn cmd_gate(
             } else {
                 None
             },
+            persona_tuning: persona_stamp,
         },
     );
     if verdict == Verdict::ConditionalPass {
@@ -3013,6 +3133,216 @@ fn cmd_strict(change: String) -> CmdResult {
     ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
     println!("Promoted {change:?} to the strict tier: judgment gates now enforce their artifacts.");
     Ok(0)
+}
+
+/// The tunable personas (persona display names + the normalized `DocValidation`
+/// key). `main-session`/`-` are not tunable. A `persona set` for a name outside
+/// this set is rejected, so a fat-fingered name cannot write inert config rot that
+/// silently no-ops a strengthening the operator believes they applied (round-4 F4-3).
+const TUNABLE_PERSONAS: &[&str] = &[
+    "Architect",
+    "Designer",
+    "Security",
+    "Builder",
+    "Tester",
+    "Documenter",
+    "DocValidation",
+];
+
+/// Canonicalize a persona name (case-insensitive) to its `TUNABLE_PERSONAS` form,
+/// or `None` if it is not a tunable persona.
+fn normalize_persona(name: &str) -> Option<&'static str> {
+    TUNABLE_PERSONAS
+        .iter()
+        .copied()
+        .find(|p| p.eq_ignore_ascii_case(name))
+}
+
+/// The per-field current/range/baseline/dangerous view for one persona — the same
+/// structure `persona show --json` exposes so a harness interview renders the same
+/// warnings mpd enforces.
+fn persona_show_json(key: &str, t: &crate::config::PersonaTuning) -> serde_json::Value {
+    serde_json::json!({
+        "persona": key,
+        "fields": {
+            "rigor": {
+                "current": t.rigor.map(|r| r.label()),
+                "baseline": "standard",
+                "range": ["standard", "deep", "paranoid"],
+                "dangerous": false,
+            },
+            "depth": {
+                "current": t.depth.map(|d| d.label()),
+                "baseline": "examples",
+                "range": ["examples", "property", "fuzz"],
+                "dangerous": false,
+                "note": "Tester only",
+            },
+            "directive-append": {
+                "current": t.directive_append.as_deref(),
+                "baseline": serde_json::Value::Null,
+                "range": "free text — appended after the base directive; un-rankable",
+                "dangerous": true,
+            },
+        }
+    })
+}
+
+fn print_persona_text(key: &str, t: &crate::config::PersonaTuning) {
+    let show = |v: Option<&str>| v.map(|s| s.to_string()).unwrap_or_else(|| "—".to_string());
+    println!("Persona: {key}");
+    println!(
+        "  rigor            current {:<10} range standard|deep|paranoid (baseline standard)",
+        show(t.rigor.map(|r| r.label()))
+    );
+    println!(
+        "  depth            current {:<10} range examples|property|fuzz (baseline examples, Tester only)",
+        show(t.depth.map(|d| d.label()))
+    );
+    println!(
+        "  directive-append current {:<10} ⚠ un-rankable — recorded/flagged on every gate receipt",
+        if t.directive_append.is_some() {
+            "<set>"
+        } else {
+            "—"
+        }
+    );
+}
+
+fn cmd_persona(command: PersonaCommand) -> CmdResult {
+    let root = find_root()?;
+    match command {
+        PersonaCommand::List { json } => {
+            let cfg = Config::load(&root);
+            let default = crate::config::PersonaTuning::default();
+            if json {
+                let arr: Vec<_> = TUNABLE_PERSONAS
+                    .iter()
+                    .map(|key| persona_show_json(key, cfg.persona_tuning(key).unwrap_or(&default)))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+            } else {
+                for key in TUNABLE_PERSONAS {
+                    print_persona_text(key, cfg.persona_tuning(key).unwrap_or(&default));
+                }
+            }
+            Ok(0)
+        }
+        PersonaCommand::Show { persona, json } => {
+            let key = normalize_persona(&persona).ok_or_else(|| {
+                format!(
+                    "unknown persona {persona:?}; one of: {}",
+                    TUNABLE_PERSONAS.join(", ")
+                )
+            })?;
+            let cfg = Config::load(&root);
+            let default = crate::config::PersonaTuning::default();
+            let t = cfg.persona_tuning(key).unwrap_or(&default);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&persona_show_json(key, t)).unwrap()
+                );
+            } else {
+                print_persona_text(key, t);
+            }
+            Ok(0)
+        }
+        PersonaCommand::Set {
+            persona,
+            field,
+            value,
+        } => {
+            let key = normalize_persona(&persona).ok_or_else(|| {
+                format!(
+                    "unknown persona {persona:?}; one of: {}",
+                    TUNABLE_PERSONAS.join(", ")
+                )
+            })?;
+            let mut cfg = Config::load(&root);
+            let entry = cfg.personas.entry(key.to_string()).or_default();
+            match field.as_str() {
+                "rigor" => {
+                    let r: crate::ledger::Rigor = value.parse().map_err(|_| {
+                        format!("unknown rigor {value:?}; range: standard | deep | paranoid")
+                    })?;
+                    let prior = entry.rigor.map(|r| r.label()).unwrap_or("—");
+                    entry.rigor = Some(r);
+                    println!("{key}.rigor: {prior} → {}", r.label());
+                }
+                "depth" => {
+                    let d: crate::ledger::Depth = value.parse().map_err(|_| {
+                        format!("unknown depth {value:?}; range: examples | property | fuzz")
+                    })?;
+                    let prior = entry.depth.map(|d| d.label()).unwrap_or("—");
+                    entry.depth = Some(d);
+                    println!("{key}.depth: {prior} → {} (Tester only)", d.label());
+                }
+                "directive-append" | "directive_append" => {
+                    let safe = harness::terminal_safe(&value);
+                    entry.directive_append = Some(safe);
+                    println!(
+                        "  ⚠ {key}.directive-append set — this is the ONE un-rankable knob. It is \
+                         appended (never replaces the base directive), recorded on every gate \
+                         receipt, and flagged `weakened`. mpd cannot prove it rigor-preserving."
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "unknown field {other:?}; one of: rigor, depth, directive-append"
+                    ))
+                }
+            }
+            cfg.save(&root).map_err(|e| e.to_string())?;
+            Ok(0)
+        }
+        PersonaCommand::Reset { persona, field } => {
+            let key = normalize_persona(&persona).ok_or_else(|| {
+                format!(
+                    "unknown persona {persona:?}; one of: {}",
+                    TUNABLE_PERSONAS.join(", ")
+                )
+            })?;
+            let mut cfg = Config::load(&root);
+            match field.as_deref() {
+                None => {
+                    cfg.personas.remove(key);
+                    println!("{key}: all tuning cleared (baseline).");
+                }
+                Some("rigor") => {
+                    if let Some(e) = cfg.personas.get_mut(key) {
+                        e.rigor = None;
+                    }
+                    println!("{key}.rigor cleared (baseline standard).");
+                }
+                Some("depth") => {
+                    if let Some(e) = cfg.personas.get_mut(key) {
+                        e.depth = None;
+                    }
+                    println!("{key}.depth cleared (baseline examples).");
+                }
+                Some("directive-append") | Some("directive_append") => {
+                    if let Some(e) = cfg.personas.get_mut(key) {
+                        e.directive_append = None;
+                    }
+                    println!("{key}.directive-append cleared.");
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "unknown field {other:?}; one of: rigor, depth, directive-append"
+                    ))
+                }
+            }
+            // Drop an entry that is now fully baseline so config stays minimal.
+            if let Some(e) = cfg.personas.get(key) {
+                if *e == crate::config::PersonaTuning::default() {
+                    cfg.personas.remove(key);
+                }
+            }
+            cfg.save(&root).map_err(|e| e.to_string())?;
+            Ok(0)
+        }
+    }
 }
 
 /// Add-only heal of `.mpd/.gitignore` so it covers exactly the transient set the

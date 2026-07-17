@@ -1,0 +1,38 @@
+Canonical current checklist. Superseded plans go to `history/`.
+
+## 1. Config + resolver
+
+- [x] 1.1 `Config.personas: BTreeMap<String, PersonaTuning>` + `PersonaTuning { rigor, depth, directive_append }`, all `#[serde(default)]`; `Rigor`/`Depth` via `string_enum!` + a **manual `rank()` impl** (string_enum! does NOT generate one — follow `RiskLevel::rank` at ledger.rs:64) + a manual ordinal effort rank; lenient per-field deser via `de_lenient_rigor`/`de_lenient_depth` adapters that deserialize a permissive `serde_json::Value` (never error) → `Some(variant)` only for an exact known string, else None (unknown token / wrong type / null); rest of Config survives. (config.rs)
+- [x] 1.2 `tuning_key(phase)` (DocValidation → "DocValidation"; else persona name) + `resolve_tuning_governed(cfg, phase, risk) -> ResolvedTuning` (config-only): rigor→effort composed as monotonic `max` on an **ordinal effort rank** (`medium<high<max`, NEVER String order) + reviewers (clamp ≤4, additive-only, never gates the dual), depth (Tester emphasis), high-risk floor for {SecurityPlan,SecurityCode,Test,DocValidation} WITHOUT the `model==default` clause, sanitize append (terminal_safe + length cap; oversized→None, control-chars stripped in place), config-half `weakened=had_append` (directive `base_modified` folded in at `next`) / tuning_note. (harness.rs, phase.rs)
+- [x] 1.3 `NextBrief` fields effort/reviewers/directive_append/weakened/tuning_note with `skip_serializing_if` (weakened skip-if-false, reviewers skip-if-1, effort/tuning_note skip-if-none) for byte-identical baseline `--json`; rendered in `governance_lines()`/renderers mirroring `deep_tier_bump`; overlay appended after the base directive under a header. (harness.rs)
+- [x] 1.4 `GateRecord.persona_tuning: Option<PersonaTuningRecord>` (serde-default), stamped by `cmd_gate` at **both** GateRecord sites (execute ~1599 AND reuse ~1409); `cmd_gate` adds the `directives::for_persona` call (resolving DocValidation's `["Architect","Designer"]` parts) for the `modified→weakened` half. (ledger.rs, cli.rs)
+- [x] 1.5 Dedicated narrow `DependencyKey::PersonaTuning` digesting that phase's **effective instructions** — config tuning (`config.personas[tuning_key(phase)]`) AND resolved base-directive text (`directives::for_persona(root, persona)`; thread `root` into `capture_dependency_values` if absent) — bound in `DependencyPolicy::for_phase` for {SecurityPlan,SecurityCode,Test,DocValidation} (reuse across a config-tuning OR directive-file change → `Stale`; unrelated edits don't stale); update `golden_dependency_policy_table` + `no_policy_binds_an_output_first_created_by_a_later_phase` + `earliest_available` (PersonaTuning = config-like → DesignMock). `mpd next` records the full weakening determination — config tuning AND `base_modified` (Cond 9) — for `(phase, attempt)` into serde-default `Ledger.brief_tuning` **only when a non-baseline tuning OR base_modified is in force** (inertness) and **monotonic weakest-seen MERGE** (neither a clean nor a non-baseline-non-weakened re-brief downgrades a recorded `weakened`; clears on attempt advance); `cmd_gate` stamps from the recorded brief **when it matches the current `(phase, attempt)`**, live determination otherwise. `brief_tuning` inert to all digests (gates nothing). (closure.rs, ledger.rs, cli.rs)
+- [x] 1.6 Strict-tier advisory: a `weakened=true` Security/DocValidation gate under strict emits the human-decision advisory line in `governance_lines` (louder only, no gate). (harness.rs)
+
+## 2. Interview primitives
+
+- [x] 2.1 `mpd persona list/show [--json]` — current + range + baseline + `dangerous` per field. (cli.rs)
+- [x] 2.2 `mpd persona set <persona> <field> <value>` — reject unknown persona NAMES (allow only the `tuning_key` set incl. "DocValidation" — round-4 F4-3) AND unknown enum terms, classify danger, loud ⚠ on directive_append, write via `Config::save`; `mpd persona reset <persona> [field]`. (cli.rs, config.rs)
+- [x] 2.3 Doctrine: `AGENTS_MD` (scaffold.rs) + protocol.md — the persona-tuning knobs + the harness-conducted interview loop (show current/range, warn on the un-rankable change, `mpd persona set` to record). MUST state: the harness applies the BRIEF's sanitized `directive_append` (never re-reads config.json), and records the gate BEFORE any `persona set/reset`. (scaffold.rs, assets)
+
+## 3. Verify
+
+- [x] 3.1 Back-compat + integrity unit/e2e tests (see matrix). (config.rs, harness.rs, cli.rs, e2e.rs)
+
+## Risk-to-test matrix
+
+- [x] R1 Empty `personas` ⇒ byte-identical brief + `--json` envelope (skip_serializing_if) + **byte-identical ledger file after `mpd next`** (proptest + inert test) (Cond 1/11).
+- [x] R2 An unknown-token AND a wrong-type (`"rigor": 5`) value each degrade to None while the rest of Config (model pins, test cmd) survives intact; never fails Config::load (Cond 2).
+- [x] R3 rigor/depth are strengthen-only: no value lowers effort/reviewers below the tier baseline; effort is a monotonic `max` compose; depth only for Test, only additive (Cond 3).
+- [x] R4 `risk=High` floors effort to `high` for Security/Tester (raises a configured `standard`); never below; never a gate verdict (Cond 4).
+- [x] R4b **Custom Security model-pin + `rigor=standard` at risk=High still raises effort `medium→high`** — the floor is NOT disabled by a custom model pin (Finding 1) (Cond 4).
+- [x] R4c **Effort `max` uses ordinal rank**: composing `high` with `medium` yields `high` (a String::max would wrongly pick `medium`) — no strengthen-only inversion (round-3 F3) (Cond 3).
+- [x] R5 `directive_append` sanitized: oversized→None (dropped), control-chars stripped in place; appended under a header, base directive unchanged; `weakened` true iff carried Some (Cond 5).
+- [x] R6 A non-baseline tuning stamps `GateRecord.persona_tuning`; a directive_append / modified-base sets `weakened=true` on brief + receipt; never a CONDITIONAL (Cond 6).
+- [x] R6b **Reuse-path variant**: a `gate --reuse` under a tuned persona stamps `persona_tuning` (both GateRecord sites); a receipt reused after the config-tuning OR the base-directive file CHANGES goes `Stale`; an UNRELATED config edit (`test`/`models`) does NOT stale it (narrow `DependencyKey::PersonaTuning` covers config tuning + directive text) (Cond 6).
+- [x] R7 `mpd persona set` rejects an unknown term, warns ⚠ on directive_append, writes valid values via `Config::save`; `show --json` exposes current/range/baseline/dangerous (Cond 7).
+- [x] R8 `reviewers` clamped ≤ 4 (Cond 8).
+- [x] R9 `tuning_key` routes DocValidation tuning to the Doc-Validation phase; the modified-base check resolves DocValidation's `["Architect","Designer"]` parts individually (Cond 9).
+- [x] R10 The whole feature is inert (no gate/stuck-state) — a strict change advances identically whether or not personas are tuned (Cond 4/6 two-tier-neutral).
+- [x] R11 **`set(append) → next → reset → gate` yields a STAMPED PASS**; laundering variants: (b) `→ next → reset → next(clean) → gate` still stamped (conditional write); (b2) `→ next → reset-append + set(rigor=deep) → next → gate` still stamped `weakened` (exercises the MERGE, not just conditional write — round-3 F2); (c) untuned+unmodified `next` leaves the ledger file byte-identical; (d) **directive-file via PLAIN `next` (no --full)**: `edit .mpd/directives/personas/security.md → mpd next → restore → gate` yields a `weakened=true` stamped PASS (round-3 F1 + round-4 F4-1: proves the write is unconditional/pre-branch) (Cond 9/11).
+- [x] R12 `reviewers` is purely additive: a `personas["DocValidation"].reviewers` below 2 does NOT collapse the Architect+Designer dual spawn (phase-derived) (Cond 8).

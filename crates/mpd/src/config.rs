@@ -1,13 +1,85 @@
 //! Project-local mpd configuration (`.mpd/config.json`).
 
 use crate::closure::HermeticReusePolicy;
-use crate::ledger::{mpd_dir, RiskLevel, ThreatProfile};
+use crate::ledger::{mpd_dir, Depth, Rigor, RiskLevel, ThreatProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// A per-harness map of persona name → model id.
 pub type ModelMap = BTreeMap<String, BTreeMap<String, String>>;
+
+/// Per-persona behavior tuning, keyed by persona DISPLAY name (or the normalized
+/// `"DocValidation"` key for the composite Doc-Validation persona) under
+/// [`Config::personas`]. Strengthen-only ordinal knobs plus one audited free-text
+/// escape (design.md D1). Additive + `#[serde(default)]`; an absent block is the
+/// baseline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaTuning {
+    /// Reasoning-rigor knob → reasoning effort + reviewer count. Lenient: a value
+    /// that is not an exact known variant string degrades to `None` (see
+    /// [`de_lenient_rigor`]).
+    #[serde(
+        default,
+        deserialize_with = "de_lenient_rigor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rigor: Option<Rigor>,
+    /// Tester test-emphasis knob (ignored for non-Tester phases). Lenient.
+    #[serde(
+        default,
+        deserialize_with = "de_lenient_depth",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub depth: Option<Depth>,
+    /// A non-destructive directive overlay appended AFTER the bundled directive
+    /// (never replacing it). The one un-rankable knob — always recorded/flagged.
+    /// Lenient like the ordinals: a non-string (hand-edited wrong type) degrades to
+    /// `None` rather than failing the whole `Config` and reverting model pins
+    /// (Security-code F1 — uniform per-field degradation for the persona block).
+    #[serde(
+        default,
+        deserialize_with = "de_lenient_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub directive_append: Option<String>,
+}
+
+/// Lenient `rigor` deserializer: reads a permissive `serde_json::Value` (which
+/// cannot fail on any well-formed JSON node) and maps to `Some(variant)` ONLY for
+/// an exact known variant string — an unknown token, a wrong TYPE (`5`, `true`,
+/// `["deep"]`, `{}`), or `null` all degrade to `None` (design.md Cond 2, round-2
+/// F2). A plain `Option<Rigor>` would instead FAIL the whole `Config` on a
+/// wrong-type token, which `Config::load`'s `unwrap_or_default` discards wholesale
+/// — silently reverting model pins.
+fn de_lenient_rigor<'de, D>(d: D) -> Result<Option<Rigor>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value.as_str().and_then(|s| Rigor::from_str(s).ok()))
+}
+
+/// Lenient `depth` deserializer — see [`de_lenient_rigor`].
+fn de_lenient_depth<'de, D>(d: D) -> Result<Option<Depth>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value.as_str().and_then(|s| Depth::from_str(s).ok()))
+}
+
+/// Lenient `Option<String>` deserializer: a JSON string → `Some`, anything else
+/// (wrong type / null) → `None`, never `Err` (Security-code F1). Keeps a
+/// hand-edited wrong-type `directive_append` from failing the whole `Config`.
+fn de_lenient_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value.as_str().map(str::to_string))
+}
 
 /// Configuration read from `.mpd/config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +120,10 @@ pub struct Config {
     /// policy remain an explicit, reviewable namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closure: Option<ClosureConfig>,
+    /// Per-persona behavior tuning, keyed by persona DISPLAY name (or
+    /// `"DocValidation"`). Absent/empty ⇒ the baseline (byte-identical brief).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub personas: BTreeMap<String, PersonaTuning>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +189,12 @@ impl Config {
     pub fn model_fallback(&self, model: &str) -> Option<&str> {
         let f = self.model_fallbacks.get(model).map(String::as_str)?;
         valid_model_id(f).then_some(f)
+    }
+
+    /// The tuning for a persona tuning key (persona display name or
+    /// `"DocValidation"`), if any.
+    pub fn persona_tuning(&self, key: &str) -> Option<&PersonaTuning> {
+        self.personas.get(key)
     }
 }
 
@@ -327,6 +409,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn lenient_persona_deser_degrades_bad_tokens_and_the_rest_of_config_survives() {
+        // R2 / round-2 F2: an unknown token AND a wrong-TYPE value each degrade
+        // ONLY that field to None; the rest of the Config (model pins, test cmd)
+        // survives, and Config::load never fails wholesale. A plain Option<Rigor>
+        // would fail the whole document on a wrong-type token.
+        for bad in [
+            r#""nope""#,   // unknown string token
+            "5",           // wrong type: number
+            "true",        // wrong type: bool
+            r#"["deep"]"#, // wrong type: array
+            "{}",          // wrong type: object
+            "null",        // null
+        ] {
+            let json = format!(
+                r#"{{"test":"cargo test","models":{{"claude-code":{{"Security":"my-strong-model"}}}},"personas":{{"Security":{{"rigor":{bad},"depth":"fuzz"}}}}}}"#
+            );
+            let cfg: Config = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("bad rigor {bad} must not fail Config: {e}"));
+            assert_eq!(
+                cfg.persona_tuning("Security").unwrap().rigor,
+                None,
+                "bad rigor {bad} → None"
+            );
+            // The rest of the field (a valid depth) and the model pin survive intact.
+            assert_eq!(
+                cfg.persona_tuning("Security").unwrap().depth,
+                Some(Depth::Fuzz)
+            );
+            assert_eq!(
+                cfg.model_for("claude-code", "Security"),
+                Some("my-strong-model")
+            );
+            assert_eq!(cfg.test.as_deref(), Some("cargo test"));
+        }
+        // A valid token still parses.
+        let cfg: Config =
+            serde_json::from_str(r#"{"personas":{"Security":{"rigor":"paranoid"}}}"#).unwrap();
+        assert_eq!(
+            cfg.persona_tuning("Security").unwrap().rigor,
+            Some(Rigor::Paranoid)
+        );
+
+        // Security-code F1: a hand-edited wrong-type `directive_append` degrades to
+        // None (not a whole-Config failure that reverts model pins), same as the
+        // ordinals — while a real string is preserved.
+        let cfg: Config = serde_json::from_str(
+            r#"{"models":{"claude-code":{"Security":"pin"}},"personas":{"Security":{"directive_append":5}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.persona_tuning("Security").unwrap().directive_append,
+            None
+        );
+        assert_eq!(cfg.model_for("claude-code", "Security"), Some("pin"));
+        let cfg: Config = serde_json::from_str(
+            r#"{"personas":{"Security":{"directive_append":"check IMAP cleartext"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.persona_tuning("Security")
+                .unwrap()
+                .directive_append
+                .as_deref(),
+            Some("check IMAP cleartext")
+        );
+    }
+
+    #[test]
+    fn empty_personas_round_trips_and_is_omitted() {
+        // R1: an absent/empty personas block round-trips and never serializes,
+        // so a baseline config is byte-identical to a pre-feature one.
+        let legacy: Config = serde_json::from_str(r#"{"test":"cargo test"}"#).unwrap();
+        assert!(legacy.personas.is_empty());
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("personas"), "empty personas must be omitted");
+    }
+
     proptest! {
         /// `valid_model_id` is a defensive-in-depth charset gate ahead of a
         /// rendered `--model <id>` command line — it must never panic on
@@ -347,6 +507,100 @@ mod tests {
             if has_unsafe_char {
                 prop_assert!(!valid_model_id(&s));
             }
+        }
+    }
+
+    /// An arbitrary shallow JSON value — the shapes a hand-edited or
+    /// hostile-tool-generated `.mpd/config.json` can plant at
+    /// `personas.<p>.rigor`/`.depth`/`.directive_append`: the exact known enum
+    /// strings (weighted in so the exact-match branch is genuinely exercised,
+    /// not left to astronomically-unlikely random string generation), an
+    /// arbitrary other string (unknown token), and every wrong-type shape
+    /// (number, bool, null, array, object).
+    fn arb_tuning_field_value() -> impl Strategy<Value = serde_json::Value> {
+        prop_oneof![
+            2 => Just(serde_json::json!("standard")),
+            2 => Just(serde_json::json!("deep")),
+            2 => Just(serde_json::json!("paranoid")),
+            2 => Just(serde_json::json!("examples")),
+            2 => Just(serde_json::json!("property")),
+            2 => Just(serde_json::json!("fuzz")),
+            1 => Just(serde_json::Value::Null),
+            2 => any::<bool>().prop_map(serde_json::Value::Bool),
+            2 => any::<i32>().prop_map(|n| serde_json::json!(n)),
+            4 => "[a-zA-Z0-9 ]{0,12}".prop_map(serde_json::Value::String),
+            2 => prop::collection::vec("[a-z]{0,4}", 0..3).prop_map(|v| serde_json::json!(v)),
+            2 => Just(serde_json::json!({"nested": "object"})),
+        ]
+    }
+
+    proptest! {
+        /// Design.md Cond 2 / D1, as a property rather than a fixed example
+        /// list: an ARBITRARY JSON value (any shape — exact token, unknown
+        /// token, or wrong type) at `personas.Security.rigor`/`.depth`/
+        /// `.directive_append` simultaneously NEVER makes
+        /// `serde_json::from_str::<Config>` fail — each field independently
+        /// degrades to `None` unless it is the exact matching token/type — and
+        /// the REST of the config (a model pin, the test command) always
+        /// survives intact. This is the permissive-`Value` guarantee the
+        /// hand-written example test only samples a handful of points of.
+        #[test]
+        fn arbitrary_tuning_field_values_never_fail_config_load_and_degrade_per_field(
+            rigor_v in arb_tuning_field_value(),
+            depth_v in arb_tuning_field_value(),
+            append_v in arb_tuning_field_value(),
+        ) {
+            let doc = serde_json::json!({
+                "test": "cargo test",
+                "models": {"claude-code": {"Security": "my-strong-model"}},
+                "personas": {
+                    "Security": {
+                        "rigor": rigor_v.clone(),
+                        "depth": depth_v.clone(),
+                        "directive_append": append_v.clone(),
+                    }
+                }
+            });
+            let text = serde_json::to_string(&doc).unwrap();
+            let cfg: Config = serde_json::from_str(&text).unwrap_or_else(|e| {
+                panic!("arbitrary tuning field values must never fail Config::load: {text} -> {e}")
+            });
+            let t = cfg.persona_tuning("Security").unwrap();
+
+            let expected_rigor = match &rigor_v {
+                serde_json::Value::String(s) => match s.as_str() {
+                    "standard" => Some(Rigor::Standard),
+                    "deep" => Some(Rigor::Deep),
+                    "paranoid" => Some(Rigor::Paranoid),
+                    _ => None,
+                },
+                _ => None,
+            };
+            prop_assert_eq!(t.rigor, expected_rigor, "rigor from {:?}", rigor_v);
+
+            let expected_depth = match &depth_v {
+                serde_json::Value::String(s) => match s.as_str() {
+                    "examples" => Some(Depth::Examples),
+                    "property" => Some(Depth::Property),
+                    "fuzz" => Some(Depth::Fuzz),
+                    _ => None,
+                },
+                _ => None,
+            };
+            prop_assert_eq!(t.depth, expected_depth, "depth from {:?}", depth_v);
+
+            // directive_append has no closed enum: ANY JSON string survives
+            // verbatim (the lenient adapter only rejects non-string shapes).
+            let expected_append = match &append_v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                _ => None,
+            };
+            prop_assert_eq!(t.directive_append.clone(), expected_append, "append from {:?}", append_v);
+
+            // The rest of the Config — the model pin, the test command —
+            // always survives, regardless of what the tuning fields carried.
+            prop_assert_eq!(cfg.model_for("claude-code", "Security"), Some("my-strong-model"));
+            prop_assert_eq!(cfg.test.as_deref(), Some("cargo test"));
         }
     }
 }

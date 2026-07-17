@@ -181,6 +181,32 @@ impl Phase {
         }
     }
 
+    /// The persona-tuning key for this phase (`.mpd/config.json` `personas` map):
+    /// the composite Doc-Validation phase normalizes to `"DocValidation"`, every
+    /// other phase keys on its persona display name. So a persona serving multiple
+    /// phases (e.g. Designer over Mock/Review/Sign-off) is tuned once for all of
+    /// them (design.md D3/Cond 9).
+    pub fn tuning_key(self) -> &'static str {
+        if self.is_doc_validation() {
+            "DocValidation"
+        } else {
+            self.persona().name
+        }
+    }
+
+    /// The persona display name(s) whose base directive backs this phase — the two
+    /// parts for the composite Doc-Validation persona (`for_persona` returns `None`
+    /// for the composite name, so it MUST be resolved from the parts), else the
+    /// single persona. Used to compute `base_modified` and the persona-tuning
+    /// dependency digest (design.md Cond 9).
+    pub fn tuning_personas(self) -> Vec<&'static str> {
+        if self.is_doc_validation() {
+            vec!["Architect", "Designer"]
+        } else {
+            vec![self.persona().name]
+        }
+    }
+
     /// The persona responsible for this phase.
     pub fn persona(self) -> Persona {
         let name = match self {
