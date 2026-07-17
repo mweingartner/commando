@@ -10,11 +10,15 @@
 mod allowlist;
 mod checks;
 mod cli;
+mod closure;
 mod config;
+mod digest;
 mod directives;
+mod git;
 mod githooks;
 mod harness;
 mod ledger;
+mod pathmatch;
 mod personas;
 mod phase;
 mod scaffold;

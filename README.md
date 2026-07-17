@@ -59,6 +59,9 @@ crates/
     phase          #   the pipeline state machine (pure)
     ledger         #   durable gate verdicts + evidence  (.mpd/state/<change>.json)
     checks         #   secret scan + test-count verification
+    digest         #   canonical, domain-separated SHA-256 content identities
+    git            #   bounded, argument-array-only Git plumbing
+    closure        #   manifests, evidence receipts, commit coherence, remote parity
     personas       #   per-phase briefs + model assignments
     harness        #   `next` adapters (generic / claude-code / codex) + model policy
     directives     #   bundled MPD doctrine (include_str!) + project-first resolution
@@ -106,6 +109,7 @@ mpd init --test "cargo test"             # scaffolds openspec/, installs directi
 
 # 3. Start a change and let mpd drive
 mpd begin add-rate-limiter               # a feature (documented). --fix/--chore skip docs.
+# edit openspec/changes/add-rate-limiter/manifest.json to declare paths and publish target
 mpd next --harness claude-code           # prints the phase's persona, model, task, gate cmd
 mpd next --harness claude-code --full    # …and inlines the persona's full directive
 #   … do the work the brief describes …
@@ -118,11 +122,22 @@ mpd gate build --pass                    # re-runs `cargo test`; refuses without
 mpd resolve --all                        # close any CONDITIONAL-PASS conditions
 mpd archive                              # dry-run preview of the spec + doc merge
 mpd archive --yes                        # apply: fold specs → openspec/specs/, doc → docs/
+# commit the archived result using normal Git, push using normal Git, then:
+mpd publish --verify                     # observe exact remote/ref parity; never pushes or fetches
 ```
 
 The **motion** is always the same three beats — `mpd next` → do the work → `mpd
 gate <phase>` — so a human, Claude Code, or Codex all drive it identically.
 `mpd next` tells each what to do and which model to use.
+
+Publication may be declared per change in `manifest.json`. If it is absent,
+MPD resolves `closure.default_remote` plus `closure.default_ref` from
+`.mpd/config.json`, then the current branch's configured upstream. It never
+invents a target for detached HEAD or an unconfigured branch. Remote reads are
+bounded (15 seconds by default; `closure.remote_timeout_secs` accepts 1–300),
+and human path lists can be capped with `closure.human_path_list_limit`.
+Hermetic execution reuse is opt-in under `closure.hermetic_reuse`; the former
+top-level `hermetic_reuse` spelling remains readable for migration.
 
 ## Commands
 
@@ -131,11 +146,15 @@ mpd init [--test <cmd>]              # scaffold openspec/ + mpd schema + install
 mpd begin <name> [--ui] [--fix|--chore] [--risk low|medium|high] [--threat-profile <profile>]
 mpd status [--change N] [--json]    # current phase, gate verdicts, tasks, archive readiness
 mpd next [--harness ...] [--full] [--json]  # emit the next persona's brief (generic | claude-code | codex)
-mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C]
+mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C] [--reuse RECEIPT]
 mpd resolve <n> | --all             # close open CONDITIONAL-PASS conditions (they block archive)
 mpd reconcile --continue "reason"   # authorize one excess attempt; also --narrow/--risk/--threat-profile
 mpd check [--staged]                # run the secret scan now (+ external scanners/tests unless --staged)
 mpd archive [--yes] [--skip-specs]  # dry-run preview, then fold specs + docs into the record & archive
+mpd manifest init [--change N]       # seed a manifest without guessing its scope
+mpd closure recover [--yes] [--json] # preview or completion-only recover an interrupted archive
+mpd closure abandon [--yes] [--json] # remove owned transaction metadata after AwaitingCommit
+mpd publish [--verify] [--json]      # readiness/fresh parity observation; never push/fetch/deploy
 mpd doctor [--json]                 # diagnose setup (schema, directives, hook, scanners, test/deploy cmd, allowlist)
 ```
 
@@ -166,8 +185,29 @@ Artifact guidance is advisory (about two pages for low and eight for medium;
 unbounded for high) across canonical proposal/design/tasks. Superseded prose
 belongs in `history/`.
 
-This release does not cache evidence, enforce commit manifests, publish, or
-attest Git remote parity; those require a separate lifecycle design.
+### Content-addressed closure
+
+Every new gate PASS carries a SHA-256 receipt over the inputs that phase
+actually reviewed: declared scope, source content, governance, relevant config,
+tool/scanner identity, and applicable artifacts. Status reports receipt content
+as `valid`, `stale`, or `absent` separately from reuse eligibility. Reuse is
+never implicit: `mpd gate <phase> --pass --reuse <receipt>` appends a distinct
+provenance event. Build, Test, and Security(code) continue to execute unless a
+complete versioned hermetic policy is configured; Deploy is never reusable.
+
+`manifest.json` declares the change's path scope and optional publication
+target. Architecture cannot pass until scope is explicit. Out-of-scope staged
+paths block checks and archive without changing the index. Archive is a durable,
+journaled transaction with staged postimages and completion-only recovery; it
+leaves an ignored pending pointer until the exact archived result is committed
+and remotely verified (or its metadata is explicitly abandoned).
+
+After the operator commits and pushes normally, `mpd publish --verify` proves a
+clean linear closure commit and observes the configured branch twice around a
+stable local snapshot. Exact OID equality is `verified`; ahead, behind,
+diverged, rewritten, unstable, offline, unavailable, and ancestry-unavailable
+remain distinct. MPD never pushes, force-pushes, creates refs, fetches, stages,
+commits, or deploys as part of publication verification.
 
 ## The gates are real, not self-reported
 
@@ -181,8 +221,11 @@ attest Git remote parity; those require a separate lifecycle design.
 - **`mpd gate deploy --pass`** runs the configured `deploy` command (when set)
   and refuses PASS if it exits non-zero, so deploy is a machine-enforced step
   rather than a checkbox.
-- **`mpd archive`** refuses on any non-PASS gate or open condition, and previews
-  what it will merge before doing it (dry-run unless `--yes`).
+- **`mpd archive`** refuses on any non-PASS gate, open condition, incomplete
+  manifest, or mixed staging. `--yes` uses a journaled transaction and retains
+  recovery data until the archived result is committed and closed.
+- **`mpd publish --verify`** requires a coherent closure commit and compares its
+  exact OID with the configured remote branch without pushing or fetching.
 - The **git `pre-commit` hook** re-runs the checks independently, so enforcement
   holds even when a harness that ignores `mpd` drives the commit. Bypass one
   commit with `MPD_GATE_SKIP=1`.
@@ -239,6 +282,11 @@ verified false positive. When gitleaks is the active scanner it honors its own
   with `--config auto`, which fetches its ruleset from Semgrep's registry over
   the network. Absent Semgrep, no egress occurs; the built-in scanner is fully
   offline.
+- **Remote observation is explicit egress.** Only `mpd publish --verify` invokes
+  `git ls-remote`, and only for a syntactically safe name found in the
+  repository's configured remote set. MPD stores no URL, credentials, raw
+  remote output, source bytes, or environment values in its bounded local
+  observation cache.
 
 ## Phase → persona → model
 

@@ -17,11 +17,14 @@
 //! - [`schema`] — schema and change-metadata YAML.
 //! - [`project`] — filesystem layout, discovery, status, archiving.
 //! - [`date`] — dependency-free `YYYY-MM-DD` formatting.
+//! - [`digest`] — a minimal SHA-256 content digest for transactional integrity.
+//! - [`transaction`] — the archive transaction plan and state-machine types.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod date;
+pub mod digest;
 pub mod error;
 pub mod merge;
 pub mod model;
@@ -30,6 +33,7 @@ pub mod parse;
 pub mod project;
 pub mod render;
 pub mod schema;
+pub mod transaction;
 pub mod validate;
 
 pub use error::{CoreError, Result};
@@ -40,4 +44,12 @@ pub use parse::{parse_delta, parse_spec, ParseError};
 pub use project::{assert_contained, read_capped, ArchivePlan, Project, SpecUpdate, TaskStatus};
 pub use render::{render_delta, render_spec};
 pub use schema::{Artifact, ChangeMeta, Schema, YamlError};
+pub use transaction::{
+    abandon_apply, build_plan, drive, inspect, prepare, recover_apply, ArchiveTransactionPlan,
+    DirectoryMove, DirectoryMoveInput, DriveOutcome, FileImage, ImageState, OidText,
+    PendingClosurePointer, RelativePath, StepClass, TargetClassification, TargetWrite,
+    TransactionError, TransactionState, TransactionTarget, TransactionView, TxResult,
+    MAX_STAGED_TOTAL_BYTES, MAX_TARGETS, MAX_TARGET_BYTES, MAX_VIEW_ROWS, PENDING_POINTER_SCHEMA,
+    TRANSACTION_SCHEMA,
+};
 pub use validate::{has_blocking, validate_delta, validate_spec};

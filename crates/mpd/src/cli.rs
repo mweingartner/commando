@@ -8,9 +8,11 @@ use crate::ledger::{
     GateRecord, Governance, ReconciliationKind, RiskLevel, ThreatProfile, Verdict,
 };
 use crate::phase::Phase;
-use crate::{githooks, harness, scaffold};
+use crate::{closure, digest, git, githooks, harness, scaffold};
 use clap::{Parser, Subcommand};
+use closure::ArchiveClosure;
 use openspec_core::{date, Project};
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 /// mpd — an adversarial-gate overlay over the OpenSpec format.
@@ -112,6 +114,9 @@ enum Command {
         harm: Option<String>,
         #[arg(long = "fix")]
         exact_fix: Option<String>,
+        /// Explicitly reuse an exact, valid executed evidence receipt.
+        #[arg(long)]
+        reuse: Option<String>,
     },
     /// Record a bounded human decision before an excess review attempt.
     Reconcile {
@@ -159,9 +164,51 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Create or inspect the active change manifest.
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommand,
+    },
+    /// Inspect or freshly verify closure commit parity with its configured remote ref.
+    Publish {
+        #[arg(long)]
+        verify: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or recover an interrupted archive closure transaction.
+    Closure {
+        #[command(subcommand)]
+        command: ClosureCommand,
+    },
     /// Diagnose the project setup.
     Doctor {
         /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ManifestCommand {
+    /// Seed manifest.json without guessing project scope.
+    Init {
+        #[arg(long)]
+        change: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClosureCommand {
+    Recover {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Abandon {
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         json: bool,
     },
@@ -202,6 +249,7 @@ pub fn run() -> i32 {
             boundary,
             harm,
             exact_fix,
+            reuse,
         } => cmd_gate(
             phase,
             change,
@@ -217,6 +265,7 @@ pub fn run() -> i32 {
             boundary,
             harm,
             exact_fix,
+            reuse,
         ),
         Command::Reconcile {
             continue_reason,
@@ -232,6 +281,9 @@ pub fn run() -> i32 {
             skip_specs,
             yes,
         } => cmd_archive(change, skip_specs, yes),
+        Command::Manifest { command } => cmd_manifest(command),
+        Command::Publish { verify, json } => cmd_publish(verify, json),
+        Command::Closure { command } => cmd_closure(command),
         Command::Doctor { json } => cmd_doctor(json),
     };
     match result {
@@ -262,8 +314,13 @@ fn resolve_change(root: &std::path::Path, opt: Option<String>) -> Result<String,
         openspec_core::validate_change_name(&c)?;
         return Ok(c);
     }
-    ledger::current(root)
-        .ok_or_else(|| "no change specified and no current change set; pass --change".to_string())
+    if let Some(current) = ledger::current(root) {
+        return Ok(current);
+    }
+    if let Ok(Some(view)) = openspec_core::inspect(root) {
+        return Ok(view.change);
+    }
+    Err("no change specified and no current or pending closure set; pass --change".to_string())
 }
 
 fn cmd_init(test: Option<String>) -> CmdResult {
@@ -303,6 +360,17 @@ fn cmd_begin(
         (true, true) => return Err("specify at most one of --fix, --chore".into()),
     };
     let root = find_root()?;
+    // A pending closure from a prior interrupted archive must be resolved
+    // (recovered or abandoned) before starting a new change — otherwise its
+    // journal/staged content could be mistaken for this one's.
+    if let Some(view) = openspec_core::inspect(&root).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "cannot begin a new change — a closure for {:?} is still pending (stage: {}); \
+             run `mpd closure recover` or `mpd closure abandon` first",
+            view.change,
+            stage_label(view.stage)
+        ));
+    }
     let cfg = Config::load(&root);
     let risk = match risk {
         Some(v) => v.parse::<RiskLevel>()?,
@@ -351,6 +419,126 @@ fn cmd_begin(
     Ok(0)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct ManifestView {
+    state: &'static str,
+    scope: Vec<String>,
+    included_staged: Vec<String>,
+    unrelated_staged: Vec<String>,
+    blockers: Vec<String>,
+}
+
+/// `manifest_view`'s scope-classification authority: either the active,
+/// still-open change's declared manifest patterns plus live system scope, or
+/// — once archived and pending commit — the closure's own concrete, realized
+/// footprint. These are deliberately different authorities (see
+/// `ArchiveClosure::system_paths`), never a shared glob-matching path.
+fn scope_covers(
+    manifest: &closure::ChangeManifest,
+    system: &closure::SystemScope,
+    path: &str,
+) -> bool {
+    manifest.covers(path, system)
+}
+
+/// A boxed "is this path in scope" predicate — either branch of
+/// `manifest_view`'s active/archived authority split, type-erased so both
+/// arms can share one binding.
+type ScopeCoverage = Box<dyn Fn(&str) -> bool>;
+
+fn manifest_view(root: &Path, change: &str) -> ManifestView {
+    let active = closure::load_manifest(root, change);
+    let (mut scope, mut blockers, covers): (Vec<String>, Vec<String>, ScopeCoverage) = match active
+    {
+        Ok(manifest) => {
+            let system = closure::active_system_scope(root, change);
+            let mut scope = manifest.paths.clone();
+            scope.extend(manifest.shared_paths.clone());
+            scope.extend(system.paths());
+            let blockers = manifest
+                .validate()
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect();
+            (
+                scope,
+                blockers,
+                Box::new(move |path: &str| scope_covers(&manifest, &system, path)),
+            )
+        }
+        Err(active_error) => {
+            let Some(record) = ledger::load(root, change)
+                .ok()
+                .and_then(|ledger| ledger.archive_closure)
+            else {
+                return ManifestView {
+                    state: "incomplete",
+                    scope: vec![],
+                    included_staged: vec![],
+                    unrelated_staged: vec![],
+                    blockers: vec![active_error.to_string()],
+                };
+            };
+            // A change that reached `AwaitingCommit` has already exhausted
+            // its declared (possibly wildcard, e.g. legacy `**`) scope —
+            // the operator's only remaining job is "commit the exact
+            // archived result". `record.system_paths` is the closure's own
+            // concrete, non-glob footprint recorded at archive time, and is
+            // the sole scope authority here (specs/change-manifest/spec.md
+            // "Active change directory has been archived" — "protect its
+            // scope"). A legacy/absent record degrades to an empty scope,
+            // which fails closed (everything staged is reported unrelated)
+            // rather than fail-open.
+            let scope_paths = record.system_paths.clone();
+            let covers_paths = scope_paths.clone();
+            (
+                scope_paths,
+                Vec::new(),
+                Box::new(move |path: &str| closure::covers_concrete_paths(&covers_paths, path)),
+            )
+        }
+    };
+    let mut included = Vec::new();
+    let mut unrelated = Vec::new();
+    match crate::git::diff_cached_name_status(root) {
+        Ok(entries) => {
+            for entry in entries {
+                for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
+                    if covers(path) {
+                        included.push(path.clone());
+                    } else {
+                        unrelated.push(path.clone());
+                    }
+                }
+            }
+        }
+        Err(e) => blockers.push(format!("cannot inspect staged paths: {e}")),
+    }
+    included.sort();
+    included.dedup();
+    unrelated.sort();
+    unrelated.dedup();
+    if !unrelated.is_empty() {
+        blockers.push("staged content falls outside this change's declared/system scope".into());
+    }
+    let state = if !unrelated.is_empty() {
+        "blocked"
+    } else if blockers.is_empty() {
+        "ready"
+    } else {
+        "incomplete"
+    };
+    scope.sort();
+    scope.dedup();
+    ManifestView {
+        state,
+        scope,
+        included_staged: included,
+        unrelated_staged: unrelated,
+        blockers,
+    }
+}
+
 fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
@@ -366,6 +554,32 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     let attempt_authorization = ledger
         .attempt_authorization(ledger.phase)
         .map(|r| r.kind.label().to_string());
+    let manifest = manifest_view(&root, &change);
+    let evidence: Vec<serde_json::Value> = ledger.gates.iter().map(|(phase, record)| {
+        let validity = if project.change_dir(&change).is_dir() {
+            closure::capture_dependency_values(&root, &change, &ledger, &Config::load(&root), *phase)
+                .ok()
+                .map(|values| closure::evidence_validity(record.receipt.as_ref(), &values))
+                .unwrap_or(closure::EvidenceValidity::Absent)
+        } else if record.receipt.is_some() {
+            closure::EvidenceValidity::Valid
+        } else {
+            closure::EvidenceValidity::Absent
+        };
+        let offer = closure::reuse_offer(*phase, record.verdict, &validity, record.receipt.as_ref().map(|r| &r.dependencies));
+        serde_json::json!({
+            "phase": phase.slug(),
+            "validity": validity.label(),
+            "reasons": match &validity { closure::EvidenceValidity::Stale(v) => v.iter().map(ToString::to_string).collect::<Vec<_>>(), _ => vec![] },
+            "reuse": format!("{:?}", offer).to_ascii_lowercase(),
+            "receipt": record.receipt.as_ref().map(|r| r.id.to_string()),
+        })
+    }).collect();
+    let coherence = ledger
+        .archive_closure
+        .as_ref()
+        .and_then(|c| closure::verify_commit_coherence(&root, c).ok());
+    let parity = closure::load_parity_cache(&root);
 
     if json {
         let gates: serde_json::Map<String, serde_json::Value> = ledger
@@ -393,6 +607,10 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
             "attempt_limit": ledger.governance.risk.attempt_limit(),
             "reconciliation_required": !ledger.attempt_authorized(ledger.phase),
             "attempt_authorization": attempt_authorization,
+            "evidence": evidence,
+            "manifest": manifest,
+            "commit_coherence": coherence.as_ref().map(|c| serde_json::json!({"coherent":c.coherent,"head":c.head,"blockers":c.blockers})),
+            "remote_parity": parity,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
@@ -467,6 +685,54 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     }
 
     println!("\nTasks: {}/{} complete", tasks.done, tasks.total);
+    println!("\nEvidence:");
+    for item in &evidence {
+        println!(
+            "  {:<8} {:<18} {}",
+            item["validity"]
+                .as_str()
+                .unwrap_or("absent")
+                .to_ascii_uppercase(),
+            item["phase"].as_str().unwrap_or(""),
+            item["reuse"].as_str().unwrap_or("")
+        );
+    }
+    println!("\nChange manifest: {}", manifest.state.to_ascii_uppercase());
+    println!("  Scope: {} path pattern(s)", manifest.scope.len());
+    println!("  Included staged: {}", manifest.included_staged.len());
+    if !manifest.unrelated_staged.is_empty() {
+        println!(
+            "  Unrelated staged: {}",
+            manifest
+                .unrelated_staged
+                .iter()
+                .take(5)
+                .map(|p| harness::terminal_safe(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for blocker in &manifest.blockers {
+        println!("  - {blocker}");
+    }
+    if let Some(c) = &coherence {
+        println!(
+            "\nCommit coherence: {}",
+            if c.coherent { "COHERENT" } else { "BLOCKED" }
+        );
+        for blocker in &c.blockers {
+            println!("  - {blocker}");
+        }
+    }
+    if let Some(p) = &parity {
+        println!(
+            "\nRemote parity: {} (last observed at {})",
+            p.state.label().to_ascii_uppercase(),
+            p.observed_at_epoch_secs
+        );
+    } else {
+        println!("\nRemote parity: NOT VERIFIED");
+    }
     if ready {
         println!("Ready to archive: yes");
     } else {
@@ -478,7 +744,18 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
 
     // Point the operator at the next command instead of leaving it to be guessed.
     let open_conditions = ledger.conditions.iter().filter(|c| !c.closed).count();
-    if open_conditions > 0 {
+    if let Some(c) = &coherence {
+        if !c.coherent {
+            println!("\n→ next: commit the exact archived result");
+        } else if parity
+            .as_ref()
+            .is_some_and(|p| p.state == closure::ParityState::Verified)
+        {
+            println!("\n→ ready: closure is published at exact remote parity");
+        } else {
+            println!("\n→ next: mpd publish --verify");
+        }
+    } else if open_conditions > 0 {
         println!("\n→ close open conditions: mpd resolve <n>");
     } else if ledger.phase != Phase::Done {
         println!("\n→ next: mpd next");
@@ -488,14 +765,99 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
     Ok(0)
 }
 
+/// The compact release-closure facts `mpd next` prepends ahead of the
+/// per-phase brief (design.md "Preserve one safe next-command cue"; tasks.md
+/// 5.1): reusability/evidence lives in `evidence_hint` already — this adds
+/// the change-manifest state (blockers, if any) and, once archived, the
+/// pending-closure stage plus its one safe next action, so an operator
+/// driving purely off `mpd next` still sees a manifest block or a stalled
+/// closure rather than only phase-by-phase task text.
+fn release_closure_facts(root: &Path, change: &str, ledger: &ledger::Ledger) -> serde_json::Value {
+    let manifest = manifest_view(root, change);
+    let pending = openspec_core::inspect(root)
+        .ok()
+        .flatten()
+        .filter(|v| v.change == change);
+    serde_json::json!({
+        "manifest_state": manifest.state,
+        "manifest_blockers": manifest.blockers,
+        "pending_closure": pending.as_ref().map(|v| serde_json::json!({
+            "stage": stage_label(v.stage),
+            "write_eligible": v.write_eligible,
+            "next": v.next,
+        })),
+        "archived": ledger.archive_closure.is_some(),
+    })
+}
+
+/// Human-readable rendering of [`release_closure_facts`], printed only when
+/// there is something worth surfacing (a blocked/incomplete manifest, or a
+/// still-pending closure) — a clean change with nothing pending prints
+/// nothing extra, so the common case stays exactly as before.
+fn print_release_closure_facts(facts: &serde_json::Value) {
+    let manifest_state = facts["manifest_state"].as_str().unwrap_or("incomplete");
+    if manifest_state != "ready" {
+        let blockers: Vec<&str> = facts["manifest_blockers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        println!(
+            "Release closure: manifest {} — {}",
+            manifest_state.to_ascii_uppercase(),
+            if blockers.is_empty() {
+                "no scope declared yet".to_string()
+            } else {
+                blockers.join("; ")
+            }
+        );
+    }
+    if let Some(pending) = facts["pending_closure"].as_object() {
+        println!(
+            "Release closure: pending ({}) — {}",
+            pending
+                .get("stage")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+            pending
+                .get("next")
+                .and_then(|v| v.as_str())
+                .unwrap_or("run `mpd closure recover`")
+        );
+    }
+}
+
 fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let release_closure = release_closure_facts(&root, &change, &ledger);
     if ledger.phase == Phase::Done {
-        println!(
-            "All phases complete for {change:?}. Run `mpd archive` to fold specs into the record."
-        );
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "change": change,
+                    "phase": "done",
+                    "archived": ledger.archive_closure.is_some(),
+                    "release_closure": release_closure,
+                }))
+                .unwrap()
+            );
+            return Ok(0);
+        }
+        if ledger.archive_closure.is_some() {
+            print_release_closure_facts(&release_closure);
+            if release_closure["pending_closure"].is_null() {
+                println!(
+                    "{change:?} is archived and its closure metadata is resolved. Run \
+                     `mpd publish --verify` to (re)confirm remote parity."
+                );
+            }
+        } else {
+            println!(
+                "All phases complete for {change:?}. Run `mpd archive` to fold specs into the record."
+            );
+        }
         return Ok(0);
     }
     let cfg = Config::load(&root);
@@ -514,6 +876,35 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool
             .map(|r| r.kind.label().to_string()),
         page_warning,
     );
+    let evidence_hint = ledger
+        .history
+        .iter()
+        .rev()
+        .find(|event| event.phase == ledger.phase)
+        .map(|event| {
+            let validity = closure::capture_dependency_values(
+                &root,
+                &change,
+                &ledger,
+                &cfg,
+                ledger.phase,
+            )
+            .ok()
+            .map(|values| closure::evidence_validity(event.record.receipt.as_ref(), &values))
+            .unwrap_or(closure::EvidenceValidity::Absent);
+            let offer = closure::reuse_offer(
+                ledger.phase,
+                event.record.verdict,
+                &validity,
+                event.record.receipt.as_ref().map(|r| &r.dependencies),
+            );
+            serde_json::json!({
+                "validity": validity.label(),
+                "reuse": format!("{:?}", offer).to_ascii_lowercase(),
+                "receipt": event.record.receipt.as_ref().map(|r| r.id.to_string()),
+                "reasons": match validity { closure::EvidenceValidity::Stale(v) => v.into_iter().map(|r| r.to_string()).collect::<Vec<_>>(), _ => vec![] }
+            })
+        });
 
     // With --full, resolve the phase persona's directive(s). A composite persona
     // (Doc Validation = "Architect & Designer") resolves its parts.
@@ -540,9 +931,16 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool
                 .collect();
             v["directives"] = serde_json::json!(arr);
         }
+        v["evidence"] = evidence_hint.clone().unwrap_or(serde_json::Value::Null);
+        v["release_closure"] = release_closure;
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
     }
+
+    // Prepend release-closure facts (manifest block / stalled pending
+    // closure) ahead of the phase brief — see `release_closure_facts`. Silent
+    // when there's nothing to report, so the common case is unchanged.
+    print_release_closure_facts(&release_closure);
 
     let rendered = match harness_kind.as_str() {
         "claude-code" => harness::render_claude_code(&brief),
@@ -555,6 +953,20 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool
         }
     };
     print!("{rendered}");
+    if let Some(evidence) = evidence_hint {
+        println!(
+            "Evidence: {} ({}){}",
+            evidence["validity"]
+                .as_str()
+                .unwrap_or("absent")
+                .to_ascii_uppercase(),
+            evidence["reuse"].as_str().unwrap_or("not offered"),
+            evidence["receipt"]
+                .as_str()
+                .map(|r| format!(" receipt {r}"))
+                .unwrap_or_default()
+        );
+    }
     for (persona, d) in &directives {
         if d.modified {
             println!(
@@ -583,17 +995,23 @@ fn cmd_gate(
     boundary: Option<String>,
     harm: Option<String>,
     exact_fix: Option<String>,
+    reuse: Option<String>,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let phase =
         Phase::from_slug(&phase_slug).ok_or_else(|| format!("unknown phase {phase_slug:?}"))?;
 
-    let verdict = match (pass, conditional, fail) {
-        (true, false, false) => Verdict::Pass,
-        (false, true, false) => Verdict::ConditionalPass,
-        (false, false, true) => Verdict::Fail,
-        _ => return Err("specify exactly one of --pass, --conditional, --fail".into()),
+    let verdict = match (pass, conditional, fail, reuse.is_some()) {
+        (true, false, false, _) => Verdict::Pass,
+        (false, true, false, false) => Verdict::ConditionalPass,
+        (false, false, true, false) => Verdict::Fail,
+        _ => {
+            return Err(
+                "specify exactly one of --pass, --conditional, --fail; --reuse requires --pass"
+                    .into(),
+            )
+        }
     };
 
     let exploit_fields_present = [&attacker, &capability, &boundary, &harm, &exact_fix]
@@ -624,12 +1042,76 @@ fn cmd_gate(
     };
 
     let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
-    if !ledger.attempt_authorized(phase) {
+    if reuse.is_none() && !ledger.attempt_authorized(phase) {
         return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), ledger.governance.risk));
     }
     let attempt = ledger.next_attempt(phase);
     let completed = ledger::now_epoch_secs();
     let mut checks_summary: Option<CheckSummary> = None;
+
+    if verdict.advances() && phase == Phase::Architecture {
+        let view = manifest_view(&root, &change);
+        if view.state != "ready" {
+            return Ok(gate_blocked(&format!(
+                "Architecture gate refused: change manifest is {} ({})",
+                view.state,
+                view.blockers.join("; ")
+            )));
+        }
+    }
+
+    // Reuse is a distinct append-only gate event. It never runs checks and
+    // only accepts the original executed receipt for this exact phase.
+    if let Some(receipt_hex) = reuse {
+        let requested = crate::digest::Digest::from_hex(&receipt_hex)?;
+        let origin = ledger
+            .history
+            .iter()
+            .find(|event| {
+                event.phase == phase
+                    && event
+                        .record
+                        .receipt
+                        .as_ref()
+                        .is_some_and(|r| r.id == requested)
+            })
+            .ok_or_else(|| format!("no receipt {receipt_hex} exists for {}", phase.label()))?;
+        let origin_receipt = origin.record.receipt.as_ref().expect("matched receipt");
+        let current = closure::capture_dependency_values(
+            &root,
+            &change,
+            &ledger,
+            &Config::load(&root),
+            phase,
+        )?;
+        let validity = closure::evidence_validity(Some(origin_receipt), &current);
+        closure::evaluate_reuse(phase, origin.record.verdict, origin_receipt, &validity)
+            .map_err(|e| format!("cannot reuse {receipt_hex}: {e}"))?;
+        let receipt = closure::EvidenceReceipt::reused_from(origin_receipt);
+        let completed = ledger::now_epoch_secs();
+        ledger.record(
+            phase,
+            GateRecord {
+                verdict: Verdict::Pass,
+                by: by.unwrap_or_else(|| phase.persona().name.to_string()),
+                evidence: Some(format!("reused from {receipt_hex}")),
+                checks: None,
+                at: date::today_utc(),
+                failure_class: None,
+                exploitability: None,
+                attempt,
+                started_at_epoch_secs: completed,
+                completed_at_epoch_secs: completed,
+                receipt: Some(receipt),
+            },
+        );
+        ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+        println!(
+            "Recorded reused PASS for {} from {receipt_hex}.",
+            phase.label()
+        );
+        return Ok(0);
+    }
 
     // Enforcement: a PASS/CONDITIONAL on a test/secret phase must be backed by
     // a real run — the gate cannot accept the caller's word.
@@ -759,6 +1241,20 @@ fn cmd_gate(
                 ledger.phase_started_at_epoch_secs.min(completed)
             },
             completed_at_epoch_secs: completed,
+            receipt: if verdict.advances() {
+                let values = closure::capture_dependency_values(
+                    &root,
+                    &change,
+                    &ledger,
+                    &Config::load(&root),
+                    phase,
+                )?;
+                let snapshot = closure::DependencySnapshot::for_phase(phase, &values)
+                    .map_err(|e| e.to_string())?;
+                Some(closure::EvidenceReceipt::executed(phase, snapshot))
+            } else {
+                None
+            },
         },
     );
     if verdict == Verdict::ConditionalPass {
@@ -992,6 +1488,19 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
     let (findings, suppressed) =
         crate::allowlist::Allowlist::load(&root).filter(report.findings, &root);
     let mut failed = false;
+    if staged {
+        if let Ok(change) = resolve_change(&root, None) {
+            let view = manifest_view(&root, &change);
+            if view.state == "blocked" {
+                failed = true;
+                eprintln!("Change manifest blocked by out-of-scope staged paths:");
+                let path_limit = Config::load(&root).human_path_list_limit();
+                for path in view.unrelated_staged.iter().take(path_limit) {
+                    eprintln!("  {}", harness::terminal_safe(path));
+                }
+            }
+        }
+    }
 
     // Suppression reporting is a security signal — never silenced by --quiet.
     if suppressed > 0 {
@@ -1048,8 +1557,373 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
     }
 }
 
+fn cmd_manifest(command: ManifestCommand) -> CmdResult {
+    let root = find_root()?;
+    match command {
+        ManifestCommand::Init { change } => {
+            let change = resolve_change(&root, change)?;
+            let path = closure::manifest_path(&root, &change)?;
+            if path.exists() {
+                return Err(format!(
+                    "{} already exists; refusing to overwrite declared scope",
+                    path.display()
+                ));
+            }
+            closure::save_manifest(&root, &change, &closure::ChangeManifest::seed())
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Seeded {}. Declare paths before Architecture PASS.",
+                path.display()
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn archived_manifest(
+    root: &Path,
+    ledger: &ledger::Ledger,
+) -> Result<closure::ChangeManifest, String> {
+    let closure_record = ledger
+        .archive_closure
+        .as_ref()
+        .ok_or("change has not been archived")?;
+    let path = root
+        .join(&closure_record.archive_path)
+        .join("manifest.json");
+    let text = openspec_core::read_capped(&path).map_err(|e| e.to_string())?;
+    let manifest: closure::ChangeManifest =
+        serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let issues = manifest.validate();
+    if !issues.is_empty() {
+        return Err(format!(
+            "archived manifest is invalid: {}",
+            issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    Ok(manifest)
+}
+
+fn resolve_publish_target(
+    root: &Path,
+    manifest: &closure::ChangeManifest,
+    config: &Config,
+) -> Result<Option<closure::PublishTarget>, String> {
+    if let Some(target) = &manifest.publish {
+        return Ok(Some(target.clone()));
+    }
+    if let Some(defaults) = &config.closure {
+        match (&defaults.default_remote, &defaults.default_ref) {
+            (Some(remote), Some(reference)) => {
+                if !git::valid_remote_name(remote) || !git::valid_branch_ref(reference) {
+                    return Err("closure default publication target is invalid".into());
+                }
+                return Ok(Some(closure::PublishTarget {
+                    remote: remote.clone(),
+                    reference: reference.clone(),
+                }));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "closure default_remote and default_ref must be configured together".into(),
+                )
+            }
+        }
+    }
+    Ok(git::publication_upstream(root)
+        .map_err(|e| e.to_string())?
+        .map(|(remote, reference)| closure::PublishTarget { remote, reference }))
+}
+
+fn cmd_publish(verify: bool, json: bool) -> CmdResult {
+    let root = find_root()?;
+    let change = resolve_change(&root, None)?;
+    let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let closure_record = ledger
+        .archive_closure
+        .as_ref()
+        .ok_or("change has no archived closure; run mpd archive first")?;
+    let manifest = archived_manifest(&root, &ledger)?;
+    let config = Config::load(&root);
+    let Some(target) = resolve_publish_target(&root, &manifest, &config)? else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"state":"unavailable","reason":"no explicit or configured publication target","next":"configure closure.default_remote and closure.default_ref or a branch upstream"})
+            );
+        } else {
+            println!("Remote parity: UNAVAILABLE\n  no explicit or configured publication target\nNo push or deploy performed.");
+        }
+        return Ok(1);
+    };
+    let coherence = closure::verify_commit_coherence(&root, closure_record)?;
+    if !verify {
+        let cached = closure::load_parity_cache(&root).filter(|p| {
+            p.change == change && p.remote == target.remote && p.reference == target.reference
+        });
+        if json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "change": change,
+                "remote": target.remote,
+                "ref": target.reference,
+                "commit_coherence": {"coherent": coherence.coherent, "head": coherence.head, "blockers": coherence.blockers},
+                "last_observation": cached,
+                "next": if coherence.coherent { "mpd publish --verify" } else { "commit the exact archived result" }
+            })).unwrap());
+        } else {
+            println!(
+                "Publish readiness: {}",
+                if coherence.coherent {
+                    "READY"
+                } else {
+                    "BLOCKED"
+                }
+            );
+            println!(
+                "  target: {}/{}",
+                harness::terminal_safe(&target.remote),
+                harness::terminal_safe(&target.reference)
+            );
+            for blocker in &coherence.blockers {
+                println!("  - {blocker}");
+            }
+            if let Some(cached) = cached {
+                println!(
+                    "  last observation: {} at {}",
+                    cached.state.label(),
+                    cached.observed_at_epoch_secs
+                );
+            }
+            println!("No push or deploy performed.");
+            println!(
+                "\n→ next: {}",
+                if coherence.coherent {
+                    "mpd publish --verify"
+                } else {
+                    "commit the exact archived result"
+                }
+            );
+        }
+        return Ok(if coherence.coherent { 0 } else { 1 });
+    }
+    if !coherence.coherent {
+        return Err(format!(
+            "closure commit is not coherent: {}",
+            coherence.blockers.join("; ")
+        ));
+    }
+    match closure::verify_remote_parity(
+        &root,
+        &change,
+        &target,
+        closure_record,
+        config.remote_timeout_secs(),
+    ) {
+        Ok(observation) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&observation).unwrap());
+            } else {
+                println!(
+                    "Remote parity: {}",
+                    observation.state.label().to_ascii_uppercase()
+                );
+                println!("  local:  {}", observation.local_oid);
+                println!(
+                    "  remote: {}",
+                    observation.remote_oid.as_deref().unwrap_or("(missing)")
+                );
+                println!("No push or deploy performed.");
+            }
+            if observation.state == closure::ParityState::Verified {
+                // The closure is complete. Remove only its ignored transaction
+                // metadata; committed repository bytes remain untouched. A
+                // prior successful `publish --verify` may have already
+                // cleaned this up (the pending closure is gone) — re-running
+                // verification is idempotent, not an error, so only clean up
+                // when a pending closure still exists.
+                if openspec_core::inspect(&root)
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+                {
+                    openspec_core::abandon_apply(&root).map_err(|e| e.to_string())?;
+                }
+                Ok(0)
+            } else {
+                Ok(1)
+            }
+        }
+        Err(e) if e.contains("offline") || e.contains("remote observation failed") => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"state":"offline","error":"remote observation failed","next":"retry mpd publish --verify when connectivity is restored"})
+                );
+            } else {
+                println!("Remote parity: OFFLINE\n  remote observation failed; local evidence remains intact.\nNo push or deploy performed.");
+            }
+            Ok(1)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A repository-relative, `/`-separated path, validated against `root`. Used
+/// to translate `Project`/`Config` filesystem paths into the
+/// `openspec_core::transaction::RelativePath` the archive-transaction
+/// executor operates on.
+fn relative_to_root(root: &Path, path: &Path) -> Result<String, String> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| format!("{} is not inside the project root", path.display()))?;
+    let s = rel
+        .to_str()
+        .ok_or_else(|| format!("{} is not valid UTF-8", path.display()))?;
+    Ok(s.replace('\\', "/"))
+}
+
+/// A stable, lowercase-kebab label for a transaction stage — matches its
+/// serde wire tag so text and JSON never disagree on vocabulary.
+fn stage_label(stage: openspec_core::TransactionState) -> &'static str {
+    use openspec_core::TransactionState::*;
+    match stage {
+        Preparing => "preparing",
+        Prepared => "prepared",
+        Applying => "applying",
+        Renaming => "renaming",
+        RecordingClosure => "recording-closure",
+        AwaitingCommit => "awaiting-commit",
+    }
+}
+
+fn stepclass_label(class: openspec_core::StepClass) -> &'static str {
+    use openspec_core::StepClass::*;
+    match class {
+        AlreadyComplete => "DONE   ",
+        Pending => "PENDING",
+        ThirdState => "BLOCKED",
+    }
+}
+
+/// Render a [`openspec_core::TransactionView`] in the shared human/JSON form
+/// `mpd closure recover` and `mpd closure abandon` both use for their
+/// preview.
+fn render_transaction_view(view: &openspec_core::TransactionView, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(view).unwrap());
+        return;
+    }
+    println!("Pending closure: {}", view.change);
+    println!("  transaction: {}", view.transaction_id.to_hex());
+    println!("  stage:       {}", stage_label(view.stage));
+    println!(
+        "  affected paths: {}{}",
+        view.affected_path_count,
+        if view.truncated {
+            " (list truncated below)"
+        } else {
+            ""
+        }
+    );
+    for c in &view.classifications {
+        println!("  [{}] {}: {}", stepclass_label(c.class), c.path, c.detail);
+    }
+    println!("  write eligible: {}", view.write_eligible);
+    if !view.blockers.is_empty() {
+        println!("  blockers:");
+        for b in &view.blockers {
+            println!("    - {b}");
+        }
+    }
+    println!("  {}", view.durability_note);
+    println!("\n→ next: {}", view.next);
+}
+
+fn cmd_closure(command: ClosureCommand) -> CmdResult {
+    let root = find_root()?;
+    match command {
+        ClosureCommand::Recover { yes, json } => cmd_closure_recover(&root, yes, json),
+        ClosureCommand::Abandon { yes, json } => cmd_closure_abandon(&root, yes, json),
+    }
+}
+
+fn closure_preview(root: &Path, json: bool) -> CmdResult {
+    match openspec_core::inspect(root).map_err(|e| e.to_string())? {
+        None => {
+            if json {
+                println!("{}", serde_json::json!({"pending": false}));
+            } else {
+                println!("No pending closure.");
+            }
+            Ok(0)
+        }
+        Some(view) => {
+            render_transaction_view(&view, json);
+            Ok(0)
+        }
+    }
+}
+
+fn cmd_closure_recover(root: &Path, yes: bool, json: bool) -> CmdResult {
+    if !yes {
+        return closure_preview(root, json);
+    }
+    match openspec_core::recover_apply(root) {
+        Ok(view) => {
+            render_transaction_view(&view, json);
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("Recovery refused: {e}");
+            Ok(1)
+        }
+    }
+}
+
+fn cmd_closure_abandon(root: &Path, yes: bool, json: bool) -> CmdResult {
+    if !yes {
+        return closure_preview(root, json);
+    }
+    match openspec_core::abandon_apply(root) {
+        Ok(()) => {
+            if json {
+                println!("{}", serde_json::json!({"abandoned": true}));
+            } else {
+                println!(
+                    "Abandoned the pending closure (removed only its own ignored metadata; \
+                     repository targets are untouched)."
+                );
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("Abandon refused: {e}");
+            Ok(1)
+        }
+    }
+}
+
 fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult {
     let root = find_root()?;
+
+    // A pending closure from a prior interrupted archive (of this or another
+    // change) must be resolved before starting a new one — see
+    // archive-transaction.md "Pending closure remains discoverable... begin/
+    // another archive refuse."
+    if let Some(view) = openspec_core::inspect(&root).map_err(|e| e.to_string())? {
+        eprintln!(
+            "Cannot archive — a closure for {:?} is already pending (stage: {}).",
+            view.change,
+            stage_label(view.stage)
+        );
+        eprintln!("Run `mpd closure recover` or `mpd closure abandon` first.");
+        return Ok(1);
+    }
+
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
 
@@ -1064,6 +1938,18 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     }
 
     let project = Project::new(&root);
+    let manifest = closure::load_manifest(&root, &change).map_err(|e| e.to_string())?;
+    let manifest_check = manifest_view(&root, &change);
+    if manifest_check.state != "ready" {
+        eprintln!(
+            "Cannot archive {change:?} — change manifest is {}:",
+            manifest_check.state
+        );
+        for reason in &manifest_check.blockers {
+            eprintln!("  - {reason}");
+        }
+        return Ok(1);
+    }
 
     // Irreversibility guard #2: never archive a change whose core artifacts are
     // still unfilled template stubs. The Documentation gate already blocks a stub
@@ -1083,7 +1969,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         .map_err(|e| e.to_string())?;
 
     // Documentation fold-in (feature changes only): read the change's
-    // documentation.md now, before commit_archive moves the change directory.
+    // documentation.md now, before the transaction moves the change directory.
     // A *symlinked* documentation.md is treated as absent (not followed).
     let doc_src = project.change_dir(&change).join("documentation.md");
     let doc_is_regular = doc_src
@@ -1125,45 +2011,146 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         return Ok(0);
     }
 
-    project.commit_archive(&plan).map_err(|e| e.to_string())?;
+    // ---- Compose every planned postimage into ONE crash-safe transaction ----
+    // (archive-transaction.md; design.md "Archive and commit lifecycle").
+    let base_commit = git::head_commit(&root)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "cannot archive: HEAD has no commit yet (unborn branch)".to_string())?;
 
-    // Fold the documentation into the durable project docs directory. Reuse the
-    // hardened containment walk (every component, incl. the leaf, checked for
-    // symlinks) BEFORE creating or following any directory, and again after
-    // mkdir to close the TOCTOU window — refusing a symlinked docs dir or a
-    // symlinked target that would redirect the write outside the project.
-    if let Some((target, content)) = &doc_fold {
-        openspec_core::assert_contained(&root, target).map_err(|e| e.to_string())?;
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        openspec_core::assert_contained(&root, target).map_err(|e| e.to_string())?;
-        std::fs::write(target, content).map_err(|e| e.to_string())?;
-        println!("  documentation → {}", target.display());
+    let mut writes: Vec<openspec_core::TargetWrite> = Vec::new();
+    let mut contents: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for u in &plan.updates {
+        let target = relative_to_root(&root, &u.target_path)?;
+        let bytes = u.content.clone().into_bytes();
+        contents.insert(target.clone(), bytes.clone());
+        writes.push(openspec_core::TargetWrite { target, bytes });
+    }
+    if let Some((target_path, content)) = &doc_fold {
+        let target = relative_to_root(&root, target_path)?;
+        let bytes = content.clone().into_bytes();
+        contents.insert(target.clone(), bytes.clone());
+        writes.push(openspec_core::TargetWrite { target, bytes });
     }
 
-    // Record Deploy gate and persist final ledger state.
-    let mut ledger = ledger;
-    ledger.record(
-        Phase::Deploy,
-        GateRecord {
-            verdict: Verdict::Pass,
-            by: "main-session".to_string(),
-            evidence: Some(plan.archive_target.display().to_string()),
-            checks: None,
-            at: date::today_utc(),
-            failure_class: None,
-            exploitability: None,
-            attempt: ledger.next_attempt(Phase::Deploy),
-            started_at_epoch_secs: ledger.phase_started_at_epoch_secs,
-            completed_at_epoch_secs: ledger::now_epoch_secs(),
+    let archive_target_rel = relative_to_root(&root, &plan.archive_target)?;
+    let change_dir_rel = relative_to_root(&root, &project.change_dir(&change))?;
+    let ledger_path_rel = relative_to_root(&root, &ledger::state_path(&root, &change))?;
+    let system = closure::SystemScope {
+        change_dir: change_dir_rel.clone(),
+        ledger_path: ledger_path_rel.clone(),
+        merged_spec_targets: plan
+            .updates
+            .iter()
+            .map(|u| relative_to_root(&root, &u.target_path))
+            .collect::<Result<Vec<_>, _>>()?,
+        doc_target: doc_fold
+            .as_ref()
+            .map(|(p, _)| relative_to_root(&root, p))
+            .transpose()?,
+        archive_target: archive_target_rel.clone(),
+    };
+    let mut closure_scope = manifest.paths.clone();
+    closure_scope.extend(manifest.shared_paths.clone());
+    closure_scope.extend(system.paths());
+    closure_scope.sort();
+    closure_scope.dedup();
+    // Freeze the declared (possibly glob) scope into a concrete snapshot now,
+    // before the transaction mutates anything — the pending closure's own
+    // protected scope (`ArchiveClosure::system_paths`); never re-resolved
+    // after this point.
+    let mut declared_patterns = manifest.paths.clone();
+    declared_patterns.extend(manifest.shared_paths.clone());
+    let scope_snapshot =
+        closure::resolve_scope_snapshot(&root, &declared_patterns, &system.paths())?;
+    let final_scoped_digest = closure::planned_archive_digest(
+        &root,
+        &closure_scope,
+        &change_dir_rel,
+        &archive_target_rel,
+        &contents,
+    )?;
+    let final_scoped_digest_oc =
+        openspec_core::digest::Digest::from_hex(&final_scoped_digest.to_hex())
+            .expect("mpd Digest hex always parses as an openspec_core Digest");
+
+    // The closure record itself can only be built once the transaction id is
+    // known. The already-executed Deploy gate is preserved; archive never
+    // invents or duplicates deployment evidence.
+    let archived_at = ledger::now_epoch_secs();
+
+    let ledger_bytes_out: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+    let plan_txn = openspec_core::build_plan(
+        &root,
+        &change,
+        base_commit.clone(),
+        writes,
+        openspec_core::DirectoryMoveInput {
+            source: change_dir_rel,
+            destination: archive_target_rel.clone(),
         },
+        final_scoped_digest_oc,
+        |transaction_id| {
+            let mut lg = ledger.clone();
+            lg.archive_closure = Some(ArchiveClosure {
+                base_commit: base_commit.clone(),
+                archive_path: archive_target_rel.clone(),
+                transaction_id: digest::Digest::from_hex(&transaction_id.to_hex())
+                    .expect("openspec_core Digest hex always parses as an mpd Digest"),
+                allowed_paths: closure_scope.clone(),
+                system_paths: scope_snapshot.clone(),
+                post_archive_digest: final_scoped_digest,
+                archived_at,
+            });
+            let mut bytes = serde_json::to_string_pretty(&lg)
+                .expect("ledger always serializes")
+                .into_bytes();
+            bytes.push(b'\n');
+            *ledger_bytes_out.borrow_mut() = Some(bytes.clone());
+            openspec_core::TargetWrite {
+                target: ledger_path_rel.clone(),
+                bytes,
+            }
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    contents.insert(
+        ledger_path_rel,
+        ledger_bytes_out
+            .into_inner()
+            .expect("the closure_ledger callback always runs inside build_plan"),
     );
-    ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+
+    openspec_core::prepare(&root, &plan_txn, &contents).map_err(|e| e.to_string())?;
+    match openspec_core::drive(&root).map_err(|e| e.to_string())? {
+        openspec_core::DriveOutcome::AwaitingCommit => {}
+        openspec_core::DriveOutcome::NothingPending => {
+            return Err("internal error: transaction vanished immediately after prepare".into());
+        }
+        openspec_core::DriveOutcome::ManualRecoveryRequired { path, detail } => {
+            eprintln!(
+                "Archive stopped: {path} is in an unexpected state ({detail}). \
+                 No further write was performed. Run `mpd closure recover` to inspect it."
+            );
+            return Ok(1);
+        }
+    }
+
+    // Housekeeping outside the transaction: clear the "current change"
+    // pointer (a convenience cache, not a repository target) so `mpd status`
+    // stops pointing at an archived change.
     if ledger::current(&root).as_deref() == Some(change.as_str()) {
         let _ = std::fs::remove_file(ledger::current_path(&root));
     }
-    println!("\nArchived {change:?}.");
+
+    println!("\nArchived {change:?} to {archive_target_rel}.");
+    println!(
+        "Closure is AwaitingCommit — preimages were not retained, and this stage is not claimed \
+         atomic beyond what the filesystem actually provided."
+    );
+    println!(
+        "→ next: commit the archived result, then run `mpd closure abandon --yes` \
+         once the commit is in (or `mpd publish --verify` once available)."
+    );
     Ok(0)
 }
 
@@ -1197,6 +2184,25 @@ fn cmd_doctor(json: bool) -> CmdResult {
         .as_ref()
         .map(|r| crate::directives::is_installed(r))
         .unwrap_or(false);
+    let pending_closure = root
+        .as_ref()
+        .and_then(|r| openspec_core::inspect(r).ok().flatten());
+    let hermetic_reuse = root
+        .as_ref()
+        .and_then(|r| Config::load(r).hermetic_reuse_policy().cloned())
+        .map(|p| p.is_complete())
+        .unwrap_or(false);
+    let closure_cfg = root.as_ref().map(|r| Config::load(r));
+    let closure_default_remote = closure_cfg
+        .as_ref()
+        .and_then(|c| c.closure.as_ref())
+        .and_then(|c| c.default_remote.clone());
+    let closure_default_ref = closure_cfg
+        .as_ref()
+        .and_then(|c| c.closure.as_ref())
+        .and_then(|c| c.default_ref.clone());
+    let closure_timeout_secs = closure_cfg.as_ref().map(|c| c.remote_timeout_secs());
+    let closure_path_limit = closure_cfg.as_ref().map(|c| c.human_path_list_limit());
 
     if json {
         let v = serde_json::json!({
@@ -1213,6 +2219,14 @@ fn cmd_doctor(json: bool) -> CmdResult {
             "deploy_command": deploy_cmd,
             "allowlist_entries": allow_entries,
             "current_change": current,
+            "pending_closure": pending_closure.as_ref().map(|v| serde_json::json!({"change":v.change,"stage":stage_label(v.stage),"write_eligible":v.write_eligible})),
+            "hermetic_reuse_configured": hermetic_reuse,
+            "closure": {
+                "default_remote": closure_default_remote,
+                "default_ref": closure_default_ref,
+                "remote_timeout_secs": closure_timeout_secs,
+                "human_path_list_limit": closure_path_limit,
+            },
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
@@ -1250,6 +2264,33 @@ fn cmd_doctor(json: bool) -> CmdResult {
     println!(
         "  current change:      {}",
         current.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  pending closure:     {}",
+        pending_closure
+            .as_ref()
+            .map(|v| format!("{} ({})", v.change, stage_label(v.stage)))
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    println!("  hermetic reuse:      {}", yn(hermetic_reuse));
+    println!(
+        "  closure remote/ref:  {}",
+        match (&closure_default_remote, &closure_default_ref) {
+            (Some(r), Some(f)) => format!(
+                "{} / {}",
+                harness::terminal_safe(r),
+                harness::terminal_safe(f)
+            ),
+            _ => "(unset — falls back to the current branch's upstream)".to_string(),
+        }
+    );
+    println!(
+        "  remote timeout:      {}s",
+        closure_timeout_secs.unwrap_or(15)
+    );
+    println!(
+        "  path list limit:     {}",
+        closure_path_limit.unwrap_or(50)
     );
     if !hook && git {
         println!("\n  Tip: re-run `mpd init` to install the pre-commit gate.");

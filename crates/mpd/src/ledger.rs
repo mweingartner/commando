@@ -5,6 +5,7 @@
 //! `.mpd/state/<change>.json` so it survives session death — the piece the
 //! in-session pipeline lacked.
 
+use crate::closure::{ArchiveClosure, EvidenceReceipt};
 use crate::phase::{Applicability, Phase};
 use openspec_core::validate_change_name;
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,12 @@ pub struct GateRecord {
     pub started_at_epoch_secs: u64,
     #[serde(default)]
     pub completed_at_epoch_secs: u64,
+    /// Content-bound evidence for this verdict, when the phase's gate ran
+    /// under the content-addressed release-closure model. Absent on every
+    /// pre-existing (legacy) gate record — legacy evidence is `absent`,
+    /// never `valid`, per design.md "Legacy gate has no receipt".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<EvidenceReceipt>,
 }
 
 impl GateRecord {
@@ -303,6 +310,12 @@ pub struct Ledger {
     pub governance: Governance,
     #[serde(default)]
     pub phase_started_at_epoch_secs: u64,
+    /// The content-addressed record of this change's completed archive
+    /// closure, once `archive --yes` has fully applied and been verified
+    /// (see `archive-transaction.md`). Absent for every change archived
+    /// before this schema existed and for any change not yet archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_closure: Option<ArchiveClosure>,
 }
 
 impl Ledger {
@@ -339,6 +352,7 @@ impl Ledger {
             history: Vec::new(),
             governance,
             phase_started_at_epoch_secs: now_epoch_secs(),
+            archive_closure: None,
         }
     }
 
@@ -601,6 +615,7 @@ mod tests {
             attempt: 1,
             started_at_epoch_secs: 0,
             completed_at_epoch_secs: 0,
+            receipt: None,
         }
     }
 
@@ -678,6 +693,31 @@ mod tests {
         assert_eq!(l.phase, Phase::Build);
         assert_eq!(l.governance, Governance::default());
         let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(l, back);
+    }
+
+    #[test]
+    fn legacy_ledger_and_gate_record_default_receipt_and_closure_to_absent() {
+        // A ledger serialized before the content-addressed release-closure
+        // schema existed (no `receipt` on any gate, no top-level
+        // `archive_closure`) must still load unchanged via #[serde(default)],
+        // with both new fields defaulting to `None` — never a false `valid`
+        // or a false completed closure (design.md "Legacy gate has no
+        // receipt").
+        let json = r#"{
+            "change": "c", "schema": "mpd", "ui": false, "kind": "fix",
+            "phase": "build",
+            "gates": { "architecture": { "verdict": "pass", "by": "Architect", "at": "2026-07-11" } },
+            "conditions": []
+        }"#;
+        let l: Ledger = serde_json::from_str(json).unwrap();
+        assert_eq!(l.archive_closure, None);
+        assert_eq!(l.gates[&Phase::Architecture].receipt, None);
+        // Round-trips forward without inventing either field.
+        let json_out = serde_json::to_string(&l).unwrap();
+        assert!(!json_out.contains("receipt"));
+        assert!(!json_out.contains("archive_closure"));
+        let back: Ledger = serde_json::from_str(&json_out).unwrap();
         assert_eq!(l, back);
     }
 

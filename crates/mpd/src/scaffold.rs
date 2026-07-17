@@ -22,7 +22,9 @@ const PROJECT_MD: &str = "# Project Context\n\n\
 <!-- Project-specific context for humans and agents. -->\n";
 const AGENTS_MD: &str = "# Agent Instructions\n\n\
 This project uses mpd (Model-Paired Development) over the OpenSpec format.\n\
-Run `mpd status` to see the current phase and `mpd next` for the next step.\n";
+Run `mpd status` to see the current phase and `mpd next` for the next step.\n\
+Declare change scope in `manifest.json`; do not mix unrelated staged work.\n\
+After archive, commit and push normally, then run `mpd publish --verify`.\n";
 
 /// Outcome of an `init`.
 #[derive(Debug, Default)]
@@ -101,6 +103,8 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
         docs_dir: None,
         models,
         model_fallbacks,
+        hermetic_reuse: None,
+        closure: None,
     };
     let cfg_path = crate::config::config_path(root);
     if !cfg_path.exists() {
@@ -116,7 +120,7 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
     // the commit/stop hooks nag about it every turn.
     write_new(
         &ledger::mpd_dir(root).join(".gitignore"),
-        "/current\n/tmp/\n",
+        "/current\n/tmp/\n/pending-closure\n/parity-observations.json\n",
         root,
         &mut report,
     )?;
@@ -176,6 +180,10 @@ pub fn begin(
     std::fs::write(change_dir.join("proposal.md"), T_PROPOSAL)?;
     std::fs::write(change_dir.join("design.md"), T_DESIGN)?;
     std::fs::write(change_dir.join("tasks.md"), T_TASKS)?;
+    std::fs::write(
+        change_dir.join("manifest.json"),
+        crate::closure::ChangeManifest::seed_json(),
+    )?;
     // Seed the documentation stub only for documented (feature) changes.
     if kind.documents() {
         std::fs::write(change_dir.join("documentation.md"), T_DOCUMENTATION)?;

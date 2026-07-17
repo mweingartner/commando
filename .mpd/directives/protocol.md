@@ -65,6 +65,31 @@ Prefer the machine over the persona's word:
 - **Archive** refuses on any non-PASS gate or open condition, and previews the
   spec + doc merge before applying.
 
+## Content-addressed closure
+
+Declare the change's repository scope and optional publication branch in
+`manifest.json`; never guess scope from whichever files happen to be staged.
+Architecture cannot pass with an empty or invalid manifest. Mixed staged work
+blocks closure without MPD changing the index.
+
+Every executed PASS receives a receipt bound to that phase's exact content and
+governing inputs. Treat `valid`, `stale`, and `absent` as evidence states, not
+gate verdicts. Reuse is explicit, append-only, and only from an exact valid
+executed receipt. CONDITIONAL PASS is rerun fresh; Build, Test, and Security
+(code) run fresh unless a complete hermetic policy is configured; Deploy always
+runs fresh.
+
+Archive is a completion-only journaled transaction: it stages and syncs exact
+postimages before replacing repository targets, retains no rollback preimages,
+and never claims filesystem-independent atomicity. Recover previews by default;
+only `closure recover --yes` may roll forward exact preimages, and any third
+state refuses before another write.
+
+After archive, commit and push through normal Git. `mpd publish --verify` is a
+fresh, non-fetching observation that requires a coherent linear closure commit
+and exact configured-branch OID parity. It never stages, commits, pushes,
+force-pushes, fetches, deploys, or invents a publication target.
+
 Parsers, interpreters, serializers, codecs, and wire protocols get
 property/fuzz/metamorphic tests (seeded + reproducible), not just example tests.
 Performance/size claims need before+after numbers, median of several runs, same

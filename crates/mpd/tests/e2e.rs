@@ -15,15 +15,37 @@ impl Sandbox {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         run("git", &["init", "-q"], &dir);
+        // The archive transaction records the commit HEAD must descend from
+        // (archive-transaction.md); a real project always has history by the
+        // time it archives its first change, so every sandbox starts with one
+        // baseline commit rather than the unborn-branch state `mpd archive`
+        // correctly refuses.
+        run(
+            "git",
+            &["commit", "--allow-empty", "-q", "-m", "sandbox-init"],
+            &dir,
+        );
         Sandbox { dir }
     }
 
     fn mpd(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_mpd"))
+        let output = Command::new(env!("CARGO_BIN_EXE_mpd"))
             .args(args)
             .current_dir(&self.dir)
             .output()
-            .expect("run mpd")
+            .expect("run mpd");
+        // Legacy scenarios predate declared scope. Keep their focus intact by
+        // supplying an explicit all-repository fixture scope immediately after
+        // begin; dedicated manifest tests exercise incomplete/narrow scopes.
+        if output.status.success() && args.first() == Some(&"begin") {
+            if let Some(change) = args.get(1) {
+                self.write(
+                    &format!("openspec/changes/{change}/manifest.json"),
+                    "{\n  \"version\": 1,\n  \"paths\": [\"**\"],\n  \"shared_paths\": []\n}\n",
+                );
+            }
+        }
+        output
     }
 
     fn write(&self, rel: &str, content: &str) {
@@ -325,10 +347,13 @@ fn gate_rejects_conflicting_verdict_flags() {
 
     let out = sb.mpd(&["gate", "architecture", "--pass", "--fail"]);
     assert!(!out.status.success(), "gate must reject two verdict flags");
+    // Match loosely on the two conflicting flag names rather than the exact
+    // refusal sentence, which is free to be reworded as `--reuse` and other
+    // gate flags evolve.
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("specify exactly one of"),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("--pass") && stderr.contains("--fail"),
+        "stderr: {stderr}"
     );
     // The phase must not have moved.
     let s = json(&sb.mpd(&["status", "--json"]));
@@ -902,6 +927,29 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
     sb.mpd(&["begin", "some-change"]);
     let after_begin = json(&sb.mpd(&["doctor", "--json"]));
     assert_eq!(after_begin["current_change"], "some-change");
+
+    // `closure` reports config-resolved defaults (bounded fallbacks) when
+    // nothing is configured, and the exact configured values once set.
+    assert_eq!(after_begin["closure"]["default_remote"], Value::Null);
+    assert_eq!(after_begin["closure"]["default_ref"], Value::Null);
+    assert_eq!(after_begin["closure"]["remote_timeout_secs"], 15);
+    assert_eq!(after_begin["closure"]["human_path_list_limit"], 50);
+    let doctor_text = stdout(&sb.mpd(&["doctor"]));
+    assert!(doctor_text.contains("falls back to the current branch's upstream"));
+
+    sb.write(
+        ".mpd/config.json",
+        "{\"closure\":{\"default_remote\":\"origin\",\"default_ref\":\"refs/heads/main\",\"remote_timeout_secs\":30,\"human_path_list_limit\":5}}\n",
+    );
+    let configured = json(&sb.mpd(&["doctor", "--json"]));
+    assert_eq!(configured["closure"]["default_remote"], "origin");
+    assert_eq!(configured["closure"]["default_ref"], "refs/heads/main");
+    assert_eq!(configured["closure"]["remote_timeout_secs"], 30);
+    assert_eq!(configured["closure"]["human_path_list_limit"], 5);
+    let configured_text = stdout(&sb.mpd(&["doctor"]));
+    assert!(configured_text.contains("origin / refs/heads/main"));
+    assert!(configured_text.contains("remote timeout:      30s"));
+    assert!(configured_text.contains("path list limit:     5"));
 }
 
 /// Drive a fresh feature change to the Documentation phase.
@@ -1294,5 +1342,533 @@ fn status_preserves_gate_history_across_fail_then_pass() {
     assert!(
         text.contains("Gate history:") && text.contains("FAIL"),
         "status text must surface the caught FAIL: {text}"
+    );
+}
+
+#[test]
+fn manifest_blocks_mixed_staging_without_mutating_the_index() {
+    let sb = Sandbox::new("manifest-mixed");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb.mpd(&["begin", "scoped", "--fix"]).status.success());
+    sb.write(
+        "openspec/changes/scoped/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"openspec/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    sb.write("outside.txt", "must remain user-owned\n");
+    run("git", &["add", "outside.txt"], &sb.dir);
+    let before = run("git", &["diff", "--cached", "--name-only"], &sb.dir);
+    let check = sb.mpd(&["check", "--staged"]);
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("out-of-scope"));
+    let after = run("git", &["diff", "--cached", "--name-only"], &sb.dir);
+    assert_eq!(before.stdout, after.stdout, "MPD must not alter the index");
+}
+
+#[test]
+fn exact_judgment_receipt_can_be_reused_but_build_defaults_to_fresh_execution() {
+    let sb = Sandbox::new("receipt-reuse");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb.mpd(&["begin", "reuse-proof", "--fix"]).status.success());
+    fill_artifacts(&sb, "reuse-proof");
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+    let status = json(&sb.mpd(&["status", "--json"]));
+    let receipt = status["gates"]["architecture"]["receipt"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reused = sb.mpd(&["gate", "architecture", "--pass", "--reuse", &receipt]);
+    assert!(
+        reused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    assert!(stdout(&reused).contains("reused PASS"));
+    let history = json(&sb.mpd(&["status", "--json"]))["history"]
+        .as_array()
+        .unwrap()
+        .to_vec();
+    assert_eq!(history.len(), 2);
+    assert_eq!(
+        history[1]["record"]["receipt"]["disposition"]["kind"],
+        "reused"
+    );
+
+    assert!(sb
+        .mpd(&["gate", "security-plan", "--pass"])
+        .status
+        .success());
+    assert!(sb.mpd(&["gate", "build", "--pass"]).status.success());
+    let build_status = json(&sb.mpd(&["status", "--json"]));
+    let build_receipt = build_status["gates"]["build"]["receipt"]["id"]
+        .as_str()
+        .unwrap();
+    let refused = sb.mpd(&["gate", "build", "--pass", "--reuse", build_receipt]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("always-execute"),
+        "stdout={} stderr={}",
+        stdout(&refused),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn archived_commit_can_be_verified_against_a_local_bare_remote_without_fetch_or_push() {
+    let sb = Sandbox::new("remote-parity");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "publish-proof", "--fix"])
+        .status
+        .success());
+    fill_artifacts(&sb, "publish-proof");
+    sb.write(
+        "openspec/changes/publish-proof/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"**\"],\n  \"shared_paths\": [],\n  \"publish\": {\"remote\": \"origin\", \"ref\": \"refs/heads/main\"}\n}\n",
+    );
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(sb.mpd(&["archive", "--yes"]).status.success());
+    run("git", &["add", "-A"], &sb.dir);
+    run(
+        "git",
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            "close change",
+        ],
+        &sb.dir,
+    );
+    let bare = sb
+        .dir
+        .parent()
+        .unwrap()
+        .join(format!("mpd-e2e-{}-parity-bare.git", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bare);
+    std::fs::create_dir_all(&bare).unwrap();
+    run("git", &["init", "--bare", "-q"], &bare);
+    run(
+        "git",
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+        &sb.dir,
+    );
+    run("git", &["push", "-q", "origin", "HEAD:main"], &sb.dir);
+
+    let verified = sb.mpd(&["publish", "--verify", "--json"]);
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    assert_eq!(json(&verified)["state"], "verified");
+    assert!(!sb.dir.join(".mpd/pending-closure").exists());
+
+    // Re-running `publish --verify` after the pending closure's metadata was
+    // already cleaned up by the first successful verification must stay
+    // idempotent (succeed, still "verified") rather than failing because
+    // there is nothing left to abandon — a prior regression here returned a
+    // hard "no pending closure to abandon" error whenever a second
+    // resolvable `publish --verify` ran after the first one's cleanup (a
+    // real race between two concurrently invoked `publish --verify`
+    // processes, or a rerun after a manual `closure abandon --yes`, hits
+    // exactly this path). `mpd publish` has no `--change` flag, and archive
+    // deliberately clears the "current change" convenience pointer once
+    // archived (cli.rs cmd_archive) — restore it exactly as `mpd begin`
+    // would have left it, to make the change resolvable for this second call
+    // the same way a fresh `mpd status`/`mpd publish` on this change would
+    // need it to be.
+    sb.write(".mpd/current", "publish-proof\n");
+    let verified_again = sb.mpd(&["publish", "--verify", "--json"]);
+    assert!(
+        verified_again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified_again.stderr)
+    );
+    assert_eq!(json(&verified_again)["state"], "verified");
+    assert!(!sb.dir.join(".mpd/pending-closure").exists());
+
+    let _ = std::fs::remove_dir_all(bare);
+}
+
+/// `mpd publish` must never invent a publication target: a detached `HEAD`
+/// with no manifest-declared target, no `closure.default_remote`/`default_ref`
+/// config, and no configured branch upstream reports `unavailable` rather
+/// than guessing a remote/ref (design.md "Remote observation": "detached
+/// HEAD requires an explicit target").
+#[test]
+fn publish_reports_unavailable_on_detached_head_with_no_configured_target() {
+    let sb = Sandbox::new("detached-publish");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "detached-proof", "--fix"])
+        .status
+        .success());
+    fill_artifacts(&sb, "detached-proof");
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(sb.mpd(&["archive", "--yes"]).status.success());
+    run("git", &["add", "-A"], &sb.dir);
+    run(
+        "git",
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            "close change",
+        ],
+        &sb.dir,
+    );
+    // No remote is ever configured, and HEAD is detached from any branch —
+    // `publication_upstream` has nothing to resolve.
+    run("git", &["checkout", "-q", "--detach"], &sb.dir);
+
+    let out = sb.mpd(&["publish", "--json"]);
+    let v = json(&out);
+    assert_eq!(v["state"], "unavailable");
+    assert!(!out.status.success(), "unavailable is exit 1, not 0");
+}
+
+/// Drives `mpd closure recover`/`mpd closure abandon` through the real
+/// binary end to end: after `archive --yes` reaches `AwaitingCommit`, a
+/// second `begin`/`archive` refuses, `closure recover` (no `--yes`) is a
+/// non-mutating preview in both text and JSON, `closure recover --yes` is
+/// refused once nothing is left to roll forward, and `closure abandon --yes`
+/// removes only the pointer/journal metadata — the archived content stays.
+#[test]
+fn closure_recover_and_abandon_via_binary() {
+    let sb = Sandbox::new("closure-cli");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "closure-thing", "--chore"])
+        .status
+        .success());
+    fill_artifacts(&sb, "closure-thing");
+    write_thing_spec(&sb, "closure-thing");
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let archived = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        archived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&archived.stderr)
+    );
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+
+    // A pending closure blocks starting a new change.
+    let begin_blocked = sb.mpd(&["begin", "other-thing"]);
+    assert!(!begin_blocked.status.success());
+    assert!(String::from_utf8_lossy(&begin_blocked.stderr).contains("pending"));
+
+    // ...and blocks a second archive.
+    let archive_blocked = sb.mpd(&["archive", "--yes"]);
+    assert!(!archive_blocked.status.success());
+    assert!(String::from_utf8_lossy(&archive_blocked.stderr).contains("pending"));
+
+    // `closure recover` with no `--yes` is a read-only preview — human form.
+    let preview = sb.mpd(&["closure", "recover"]);
+    assert!(preview.status.success());
+    let preview_text = stdout(&preview);
+    assert!(preview_text.contains("closure-thing"));
+    assert!(preview_text.contains("awaiting-commit"));
+    assert!(preview_text.contains("write eligible: false"));
+
+    // Same preview, JSON form — same facts, machine-readable.
+    let preview_json = json(&sb.mpd(&["closure", "recover", "--json"]));
+    assert_eq!(preview_json["change"], "closure-thing");
+    assert_eq!(preview_json["stage"], "awaiting-commit");
+    assert_eq!(preview_json["write-eligible"], false);
+
+    // The preview must not have mutated the pointer or any repository target.
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+    let archive_entries: Vec<_> = std::fs::read_dir(sb.dir.join("openspec/changes/archive"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(archive_entries
+        .iter()
+        .any(|n| n.ends_with("-closure-thing")));
+
+    // Nothing is left to roll forward once AwaitingCommit — `recover --yes`
+    // is refused rather than treated as a no-op success.
+    let recover_yes = sb.mpd(&["closure", "recover", "--yes"]);
+    assert!(!recover_yes.status.success());
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+
+    // `abandon` preview (no `--yes`) is also read-only.
+    let abandon_preview = sb.mpd(&["closure", "abandon"]);
+    assert!(abandon_preview.status.success());
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+
+    // `abandon --yes` removes only the ignored pointer/journal metadata; the
+    // archived content stays exactly where the transaction put it.
+    let abandoned = sb.mpd(&["closure", "abandon", "--yes"]);
+    assert!(
+        abandoned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&abandoned.stderr)
+    );
+    assert!(!sb.dir.join(".mpd/pending-closure").exists());
+    assert!(!sb.dir.join("openspec/changes/closure-thing").exists());
+    let archive_entries_after: Vec<_> = std::fs::read_dir(sb.dir.join("openspec/changes/archive"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(archive_entries, archive_entries_after);
+
+    // Nothing pending anymore — `mpd begin` works again.
+    let no_pending = sb.mpd(&["closure", "recover"]);
+    assert!(stdout(&no_pending).contains("No pending closure"));
+    assert!(sb.mpd(&["begin", "other-thing"]).status.success());
+}
+
+/// change-manifest spec "Active change directory has been archived": once
+/// `archive --yes` has moved the active change directory and left a pending
+/// closure, `mpd check --staged` (the exact command the pre-commit hook
+/// runs) must resolve that pending closure rather than reporting "no current
+/// change" — and must keep protecting its scope: the real archived diff
+/// (spec merge, moved directory, ledger) stages and checks clean, while any
+/// unrelated file staged alongside it is still caught as out-of-scope,
+/// without MPD ever touching the index.
+#[test]
+fn check_staged_resolves_pending_closure_and_still_blocks_unrelated_paths() {
+    let sb = Sandbox::new("closure-hook-scope");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "hook-scope-thing", "--chore"])
+        .status
+        .success());
+    fill_artifacts(&sb, "hook-scope-thing");
+    write_thing_spec(&sb, "hook-scope-thing");
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(sb.mpd(&["archive", "--yes"]).status.success());
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+
+    // `mpd begin` with no `--change` flag has no "current change" pointer
+    // once archived (cli.rs cmd_archive clears `.mpd/current`); `check
+    // --staged` must still resolve scope via the pending-closure pointer.
+    assert!(!sb.dir.join(".mpd/current").exists());
+
+    // Stage exactly the real archived diff plus one genuinely unrelated file.
+    run("git", &["add", "-A"], &sb.dir);
+    sb.write("unrelated-secret.txt", "not part of this change\n");
+    run("git", &["add", "unrelated-secret.txt"], &sb.dir);
+
+    let before = run("git", &["diff", "--cached", "--name-only"], &sb.dir);
+    let blocked = sb.mpd(&["check", "--staged"]);
+    assert!(!blocked.status.success());
+    let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_stderr.contains("out-of-scope"),
+        "stderr={blocked_stderr}"
+    );
+    assert!(
+        blocked_stderr.contains("unrelated-secret.txt"),
+        "stderr={blocked_stderr}"
+    );
+    let after = run("git", &["diff", "--cached", "--name-only"], &sb.dir);
+    assert_eq!(
+        before.stdout, after.stdout,
+        "MPD must not alter the index even while blocking"
+    );
+
+    // Unstage only the unrelated file — the real archived diff alone (the
+    // pending closure's own scope) must check clean.
+    run(
+        "git",
+        &["restore", "--staged", "unrelated-secret.txt"],
+        &sb.dir,
+    );
+    let clean = sb.mpd(&["check", "--staged"]);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+}
+
+/// `mpd next` must prepend a release-closure fact when the change manifest is
+/// not ready — an operator driving purely off `mpd next` should see the
+/// blocker without also having to run `mpd status`.
+#[test]
+fn next_prepends_manifest_block_when_scope_is_undeclared() {
+    let sb = Sandbox::new("next-manifest-block");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "undeclared-thing", "--fix"])
+        .status
+        .success());
+    // Overwrite the Sandbox test fixture's auto-"**" manifest with an empty,
+    // undeclared one — the real state of a freshly-seeded `manifest.json`
+    // before an operator declares scope.
+    sb.write(
+        "openspec/changes/undeclared-thing/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [],\n  \"shared_paths\": []\n}\n",
+    );
+
+    let out = sb.mpd(&["next", "--harness", "generic"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("Release closure: manifest INCOMPLETE"),
+        "stdout={text}"
+    );
+
+    let json_out = json(&sb.mpd(&["next", "--harness", "generic", "--json"]));
+    assert_eq!(json_out["release_closure"]["manifest_state"], "incomplete");
+    assert!(!json_out["release_closure"]["manifest_blockers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(json_out["release_closure"]["archived"], false);
+}
+
+/// Once a change is archived (pending closure, not yet committed), `mpd
+/// next` must reflect that instead of the stale "run `mpd archive`" message
+/// — human and JSON must agree on the pending stage and its one safe next
+/// action (design.md Condition 11: "every known blocker has one executable
+/// next action").
+#[test]
+fn next_reflects_pending_closure_after_archive_instead_of_stale_archive_hint() {
+    let sb = Sandbox::new("next-pending-closure");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "next-closure-thing", "--chore"])
+        .status
+        .success());
+    fill_artifacts(&sb, "next-closure-thing");
+    write_thing_spec(&sb, "next-closure-thing");
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(sb.mpd(&["archive", "--yes"]).status.success());
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+    assert!(!sb.dir.join(".mpd/current").exists());
+
+    let out = sb.mpd(&["next", "--harness", "generic"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(
+        !text.contains("Run `mpd archive` to fold specs into the record"),
+        "next must not repeat the pre-archive hint once already archived: {text}"
+    );
+    assert!(
+        text.contains("Release closure: pending (awaiting-commit)"),
+        "stdout={text}"
+    );
+
+    let json_out = json(&sb.mpd(&["next", "--harness", "generic", "--json"]));
+    assert_eq!(json_out["phase"], "done");
+    assert_eq!(json_out["archived"], true);
+    assert_eq!(
+        json_out["release_closure"]["pending_closure"]["stage"],
+        "awaiting-commit"
+    );
+    assert_eq!(
+        json_out["release_closure"]["pending_closure"]["write_eligible"],
+        false
     );
 }

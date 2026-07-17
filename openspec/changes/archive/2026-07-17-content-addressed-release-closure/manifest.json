@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "paths": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/**",
+    ".mpd/**",
+    "openspec/**",
+    "README.md"
+  ],
+  "shared_paths": [],
+  "publish": {
+    "remote": "origin",
+    "ref": "refs/heads/main"
+  }
+}

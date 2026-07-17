@@ -1,5 +1,6 @@
 //! Project-local mpd configuration (`.mpd/config.json`).
 
+use crate::closure::HermeticReusePolicy;
 use crate::ledger::{mpd_dir, RiskLevel, ThreatProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -38,6 +39,29 @@ pub struct Config {
     /// Fallback model per model id, e.g. `{"fable": "opus"}` — surfaced as a note.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_fallbacks: BTreeMap<String, String>,
+    /// Optional, explicit hermetic input declaration. Merely declaring this
+    /// does not grant reuse: all declared dependencies must be captured in a
+    /// receipt and match when reuse is requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hermetic_reuse: Option<HermeticReusePolicy>,
+    /// Release-closure defaults. Kept nested so publication and evidence
+    /// policy remain an explicit, reviewable namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure: Option<ClosureConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hermetic_reuse: Option<HermeticReusePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_path_list_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +76,29 @@ impl Config {
     /// The documentation subdirectory, defaulting to `docs`.
     pub fn docs_dir(&self) -> &str {
         self.docs_dir.as_deref().unwrap_or("docs")
+    }
+
+    pub fn hermetic_reuse_policy(&self) -> Option<&HermeticReusePolicy> {
+        self.closure
+            .as_ref()
+            .and_then(|c| c.hermetic_reuse.as_ref())
+            .or(self.hermetic_reuse.as_ref())
+    }
+
+    pub fn remote_timeout_secs(&self) -> u64 {
+        self.closure
+            .as_ref()
+            .and_then(|c| c.remote_timeout_secs)
+            .filter(|seconds| (1..=300).contains(seconds))
+            .unwrap_or(15)
+    }
+
+    pub fn human_path_list_limit(&self) -> usize {
+        self.closure
+            .as_ref()
+            .and_then(|c| c.human_path_list_limit)
+            .filter(|limit| (1..=1000).contains(limit))
+            .unwrap_or(50)
     }
 
     /// The configured model for a persona under a harness, if any and valid. An
@@ -224,6 +271,24 @@ mod tests {
             configured.governance.as_ref().unwrap().threat_profile,
             Some(ThreatProfile::CredentialBearing)
         );
+    }
+
+    #[test]
+    fn closure_defaults_validate_bounds_and_nested_hermetic_policy_wins() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"closure":{"default_remote":"origin","default_ref":"refs/heads/main","remote_timeout_secs":300,"human_path_list_limit":12,"hermetic_reuse":{"schema":1,"external_state":"none"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.remote_timeout_secs(), 300);
+        assert_eq!(cfg.human_path_list_limit(), 12);
+        assert!(cfg.hermetic_reuse_policy().is_some());
+
+        let invalid: Config = serde_json::from_str(
+            r#"{"closure":{"remote_timeout_secs":0,"human_path_list_limit":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(invalid.remote_timeout_secs(), 15);
+        assert_eq!(invalid.human_path_list_limit(), 50);
     }
 
     #[cfg(unix)]
