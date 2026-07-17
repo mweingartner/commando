@@ -1,0 +1,667 @@
+{
+  "change": "promote-to-strict",
+  "schema": "mpd",
+  "ui": false,
+  "kind": "feature",
+  "phase": "done",
+  "gates": {
+    "architecture": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "design.md#conditions-for-builder",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784321775,
+      "completed_at_epoch_secs": 1784321851,
+      "receipt": {
+        "id": "550564cbd93563f5c7636a892f8a52f502788bf3c795b8c971114606cb75c3e3",
+        "schema": 1,
+        "phase": "architecture",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "governance": "3eaf1d35c423f8f7871282c72ea53b78f834204f2f84b2dd2d5f1d665cb3d9d6",
+            "design-artifacts": "da7c467130140830503a07c9655b7593debb56e3787e2d02b049d25b377b85cc"
+          }
+        }
+      }
+    },
+    "security-plan": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "security-plan.md#verdict",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784321851,
+      "completed_at_epoch_secs": 1784321871,
+      "receipt": {
+        "id": "f02c074a66aa458ec64b556fc984586a50ff306de48ccdc74f6471afb6e7ccae",
+        "schema": 1,
+        "phase": "security-plan",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "source": "df5c664e54c432a3757aff3790471b42ab4b7a259520c776c86c5ddbf1043716",
+            "governance": "3eaf1d35c423f8f7871282c72ea53b78f834204f2f84b2dd2d5f1d665cb3d9d6",
+            "design-artifacts": "da7c467130140830503a07c9655b7593debb56e3787e2d02b049d25b377b85cc"
+          }
+        }
+      }
+    },
+    "build": {
+      "verdict": "pass",
+      "by": "Builder",
+      "evidence": "tasks.md#1-implement",
+      "checks": {
+        "tests_passed": 402,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784321872,
+      "completed_at_epoch_secs": 1784322094,
+      "receipt": {
+        "id": "2b5bf67d414624225828a882ea5de94d6a10bbae56c5a015f92a605dd4939a58",
+        "schema": 1,
+        "phase": "build",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "source": "b46b090faf5956c1626101c8d2fb3c45e2f56206f6b7340bda20042c25bf246d",
+            "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+            "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+            "produced-artifact": "b46b090faf5956c1626101c8d2fb3c45e2f56206f6b7340bda20042c25bf246d"
+          }
+        }
+      }
+    },
+    "security-code": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "security-code.md#verdict",
+      "checks": {
+        "secrets_clean": true,
+        "scanner": "builtin+gitleaks"
+      },
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784322102,
+      "completed_at_epoch_secs": 1784322146,
+      "receipt": {
+        "id": "965c1b98525c87e9a39fffad26cdbd61265b9d7d2b2f92ca9716959c22f9c1a7",
+        "schema": 1,
+        "phase": "security-code",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "source": "9f62f7147583d19e00cfbadd64bb350d499cffde66d1bc16fc18e48875f28610",
+            "governance": "3eaf1d35c423f8f7871282c72ea53b78f834204f2f84b2dd2d5f1d665cb3d9d6",
+            "design-artifacts": "da7c467130140830503a07c9655b7593debb56e3787e2d02b049d25b377b85cc",
+            "scanner-identity": "668f4bbf5c7cc646f92c8ced8ea28ebd07ba00afe3b95d21a08449df199a7224",
+            "allowlist-digest": "dbed088396a9c2b3a8f9a66e8c0ae90e17a871a982494f6ed29765330b4dd3a1"
+          }
+        }
+      }
+    },
+    "test": {
+      "verdict": "pass",
+      "by": "Tester",
+      "evidence": "test.md#verdict",
+      "checks": {
+        "tests_passed": 402,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784322153,
+      "completed_at_epoch_secs": 1784322173,
+      "receipt": {
+        "id": "97f7a0f5c337ba9f95d5a5e336bd9f8f53686fee98cfddf792647c137497ad36",
+        "schema": 1,
+        "phase": "test",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "source": "b827964e953729e5219559ee5be278fa3738c0c14c7c92608d7da1ff7ab1e832",
+            "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+            "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+            "produced-artifact": "b827964e953729e5219559ee5be278fa3738c0c14c7c92608d7da1ff7ab1e832"
+          }
+        }
+      }
+    },
+    "documentation": {
+      "verdict": "pass",
+      "by": "Documenter",
+      "evidence": "documentation.md",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784322181,
+      "completed_at_epoch_secs": 1784322228,
+      "receipt": {
+        "id": "08fdc3954586586bd3dd0c4dba095b56dcd3e1248256703db8541c9b305f903e",
+        "schema": 1,
+        "phase": "documentation",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "shipped-behavior": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+            "documentation": "7f5197319d7df1a252654a7102bf02f6e9266c93b6f5f9b6bd5a82fba304e1fb"
+          }
+        }
+      }
+    },
+    "deploy": {
+      "verdict": "pass",
+      "by": "main",
+      "evidence": "tasks.md#1-implement",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784322228,
+      "completed_at_epoch_secs": 1784322228,
+      "receipt": {
+        "id": "d49ffc2530d7ab1bd2c0d8175277af0dff55b4ec19203f418823a1d84d57c9fa",
+        "schema": 1,
+        "phase": "deploy",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "source": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+            "produced-artifact": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+            "deploy-command": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      }
+    },
+    "doc-validation": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "doc-validation.md#verdict",
+      "at": "2026-07-17",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784322228,
+      "completed_at_epoch_secs": 1784322228,
+      "receipt": {
+        "id": "442644b5dc7c91801b39f1a0dc3f1365e373f6c286216781a4ef9f7a1af23218",
+        "schema": 1,
+        "phase": "doc-validation",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+            "shipped-behavior": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+            "documentation": "7f5197319d7df1a252654a7102bf02f6e9266c93b6f5f9b6bd5a82fba304e1fb"
+          }
+        }
+      }
+    }
+  },
+  "conditions": [],
+  "history": [
+    {
+      "phase": "architecture",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect",
+        "evidence": "design.md#conditions-for-builder",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784321775,
+        "completed_at_epoch_secs": 1784321851,
+        "receipt": {
+          "id": "550564cbd93563f5c7636a892f8a52f502788bf3c795b8c971114606cb75c3e3",
+          "schema": 1,
+          "phase": "architecture",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "governance": "3eaf1d35c423f8f7871282c72ea53b78f834204f2f84b2dd2d5f1d665cb3d9d6",
+              "design-artifacts": "da7c467130140830503a07c9655b7593debb56e3787e2d02b049d25b377b85cc"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "security-plan",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "security-plan.md#verdict",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784321851,
+        "completed_at_epoch_secs": 1784321871,
+        "receipt": {
+          "id": "f02c074a66aa458ec64b556fc984586a50ff306de48ccdc74f6471afb6e7ccae",
+          "schema": 1,
+          "phase": "security-plan",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "source": "df5c664e54c432a3757aff3790471b42ab4b7a259520c776c86c5ddbf1043716",
+              "governance": "3eaf1d35c423f8f7871282c72ea53b78f834204f2f84b2dd2d5f1d665cb3d9d6",
+              "design-artifacts": "da7c467130140830503a07c9655b7593debb56e3787e2d02b049d25b377b85cc"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "build",
+      "record": {
+        "verdict": "pass",
+        "by": "Builder",
+        "evidence": "tasks.md#1-implement",
+        "checks": {
+          "tests_passed": 402,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784321872,
+        "completed_at_epoch_secs": 1784322094,
+        "receipt": {
+          "id": "2b5bf67d414624225828a882ea5de94d6a10bbae56c5a015f92a605dd4939a58",
+          "schema": 1,
+          "phase": "build",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "source": "b46b090faf5956c1626101c8d2fb3c45e2f56206f6b7340bda20042c25bf246d",
+              "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+              "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+              "produced-artifact": "b46b090faf5956c1626101c8d2fb3c45e2f56206f6b7340bda20042c25bf246d"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "security-code.md#verdict",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784322102,
+        "completed_at_epoch_secs": 1784322146,
+        "receipt": {
+          "id": "965c1b98525c87e9a39fffad26cdbd61265b9d7d2b2f92ca9716959c22f9c1a7",
+          "schema": 1,
+          "phase": "security-code",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "source": "9f62f7147583d19e00cfbadd64bb350d499cffde66d1bc16fc18e48875f28610",
+              "governance": "3eaf1d35c423f8f7871282c72ea53b78f834204f2f84b2dd2d5f1d665cb3d9d6",
+              "design-artifacts": "da7c467130140830503a07c9655b7593debb56e3787e2d02b049d25b377b85cc",
+              "scanner-identity": "668f4bbf5c7cc646f92c8ced8ea28ebd07ba00afe3b95d21a08449df199a7224",
+              "allowlist-digest": "dbed088396a9c2b3a8f9a66e8c0ae90e17a871a982494f6ed29765330b4dd3a1"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "test",
+      "record": {
+        "verdict": "pass",
+        "by": "Tester",
+        "evidence": "test.md#verdict",
+        "checks": {
+          "tests_passed": 402,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784322153,
+        "completed_at_epoch_secs": 1784322173,
+        "receipt": {
+          "id": "97f7a0f5c337ba9f95d5a5e336bd9f8f53686fee98cfddf792647c137497ad36",
+          "schema": 1,
+          "phase": "test",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "source": "b827964e953729e5219559ee5be278fa3738c0c14c7c92608d7da1ff7ab1e832",
+              "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+              "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+              "produced-artifact": "b827964e953729e5219559ee5be278fa3738c0c14c7c92608d7da1ff7ab1e832"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "documentation",
+      "record": {
+        "verdict": "pass",
+        "by": "Documenter",
+        "evidence": "documentation.md",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784322181,
+        "completed_at_epoch_secs": 1784322228,
+        "receipt": {
+          "id": "08fdc3954586586bd3dd0c4dba095b56dcd3e1248256703db8541c9b305f903e",
+          "schema": 1,
+          "phase": "documentation",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "shipped-behavior": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+              "documentation": "7f5197319d7df1a252654a7102bf02f6e9266c93b6f5f9b6bd5a82fba304e1fb"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main",
+        "evidence": "tasks.md#1-implement",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784322228,
+        "completed_at_epoch_secs": 1784322228,
+        "receipt": {
+          "id": "d49ffc2530d7ab1bd2c0d8175277af0dff55b4ec19203f418823a1d84d57c9fa",
+          "schema": 1,
+          "phase": "deploy",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "source": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+              "produced-artifact": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+              "deploy-command": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "doc-validation",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect",
+        "evidence": "doc-validation.md#verdict",
+        "at": "2026-07-17",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784322228,
+        "completed_at_epoch_secs": 1784322228,
+        "receipt": {
+          "id": "442644b5dc7c91801b39f1a0dc3f1365e373f6c286216781a4ef9f7a1af23218",
+          "schema": 1,
+          "phase": "doc-validation",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa0034edcf2413340bfe7991b9171b75eb3458b56a315f429b7ed71fa18f9876",
+              "shipped-behavior": "750349582a4a9fdbcc80e8f5583785ea8bc3e2e86cab0a3700d158e675413ae8",
+              "documentation": "7f5197319d7df1a252654a7102bf02f6e9266c93b6f5f9b6bd5a82fba304e1fb"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "governance": {
+    "risk": "low",
+    "threat_profile": "local-trusted-user",
+    "reconciliations": []
+  },
+  "strict": true,
+  "waivers": [],
+  "phase_started_at_epoch_secs": 1784322228,
+  "archive_closure": {
+    "base_commit": "b0cc5ed381b759aafe54f46e0404e0e0f519aec0",
+    "archive_path": "openspec/changes/archive/2026-07-17-promote-to-strict",
+    "transaction_id": "d308a72feda6a5ad173d40188682847699cb81e9392c261a9f193eb48ac26c34",
+    "allowed_paths": [
+      ".mpd/**",
+      ".mpd/state/promote-to-strict.json",
+      "Cargo.lock",
+      "Cargo.toml",
+      "README.md",
+      "crates/**",
+      "docs/promote-to-strict.md",
+      "openspec/**",
+      "openspec/changes/archive/2026-07-17-promote-to-strict",
+      "openspec/changes/promote-to-strict"
+    ],
+    "system_paths": [
+      ".mpd/.gitignore",
+      ".mpd/config.json",
+      ".mpd/directives/personas/architect.md",
+      ".mpd/directives/personas/builder.md",
+      ".mpd/directives/personas/designer.md",
+      ".mpd/directives/personas/documenter.md",
+      ".mpd/directives/personas/security.md",
+      ".mpd/directives/personas/tester.md",
+      ".mpd/directives/protocol.md",
+      ".mpd/secret-allowlist.json",
+      ".mpd/state/bundle-directives-configurable-models.json",
+      ".mpd/state/content-addressed-release-closure.json",
+      ".mpd/state/gate-history-and-guards.json",
+      ".mpd/state/improve-mpd-process-governance.json",
+      ".mpd/state/promote-to-strict.json",
+      ".mpd/state/self-enforcing-pipeline.json",
+      "Cargo.lock",
+      "Cargo.toml",
+      "README.md",
+      "crates/mpd/Cargo.toml",
+      "crates/mpd/assets/directives/personas/architect.md",
+      "crates/mpd/assets/directives/personas/builder.md",
+      "crates/mpd/assets/directives/personas/designer.md",
+      "crates/mpd/assets/directives/personas/documenter.md",
+      "crates/mpd/assets/directives/personas/security.md",
+      "crates/mpd/assets/directives/personas/tester.md",
+      "crates/mpd/assets/directives/protocol.md",
+      "crates/mpd/assets/mpd.schema.yaml",
+      "crates/mpd/assets/templates/design.md",
+      "crates/mpd/assets/templates/documentation.md",
+      "crates/mpd/assets/templates/judgment/design-review.md",
+      "crates/mpd/assets/templates/judgment/design-signoff.md",
+      "crates/mpd/assets/templates/judgment/doc-validation.md",
+      "crates/mpd/assets/templates/judgment/security-code.md",
+      "crates/mpd/assets/templates/judgment/security-plan.md",
+      "crates/mpd/assets/templates/judgment/test.md",
+      "crates/mpd/assets/templates/proposal.md",
+      "crates/mpd/assets/templates/spec.md",
+      "crates/mpd/assets/templates/tasks.md",
+      "crates/mpd/proptest-regressions/cli.txt",
+      "crates/mpd/src/allowlist.rs",
+      "crates/mpd/src/checks/mod.rs",
+      "crates/mpd/src/checks/secrets.rs",
+      "crates/mpd/src/checks/tests_runner.rs",
+      "crates/mpd/src/cli.rs",
+      "crates/mpd/src/closure.rs",
+      "crates/mpd/src/config.rs",
+      "crates/mpd/src/digest.rs",
+      "crates/mpd/src/directives.rs",
+      "crates/mpd/src/git.rs",
+      "crates/mpd/src/githooks.rs",
+      "crates/mpd/src/harness.rs",
+      "crates/mpd/src/ledger.rs",
+      "crates/mpd/src/main.rs",
+      "crates/mpd/src/pathmatch.rs",
+      "crates/mpd/src/personas.rs",
+      "crates/mpd/src/phase.rs",
+      "crates/mpd/src/scaffold.rs",
+      "crates/mpd/tests/e2e.rs",
+      "crates/openspec-core/Cargo.toml",
+      "crates/openspec-core/src/date.rs",
+      "crates/openspec-core/src/digest.rs",
+      "crates/openspec-core/src/error.rs",
+      "crates/openspec-core/src/lib.rs",
+      "crates/openspec-core/src/merge.rs",
+      "crates/openspec-core/src/model.rs",
+      "crates/openspec-core/src/names.rs",
+      "crates/openspec-core/src/parse.rs",
+      "crates/openspec-core/src/project.rs",
+      "crates/openspec-core/src/render.rs",
+      "crates/openspec-core/src/schema.rs",
+      "crates/openspec-core/src/transaction.rs",
+      "crates/openspec-core/src/validate.rs",
+      "crates/openspec-core/tests/fidelity.rs",
+      "crates/openspec-core/tests/fixtures/all-sections.delta.md",
+      "crates/openspec-core/tests/fixtures/cli-archive.spec.md",
+      "crates/openspec-core/tests/fixtures/fenced-torture.spec.md",
+      "crates/openspec-core/tests/fixtures/openspec-conventions.spec.md",
+      "crates/openspec-core/tests/fixtures/real-delta.cli-validate.md",
+      "crates/openspec-core/tests/fixtures/spec-driven.schema.yaml",
+      "crates/openspec-core/tests/merge_tests.rs",
+      "crates/openspec-core/tests/nonfunctional.rs",
+      "crates/openspec-core/tests/parse_edge_cases.rs",
+      "crates/openspec-core/tests/project_tests.rs",
+      "crates/openspec-core/tests/props.rs",
+      "crates/openspec-core/tests/security_tests.rs",
+      "docs/promote-to-strict.md",
+      "openspec/AGENTS.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/.openspec.yaml",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/design.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/documentation.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/proposal.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/specs/directives/spec.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/specs/model-config/spec.md",
+      "openspec/changes/archive/2026-07-13-bundle-directives-configurable-models/tasks.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/.openspec.yaml",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/design.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/documentation.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/proposal.md",
+      "openspec/changes/archive/2026-07-16-gate-history-and-guards/tasks.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/.openspec.yaml",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/design-signoff.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/design.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/doc-validation.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/documentation.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/proposal.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/security-code.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/security-plan.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/specs/directives/spec.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/specs/gate-evidence/spec.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/specs/process-governance/spec.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/tasks.md",
+      "openspec/changes/archive/2026-07-16-improve-mpd-process-governance/test.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/.openspec.yaml",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/archive-transaction.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/design.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/documentation.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/manifest.json",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/proposal.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/security-plan.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/specs/change-manifest/spec.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/specs/evidence-reuse/spec.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/specs/remote-parity/spec.md",
+      "openspec/changes/archive/2026-07-17-content-addressed-release-closure/tasks.md",
+      "openspec/changes/archive/2026-07-17-promote-to-strict",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/.openspec.yaml",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/design.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/doc-validation.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/documentation.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/manifest.json",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/proposal.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/security-code.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/security-plan.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/tasks.md",
+      "openspec/changes/archive/2026-07-17-self-enforcing-pipeline/test.md",
+      "openspec/changes/promote-to-strict",
+      "openspec/changes/promote-to-strict/.openspec.yaml",
+      "openspec/changes/promote-to-strict/design.md",
+      "openspec/changes/promote-to-strict/doc-validation.md",
+      "openspec/changes/promote-to-strict/documentation.md",
+      "openspec/changes/promote-to-strict/manifest.json",
+      "openspec/changes/promote-to-strict/proposal.md",
+      "openspec/changes/promote-to-strict/security-code.md",
+      "openspec/changes/promote-to-strict/security-plan.md",
+      "openspec/changes/promote-to-strict/tasks.md",
+      "openspec/changes/promote-to-strict/test.md",
+      "openspec/project.md",
+      "openspec/schemas/mpd/schema.yaml",
+      "openspec/schemas/mpd/templates/design.md",
+      "openspec/schemas/mpd/templates/documentation.md",
+      "openspec/schemas/mpd/templates/proposal.md",
+      "openspec/schemas/mpd/templates/spec.md",
+      "openspec/schemas/mpd/templates/tasks.md",
+      "openspec/specs/change-manifest/spec.md",
+      "openspec/specs/directives/spec.md",
+      "openspec/specs/evidence-reuse/spec.md",
+      "openspec/specs/gate-evidence/spec.md",
+      "openspec/specs/model-config/spec.md",
+      "openspec/specs/process-governance/spec.md",
+      "openspec/specs/remote-parity/spec.md"
+    ],
+    "post_archive_digest": "5212aa073238b646129598b32b74d4b04c7a5816a1ce547fe8bfa435a31a8839",
+    "archived_at": 1784322244
+  }
+}

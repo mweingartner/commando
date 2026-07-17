@@ -77,10 +77,11 @@ survived. A dropped call degrades loudly, not silently.\n\n\
 - `mpd gate <phase> --pass --waive-artifact \"reason\"` — waive the artifact \
 check (audited, loud WAIVED banner; never bypasses an objective gate or a FAIL).\n\
 - `mpd use <change>` — restore `.mpd/current` after it was cleared.\n\
-- `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent).\n\n\
-Strict is set once — at `conduct` or `begin --strict` — and is write-once: there \
-is no verb to promote an already-begun non-strict change to strict. Re-`begin` \
-under `conduct` instead.\n";
+- `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent).\n\
+- `mpd strict <change>` — promote an already-begun non-strict change to the \
+strict tier (monotonic, idempotent).\n\n\
+Strict is set at `conduct`/`begin --strict`, or later with `mpd strict <change>`, \
+and is write-once (no path sets it back to false) — a harness opts in once.\n";
 
 /// Outcome of an `init`.
 #[derive(Debug, Default)]

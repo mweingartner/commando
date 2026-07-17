@@ -246,6 +246,12 @@ enum Command {
         /// Change name to make current (must have a seeded ledger).
         change: String,
     },
+    /// Promote an already-begun change to the strict (orchestration) tier — its
+    /// judgment gates then enforce their artifacts. Monotonic and idempotent.
+    Strict {
+        /// Change name to promote (must have a seeded ledger).
+        change: String,
+    },
     /// Diagnose the project setup.
     Doctor {
         /// Emit machine-readable JSON.
@@ -381,6 +387,7 @@ pub fn run() -> i32 {
         Command::Publish { verify, json } => cmd_publish(verify, json),
         Command::Closure { command } => cmd_closure(command),
         Command::Use { change } => cmd_use(change),
+        Command::Strict { change } => cmd_strict(change),
         Command::Doctor { json, fix } => cmd_doctor(json, fix),
     };
     match result {
@@ -2980,6 +2987,31 @@ fn cmd_use(change: String) -> CmdResult {
     }
     ledger::set_current(&root, &change).map_err(|e| e.to_string())?;
     println!("Current change set to {change:?}.");
+    Ok(0)
+}
+
+/// `mpd strict <change>`: promote an already-begun change to the strict tier
+/// (design.md#conditions-for-builder). Mirrors `cmd_use`'s name-validation +
+/// ledger-existence check; mutates strictness ONLY through the monotonic
+/// `set_strict()` (never `strict=false`); idempotent when already strict; touches
+/// only the change's own ledger. The change name is charset-validated by
+/// `validate_change_name`, so it carries no control characters into output.
+fn cmd_strict(change: String) -> CmdResult {
+    let root = find_root()?;
+    openspec_core::validate_change_name(&change)?;
+    if !ledger::state_path(&root, &change).is_file() {
+        return Err(format!(
+            "no ledger for change {change:?}; run `mpd begin {change}` first"
+        ));
+    }
+    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    if ledger.strict {
+        println!("Change {change:?} is already strict — no change.");
+        return Ok(0);
+    }
+    ledger.set_strict();
+    ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+    println!("Promoted {change:?} to the strict tier: judgment gates now enforce their artifacts.");
     Ok(0)
 }
 

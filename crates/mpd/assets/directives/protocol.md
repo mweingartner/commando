@@ -77,10 +77,12 @@ one-command escape, so a refusal is never a dead-end:
 - `mpd use <change>` — restore `.mpd/current` after it was cleared.
 - `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent,
   fail-closed).
+- `mpd strict <change>` — promote an already-begun non-strict change to the
+  strict tier (monotonic, idempotent) so its judgment gates enforce their
+  artifacts.
 
-Strict is set once, at `conduct`/`begin --strict`, and is monotonic (no path sets
-it back to false). There is no verb to promote an already-begun non-strict change
-to strict without re-`begin`ing under `conduct` — the harness opts in once.
+Strict is set at `conduct`/`begin --strict`, or later with `mpd strict <change>`,
+and is monotonic (no path sets it back to false) — a harness opts in once.
 
 ## Proportional governance
 

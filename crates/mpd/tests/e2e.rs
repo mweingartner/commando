@@ -1163,6 +1163,70 @@ fn doctor_fix_fails_closed_on_symlinked_gitignore() {
     );
 }
 
+#[test]
+fn strict_verb_promotes_an_existing_change_and_turns_enforcement_on() {
+    // R1–R4: `mpd strict <change>` flips a non-strict change to strict
+    // (monotonic), is idempotent, errors on an unknown change, and after it a
+    // strict judgment gate enforces its artifact (a non-strict change would
+    // accept the same stub).
+    let sb = Sandbox::new("promote");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "later"]);
+
+    let strict_of = |sb: &Sandbox| -> bool {
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(sb.dir.join(".mpd/state/later.json")).unwrap(),
+        )
+        .unwrap();
+        v.get("strict").and_then(|s| s.as_bool()).unwrap_or(false)
+    };
+    assert!(!strict_of(&sb), "begin starts non-strict");
+
+    // Promote.
+    let out = sb.mpd(&["strict", "later"]);
+    assert!(
+        out.status.success(),
+        "promote failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("strict tier"), "{}", stdout(&out));
+    assert!(strict_of(&sb), "mpd strict must set ledger.strict = true");
+
+    // Idempotent no-op.
+    let again = sb.mpd(&["strict", "later"]);
+    assert!(again.status.success());
+    assert!(
+        stdout(&again).contains("already strict"),
+        "second promote must be an idempotent no-op: {}",
+        stdout(&again)
+    );
+
+    // Unknown change errors and creates no ledger.
+    let bad = sb.mpd(&["strict", "nope"]);
+    assert!(!bad.status.success(), "unknown change must error");
+    assert!(!sb.dir.join(".mpd/state/nope.json").exists());
+
+    // Enforcement is now ON: with the manifest made ready (so the refusal is the
+    // artifact check, not the manifest check), a strict judgment gate refuses
+    // the seeded stub design.md (still full of `<!-- -->` placeholders).
+    let mpath = sb.dir.join("openspec/changes/later/manifest.json");
+    let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    m["paths"] = serde_json::json!(["crates/**"]);
+    std::fs::write(&mpath, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(
+        !gate.status.success(),
+        "after promotion a strict gate must enforce the stub design.md: {}",
+        stdout(&gate)
+    );
+    let combined = format!("{}{}", stdout(&gate), String::from_utf8_lossy(&gate.stderr));
+    assert!(
+        combined.contains("design.md"),
+        "the refusal should name the design.md artifact: {combined}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn strict_symlinked_change_dir_is_refused_and_never_surfaced() {
