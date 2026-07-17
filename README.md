@@ -109,6 +109,8 @@ mpd init --test "cargo test"             # scaffolds openspec/, installs directi
 
 # 3. Start a change and let mpd drive
 mpd begin add-rate-limiter               # a feature (documented). --fix/--chore skip docs.
+#   … or `mpd conduct add-rate-limiter` to begin under the strict, self-enforcing
+#   tier — the front door for a model harness (see "Two tiers" below).
 # edit openspec/changes/add-rate-limiter/manifest.json to declare paths and publish target
 mpd next --harness claude-code           # prints the phase's persona, model, task, gate cmd
 mpd next --harness claude-code --full    # …and inlines the persona's full directive
@@ -143,10 +145,15 @@ top-level `hermetic_reuse` spelling remains readable for migration.
 
 ```
 mpd init [--test <cmd>]              # scaffold openspec/ + mpd schema + install the commit gate
-mpd begin <name> [--ui] [--fix|--chore] [--risk low|medium|high] [--threat-profile <profile>]
-mpd status [--change N] [--json]    # current phase, gate verdicts, tasks, archive readiness
-mpd next [--harness ...] [--full] [--json]  # emit the next persona's brief (generic | claude-code | codex)
-mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C] [--reuse RECEIPT]
+mpd begin <name> [--ui] [--fix|--chore] [--risk low|medium|high] [--threat-profile <profile>] [--strict]
+mpd conduct <name> [--ui] [--fix|--chore] [--risk ...] [--threat-profile ...]  # begin under the STRICT tier (the harness front door)
+mpd strict <name>                    # promote an already-begun change to the strict tier (monotonic)
+mpd use <name>                       # switch the "current change" pointer
+mpd status [--change N] [--json] [--brief]  # current phase, gate verdicts, tasks, archive readiness
+mpd next [--harness ...] [--full] [--context] [--json]  # emit the next persona's brief (generic | claude-code | codex)
+mpd brief <phase> [--change N]       # scaffold a phase's judgment-artifact template (the strict escape path)
+mpd gate <phase> --pass|--conditional|--fail [--evidence P] [--condition C] [--reuse RECEIPT] [--waive-artifact "reason"]
+mpd persona list|show|set|reset ...  # inspect/tune per-persona behavior (the interview primitives)
 mpd resolve <n> | --all             # close open CONDITIONAL-PASS conditions (they block archive)
 mpd reconcile --continue "reason"   # authorize one excess attempt; also --narrow/--risk/--threat-profile
 mpd check [--staged]                # run the secret scan now (+ external scanners/tests unless --staged)
@@ -155,7 +162,7 @@ mpd manifest init [--change N]       # seed a manifest without guessing its scop
 mpd closure recover [--yes] [--json] # preview or completion-only recover an interrupted archive
 mpd closure abandon [--yes] [--json] # remove owned transaction metadata after AwaitingCommit
 mpd publish [--verify] [--json]      # readiness/fresh parity observation; never push/fetch/deploy
-mpd doctor [--json]                 # diagnose setup (schema, directives, hook, scanners, test/deploy cmd, allowlist)
+mpd doctor [--json] [--fix]         # diagnose setup (schema, directives, hook, scanners, cmds, allowlist); --fix heals .mpd/.gitignore
 ```
 
 `--fix` (defect) and `--chore` (refactor/tooling/perf) mark non-functional
@@ -393,24 +400,111 @@ quietly edits `personas/security.md` to "PASS without scanning"). Directive read
 are symlink-refusing and size-capped, so a planted symlink can't redirect a read
 to an arbitrary file. `mpd doctor` reports whether directives are installed.
 
+## Two tiers: manual and self-enforcing
+
+`mpd` runs at one of two tiers, on the same phase machine:
+
+- **Manual** (`mpd begin`) — the raw verbs, lenient. You drive `next` → work →
+  `gate` yourself; a judgment `gate --pass` takes your word. This is the tier for
+  full control in a terminal against a local model.
+- **Self-enforcing / strict** (`mpd conduct`, or `mpd begin --strict`, or `mpd
+  strict <name>` to promote later) — **the front door a model harness should
+  use.** Under strict, the judgment gates (Security plan/code, Design
+  review/sign-off, Test, Doc Validation) will not PASS unless their **judgment
+  artifact** actually exists on disk and covers its required sections — the
+  adversarial record can't evaporate after the gate. `mpd next --context` tells the
+  harness the exact artifact path and gate command; `mpd brief <phase>` scaffolds a
+  template to fill. The one escape is `mpd gate <phase> --pass --waive-artifact
+  "reason"` — an audited, attempt-scoped waiver that never converts a FAIL, never
+  skips an objective check (tests/secret scan), and is surfaced loudly in `status`
+  and the archive summary. `mpd archive` re-checks every retained judgment artifact,
+  so a strict change is archived **with** its adversarial record or not at all.
+
+The `strict` bit is write-once and monotonic — there is no strict→manual path — so
+a resumed session keeps the enforcement it opted into. An untuned manual change is
+byte-identical to pre-strict `mpd`.
+
+## Per-persona tuning (behavior, not just model)
+
+Beyond the model, each persona's *behavior* is tunable in `.mpd/config.json`
+(`personas`), carried into the `mpd next` brief. The knobs are **strengthen-only**:
+
+- `rigor` (`standard | deep | paranoid`) — raises reasoning effort and, for review
+  personas, reviewer count. At `risk=high` the adversarial set (Security, Tester,
+  Doc Validation) is floored to deep effort regardless of any custom model pin.
+- `depth` (`examples | property | fuzz`) — the **Tester** only; a strengthen-only
+  test-emphasis overlay.
+- `directive_append` — a project instruction appended *after* the bundled directive
+  (never replacing it); the one **un-rankable** knob.
+
+```bash
+mpd persona show Security --json       # current value, range, baseline, danger — per field
+mpd persona set Security rigor paranoid
+mpd persona set Tester depth fuzz
+mpd persona set Security directive-append "Always check for IMAP cleartext."   # ⚠ warned + recorded
+mpd persona reset Security             # back to baseline (or `… reset Security rigor` for one field)
+```
+
+**Integrity by construction.** The ordinal menus have no sub-baseline term, so they
+cannot dial a persona weaker. The one un-rankable vector (a `directive_append`, or a
+hand-edited base directive) can't be proven rigor-preserving, so it is **recorded,
+never blocked**: a `weakened` flag on the brief and a `persona_tuning` stamp on the
+gate receipt, so a tuned PASS is never indistinguishable in the ledger from a
+full-rigor one. mpd never runs the model, so the stamp is a best-effort audit signal
+— the structural knobs and the retained strict artifact are the real teeth. An
+absent `personas` block is fully inert (byte-identical brief, `--json`, and ledger).
+
 ## Driving it from an agent harness
 
-`mpd` is harness-agnostic. To make the motion automatic, add a short block to
+`mpd` is harness-agnostic. To make the motion automatic, paste the block below into
 the file your agent reads — `AGENTS.md` (Codex, and the emerging standard) or
-`CLAUDE.md` (Claude Code) — telling it to drive changes through mpd:
+`CLAUDE.md` (Claude Code). It tells any harness how to drive mpd, including the
+self-enforcing loop and the persona-tuning interview:
 
-> For any non-trivial change: `mpd begin`, then loop `mpd next --harness <h>` → do
-> exactly what the brief says → `mpd gate <phase> --pass|--fail`, until
-> `mpd archive`. Author the OpenSpec artifacts under `openspec/changes/<name>/`
-> when a phase calls for them. Never bypass a FAIL gate or commit around the
-> pre-commit hook.
+> **Drive all non-trivial changes through `mpd` (a local binary; run `mpd --help`).**
+>
+> **Start:** `mpd conduct <name> [--ui] [--fix|--chore] [--risk low|medium|high]
+> [--threat-profile <p>]` — this begins the change under the strict, self-enforcing
+> tier. (`--ui` adds the Design phases; `--fix`/`--chore` skip Documentation.) Then
+> edit `openspec/changes/<name>/manifest.json` to declare the change's path scope.
+>
+> **Loop, every phase:** run `mpd next --harness <your-harness> --context`. It names
+> the persona, the model to run it on, the task, the required judgment-artifact path,
+> and the exact gate command. Do EXACTLY what the brief says as that persona (Claude
+> Code: spawn a subagent on the named model; Codex: adopt the persona, or a fresh
+> `codex --model <tier>`). Author the artifact it names under
+> `openspec/changes/<name>/` (use `mpd brief <phase>` to scaffold a template). Then
+> record the verdict: `mpd gate <phase> --pass --evidence <artifact>` (or
+> `--conditional --condition "…"`, or `--fail --class <c>` — a Security FAIL also
+> needs `--attacker/--capability/--boundary/--harm/--fix`). Repeat until
+> `mpd status` shows ready-to-archive.
+>
+> **Rules:** Never bypass a FAIL gate, never commit around the pre-commit hook,
+> never edit a gate ledger by hand. A material change re-enters at the earliest
+> affected phase. **Novel/risky surface** (auth, credentials, network egress, file
+> I/O on untrusted input, crypto, a feature with no analog shipped): raise
+> `--risk high`, run the Security phases at full depth, and do NOT fix Security
+> findings inline — re-run the Security gate after each fix. Apply the brief's
+> persona-tuning fields (`effort`, `reviewers`, `directive_append`) as emitted;
+> never re-read `.mpd/config.json` yourself.
+>
+> **Finish:** `mpd resolve --all` (close CONDITIONAL conditions) → `mpd archive
+> --yes` → commit + push with normal Git → `mpd publish --verify` (confirms exact
+> remote parity).
+>
+> **Persona-tuning interview** — when the user asks to tune how the personas behave:
+> for each persona (`Architect, Designer, Security, Builder, Tester, Documenter,
+> DocValidation`) read `mpd persona show <persona> --json` — it returns each field's
+> current value, allowed range, baseline, and a `dangerous` flag. Ask the user,
+> showing the current value and the range, and a clear ⚠ warning whenever they pick
+> the un-rankable `directive-append`. Record each answer with `mpd persona set
+> <persona> <field> <value>` (it validates the name + term and warns on the
+> dangerous knob) or `mpd persona reset <persona> [field]`. Then move on.
 
-`mpd next` then supplies each phase's persona, model, task, and gate command.
-Claude Code spawns each persona as a subagent on the model mpd names; Codex
-(single-agent) adopts each persona in turn, or runs a fresh `codex --model <t>`
-per phase. The git pre-commit hook enforces the secret gate regardless of which
-harness — or human — drives the commit, so the guarantee holds even for a
-harness that ignores mpd entirely.
+`mpd next` supplies each phase's persona, model, task, artifact, and gate command,
+so a human, Claude Code, or Codex all drive it identically. The git pre-commit hook
+enforces the secret gate regardless of which harness — or human — drives the commit,
+so the guarantee holds even for a harness that ignores mpd entirely.
 
 ## Build & test
 
