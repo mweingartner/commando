@@ -515,7 +515,7 @@ fn tree_digest_of(dir: &Path) -> io::Result<Digest> {
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
     match File::open(path) {
-        Ok(f) => f.sync_all(),
+        Ok(f) => io_fsync(&f, path),
         // A best-effort durability aid; a directory that vanished underneath
         // us is reported by the caller's own subsequent existence checks.
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -525,6 +525,94 @@ fn sync_dir(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn sync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+// =====================================================================
+// Durability-op seam (test-only fault injection)
+// =====================================================================
+//
+// Every durability-critical filesystem operation the transaction relies on —
+// file `sync_all`, directory fsync, and `rename` — is routed through one of
+// these two wrappers. In a production build they are `#[inline]` pass-throughs
+// with byte-identical codegen and zero overhead (no branch, no state read);
+// `#![forbid(unsafe_code)]` is preserved. Under `#[cfg(test)]` they first
+// consult a thread-local fault plan so a test can force one specific sync or
+// rename to fail with an I/O error and prove the transaction still fails closed
+// and stays recoverable. Process-restart simulation reconstructs a
+// *hypothesized* interruption point on disk; this seam instead exercises the
+// executor's real error-propagation path when the OS itself fails a durability
+// step (e.g. a `rename` that succeeds but whose following `sync_all` fails).
+
+#[cfg(not(test))]
+#[inline]
+fn io_fsync(f: &File, _path: &Path) -> io::Result<()> {
+    f.sync_all()
+}
+#[cfg(not(test))]
+#[inline]
+fn io_rename(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(test)]
+fn io_fsync(f: &File, path: &Path) -> io::Result<()> {
+    faults::check(faults::FaultOp::Fsync, path)?;
+    f.sync_all()
+}
+#[cfg(test)]
+fn io_rename(from: &Path, to: &Path) -> io::Result<()> {
+    // A rename is identified by the durable destination name it installs.
+    faults::check(faults::FaultOp::Rename, to)?;
+    fs::rename(from, to)
+}
+
+#[cfg(test)]
+mod faults {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::Path;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum FaultOp {
+        Fsync,
+        Rename,
+    }
+
+    thread_local! {
+        // (op, path-substring). The next matching durability op fails once.
+        static PLAN: RefCell<Option<(FaultOp, String)>> = const { RefCell::new(None) };
+    }
+
+    /// Disarms the thread-local fault on drop, so a fault — whether it fired or
+    /// not — can never leak into the next test sharing this worker thread.
+    #[must_use]
+    pub(super) struct Armed;
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            PLAN.with(|p| *p.borrow_mut() = None);
+        }
+    }
+
+    /// Arm: the next durability op of kind `op` whose path contains `substr`
+    /// fails once with an I/O error. The returned guard disarms on drop.
+    pub(super) fn fail_next(op: FaultOp, substr: &str) -> Armed {
+        PLAN.with(|p| *p.borrow_mut() = Some((op, substr.to_string())));
+        Armed
+    }
+
+    /// Consulted by the `io_*` wrappers before the real syscall.
+    pub(super) fn check(op: FaultOp, path: &Path) -> io::Result<()> {
+        PLAN.with(|p| {
+            let mut slot = p.borrow_mut();
+            if let Some((want, substr)) = slot.as_ref() {
+                if *want == op && path.to_string_lossy().contains(substr.as_str()) {
+                    *slot = None; // fire exactly once
+                    return Err(io::Error::other("injected durability failure"));
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 // =====================================================================
@@ -755,7 +843,7 @@ fn stage_one(path: &Path, bytes: &[u8], expect: &FileImage) -> TxResult<()> {
     {
         let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        io_fsync(&f, path)?;
     }
     // Enforce a stable, non-executable mode regardless of umask (every
     // postimage in this system is spec/doc/JSON text).
@@ -852,9 +940,9 @@ pub fn prepare(
         let json = serde_json::to_vec_pretty(plan)
             .map_err(|e| TransactionError::Corrupt(format!("cannot encode journal: {e}")))?;
         f.write_all(&json)?;
-        f.sync_all()?;
+        io_fsync(&f, &journal_tmp)?;
     }
-    fs::rename(&journal_tmp, &journal_final)?;
+    io_rename(&journal_tmp, &journal_final)?;
     sync_dir(&dir)?;
 
     let pointer = PendingClosurePointer {
@@ -887,9 +975,9 @@ fn write_pointer(root: &Path, pointer: &PendingClosurePointer) -> TxResult<()> {
         let json = serde_json::to_vec_pretty(pointer)
             .map_err(|e| TransactionError::Corrupt(format!("cannot encode pointer: {e}")))?;
         f.write_all(&json)?;
-        f.sync_all()?;
+        io_fsync(&f, &tmp_path)?;
     }
-    fs::rename(&tmp_path, &final_path)?;
+    io_rename(&tmp_path, &final_path)?;
     sync_dir(&dir)?;
     Ok(())
 }
@@ -1021,9 +1109,9 @@ fn replace_from_staged(root: &Path, t: &TransactionTarget) -> TxResult<()> {
     if let Some(parent) = target_full.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::rename(&staged_full, &target_full)?;
+    io_rename(&staged_full, &target_full)?;
     let f = open_non_following().open(&target_full)?;
-    f.sync_all()?;
+    io_fsync(&f, &target_full)?;
     drop(f);
     if let Some(parent) = target_full.parent() {
         sync_dir(parent)?;
@@ -1221,7 +1309,7 @@ fn apply_directory_move(root: &Path, mv: &DirectoryMove) -> TxResult<()> {
     if let Some(parent) = dest_full.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::rename(&source_full, &dest_full)?;
+    io_rename(&source_full, &dest_full)?;
     sync_dir(&dest_full)?;
     if let Some(parent) = dest_full.parent() {
         sync_dir(parent)?;
@@ -2512,5 +2600,149 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Forced durability-I/O failure (via the io_* seam; tasks.md 3.7
+    // "forced sync/rename failures"). Distinct from the process-restart
+    // crash tests above: these arm a thread-local fault so a real
+    // sync_all/rename returns Err mid-transaction, then assert the executor
+    // propagated the error, left NO partial/incorrect write, and that a clean
+    // re-run converges with no double-apply. The fault fires exactly once and
+    // its guard disarms on drop.
+    // -----------------------------------------------------------------
+    use faults::{fail_next, FaultOp};
+
+    #[test]
+    fn journal_fsync_failure_in_prepare_leaves_nothing_pending() {
+        let dir = tempdir();
+        init_project(dir.path());
+        let plan = build_sample(dir.path());
+        let contents = contents_for(&plan, dir.path());
+        {
+            let _g = fail_next(FaultOp::Fsync, "journal");
+            assert!(prepare(dir.path(), &plan, &contents).is_err());
+        }
+        // No durable pointer installed -> nothing to drive, no target touched.
+        assert!(!pointer_path(dir.path()).exists());
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::NothingPending);
+        assert!(!dir.path().join(&plan.targets[0].target).exists());
+        assert!(dir.path().join(&plan.directory_move.source).exists());
+        // A clean retry discards the orphan scratch and converges.
+        prepare(dir.path(), &plan, &contents).unwrap();
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+    }
+
+    #[test]
+    fn journal_rename_failure_in_prepare_leaves_nothing_pending() {
+        let dir = tempdir();
+        init_project(dir.path());
+        let plan = build_sample(dir.path());
+        let contents = contents_for(&plan, dir.path());
+        {
+            let _g = fail_next(FaultOp::Rename, "journal");
+            assert!(prepare(dir.path(), &plan, &contents).is_err());
+        }
+        assert!(!pointer_path(dir.path()).exists());
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::NothingPending);
+        assert!(!dir.path().join(&plan.targets[0].target).exists());
+        prepare(dir.path(), &plan, &contents).unwrap();
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+    }
+
+    #[test]
+    fn pointer_fsync_failure_in_prepare_installs_no_pointer_and_recovers() {
+        let dir = tempdir();
+        init_project(dir.path());
+        let plan = build_sample(dir.path());
+        let contents = contents_for(&plan, dir.path());
+        {
+            let _g = fail_next(FaultOp::Fsync, "pending-closure");
+            assert!(prepare(dir.path(), &plan, &contents).is_err());
+        }
+        // The journal may be durable, but with no installed pointer recovery
+        // must never guess: fail closed, no target touched.
+        assert!(!pointer_path(dir.path()).exists());
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::NothingPending);
+        assert!(!dir.path().join(&plan.targets[0].target).exists());
+        prepare(dir.path(), &plan, &contents).unwrap();
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+    }
+
+    #[test]
+    fn target_rename_failure_during_drive_reapplies_cleanly() {
+        let dir = tempdir();
+        init_project(dir.path());
+        let plan = build_sample(dir.path());
+        let contents = contents_for(&plan, dir.path());
+        prepare(dir.path(), &plan, &contents).unwrap();
+        let target = plan.targets[0].target.clone();
+        {
+            let _g = fail_next(FaultOp::Rename, &target);
+            assert!(drive(dir.path()).is_err());
+        }
+        // The rename never took effect: the target is still absent (its
+        // preimage) and the staged postimage is intact.
+        assert!(!dir.path().join(&target).exists());
+        assert!(dir.path().join(&plan.targets[0].staged).exists());
+        // A clean re-drive applies from the exact preimage+staged and converges.
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&target)).unwrap(),
+            "# Thing\n\n## Requirements\n"
+        );
+    }
+
+    #[test]
+    fn target_fsync_failure_after_rename_is_already_postimage_on_redrive() {
+        // The crown-jewel case: the rename SUCCEEDED but its following sync_all
+        // FAILED. The target is now its postimage (renamed, just not fsynced)
+        // and the staged file was consumed. A re-drive must classify the target
+        // AlreadyPostimage and never attempt a second rename (which would fail,
+        // the staged source being gone) nor double-apply.
+        let dir = tempdir();
+        init_project(dir.path());
+        let plan = build_sample(dir.path());
+        let contents = contents_for(&plan, dir.path());
+        prepare(dir.path(), &plan, &contents).unwrap();
+        let target = plan.targets[0].target.clone();
+        {
+            let _g = fail_next(FaultOp::Fsync, &target);
+            assert!(drive(dir.path()).is_err());
+        }
+        // Rename applied; staged consumed.
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&target)).unwrap(),
+            "# Thing\n\n## Requirements\n"
+        );
+        assert!(!dir.path().join(&plan.targets[0].staged).exists());
+        // Re-drive is AlreadyPostimage (no second rename) and idempotent.
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(&target)).unwrap(),
+            "# Thing\n\n## Requirements\n"
+        );
+    }
+
+    #[test]
+    fn directory_move_rename_failure_during_drive_reapplies_cleanly() {
+        let dir = tempdir();
+        init_project(dir.path());
+        let plan = build_sample(dir.path());
+        let contents = contents_for(&plan, dir.path());
+        prepare(dir.path(), &plan, &contents).unwrap();
+        let dest = plan.directory_move.destination.clone();
+        {
+            let _g = fail_next(FaultOp::Rename, &dest);
+            assert!(drive(dir.path()).is_err());
+        }
+        // The move never took effect: source dir intact, destination absent.
+        assert!(dir.path().join(&plan.directory_move.source).exists());
+        assert!(!dir.path().join(&dest).exists());
+        // Re-drive completes the move (NeedsMove) and converges.
+        assert_eq!(drive(dir.path()).unwrap(), DriveOutcome::AwaitingCommit);
+        assert!(dir.path().join(&dest).exists());
+        assert!(!dir.path().join(&plan.directory_move.source).exists());
     }
 }
