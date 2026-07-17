@@ -5,7 +5,7 @@ use crate::checks::{self, tests_runner};
 use crate::config::Config;
 use crate::ledger::{
     self, bounded_text, ChangeKind, CheckSummary, Condition, Exploitability, FailureClass,
-    GateRecord, Governance, ReconciliationKind, RiskLevel, ThreatProfile, Verdict,
+    GateRecord, Governance, ReconciliationKind, RiskLevel, ThreatProfile, Verdict, Waiver,
 };
 use crate::phase::Phase;
 use crate::{closure, digest, git, githooks, harness, scaffold};
@@ -50,6 +50,40 @@ enum Command {
         /// Credible threat boundary for this change.
         #[arg(long = "threat-profile")]
         threat_profile: Option<String>,
+        /// Run under the strict (self-enforcing) tier — the same bit `conduct`
+        /// sets. Gate-enforces judgment artifacts; survives session death.
+        #[arg(long)]
+        strict: bool,
+    },
+    /// Begin a change under the strict tier: begin + strict + a seeded judgment
+    /// stub + the harness call-loop contract. The way a harness drives mpd.
+    Conduct {
+        /// Change name (lowercase kebab-case).
+        name: String,
+        /// Mark the change as having a UI/UX surface (enables design phases).
+        #[arg(long)]
+        ui: bool,
+        /// A defect fix — skips the Documentation phases.
+        #[arg(long)]
+        fix: bool,
+        /// A non-functional chore (refactor/tooling/perf) — skips Documentation.
+        #[arg(long)]
+        chore: bool,
+        /// Review rigor (`low`, `medium`, or `high`).
+        #[arg(long)]
+        risk: Option<String>,
+        /// Credible threat boundary for this change.
+        #[arg(long = "threat-profile")]
+        threat_profile: Option<String>,
+    },
+    /// Scaffold a phase's judgment-artifact template into the change dir (the
+    /// strict-mode escape path — fills a stub you then author).
+    Brief {
+        /// Phase slug (e.g. `security-code`, `test`, `design-review`).
+        phase: String,
+        /// Change (defaults to the current change).
+        #[arg(long)]
+        change: Option<String>,
     },
     /// Show the current phase, gate verdicts, and readiness.
     Status {
@@ -59,6 +93,10 @@ enum Command {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+        /// Print a compact one-block summary (phase, governance, readiness, next
+        /// command) instead of the full report. `--json` is unaffected.
+        #[arg(long)]
+        brief: bool,
     },
     /// Emit the next persona's brief for the current phase.
     Next {
@@ -75,6 +113,13 @@ enum Command {
         /// bundled default) so the brief is self-sufficient.
         #[arg(long)]
         full: bool,
+        /// Emit only the phase slice — the active persona directive, the change's
+        /// manifest scope, the extracted `## Conditions for Builder` block, and
+        /// the upstream artifact pointers — instead of the full brief; `--json`
+        /// additionally carries `artifact_path` + the strict `gate_command`. Cuts
+        /// harness context load (design.md goal / task 3.2).
+        #[arg(long)]
+        context: bool,
     },
     /// Record a gate verdict (runs deterministic checks for enforcement phases).
     Gate {
@@ -117,6 +162,15 @@ enum Command {
         /// Explicitly reuse an exact, valid executed evidence receipt.
         #[arg(long)]
         reuse: Option<String>,
+        /// Strict tier only: waive this phase's judgment-artifact check with a
+        /// bounded reason (audited; never bypasses an objective gate or a FAIL).
+        #[arg(long = "waive-artifact")]
+        waive_artifact: Option<String>,
+        /// Autonomous mode: a `--waive-artifact` on a Security phase is a judgment
+        /// call reserved for a human — refuse it (halt-and-report) rather than
+        /// self-authorize it (design.md D7 / Cond 12).
+        #[arg(long)]
+        autonomous: bool,
     },
     /// Record a bounded human decision before an excess review attempt.
     Reconcile {
@@ -130,6 +184,11 @@ enum Command {
         threat_profile: Option<Vec<String>>,
         #[arg(long)]
         change: Option<String>,
+        /// Autonomous mode: proceed on `--continue`/`--narrow`/a `--risk` upgrade,
+        /// but refuse (halt-and-report) any threat-profile change or `--risk`
+        /// downgrade — those weaken rigor and require a human (Cond 12).
+        #[arg(long)]
+        autonomous: bool,
     },
     /// Close open conditions from a CONDITIONAL PASS (they block archive).
     Resolve {
@@ -181,11 +240,21 @@ enum Command {
         #[command(subcommand)]
         command: ClosureCommand,
     },
+    /// Point `.mpd/current` at an existing change — recovers a cleared pointer
+    /// (e.g. after `mpd closure abandon` or an archive that reset it).
+    Use {
+        /// Change name to make current (must have a seeded ledger).
+        change: String,
+    },
     /// Diagnose the project setup.
     Doctor {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
+        /// Heal a missing/incomplete `.mpd/.gitignore` (add-only; fails closed
+        /// on a symlinked/oversized file; never touches config.json).
+        #[arg(long)]
+        fix: bool,
     },
 }
 
@@ -226,14 +295,29 @@ pub fn run() -> i32 {
             chore,
             risk,
             threat_profile,
-        } => cmd_begin(name, ui, fix, chore, risk, threat_profile),
-        Command::Status { change, json } => cmd_status(change, json),
+            strict,
+        } => cmd_begin(name, ui, fix, chore, risk, threat_profile, strict),
+        Command::Conduct {
+            name,
+            ui,
+            fix,
+            chore,
+            risk,
+            threat_profile,
+        } => cmd_conduct(name, ui, fix, chore, risk, threat_profile),
+        Command::Brief { phase, change } => cmd_brief(phase, change),
+        Command::Status {
+            change,
+            json,
+            brief,
+        } => cmd_status(change, json, brief),
         Command::Next {
             change,
             harness,
             json,
             full,
-        } => cmd_next(change, harness, json, full),
+            context,
+        } => cmd_next(change, harness, json, full, context),
         Command::Gate {
             phase,
             change,
@@ -250,6 +334,8 @@ pub fn run() -> i32 {
             harm,
             exact_fix,
             reuse,
+            waive_artifact,
+            autonomous,
         } => cmd_gate(
             phase,
             change,
@@ -266,6 +352,8 @@ pub fn run() -> i32 {
             harm,
             exact_fix,
             reuse,
+            waive_artifact,
+            autonomous,
         ),
         Command::Reconcile {
             continue_reason,
@@ -273,7 +361,15 @@ pub fn run() -> i32 {
             risk,
             threat_profile,
             change,
-        } => cmd_reconcile(continue_reason, narrow, risk, threat_profile, change),
+            autonomous,
+        } => cmd_reconcile(
+            continue_reason,
+            narrow,
+            risk,
+            threat_profile,
+            change,
+            autonomous,
+        ),
         Command::Resolve { index, all, change } => cmd_resolve(index, all, change),
         Command::Check { staged, quiet } => cmd_check(staged, quiet),
         Command::Archive {
@@ -284,7 +380,8 @@ pub fn run() -> i32 {
         Command::Manifest { command } => cmd_manifest(command),
         Command::Publish { verify, json } => cmd_publish(verify, json),
         Command::Closure { command } => cmd_closure(command),
-        Command::Doctor { json } => cmd_doctor(json),
+        Command::Use { change } => cmd_use(change),
+        Command::Doctor { json, fix } => cmd_doctor(json, fix),
     };
     match result {
         Ok(code) => code,
@@ -345,6 +442,7 @@ fn cmd_init(test: Option<String>) -> CmdResult {
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_begin(
     name: String,
     ui: bool,
@@ -352,6 +450,7 @@ fn cmd_begin(
     chore: bool,
     risk: Option<String>,
     threat_profile: Option<String>,
+    strict: bool,
 ) -> CmdResult {
     let kind = match (fix, chore) {
         (false, false) => ChangeKind::Feature,
@@ -397,7 +496,8 @@ fn cmd_begin(
         threat_profile,
         reconciliations: vec![],
     };
-    let ledger = scaffold::begin(&root, &name, ui, kind, governance).map_err(|e| e.to_string())?;
+    let mut ledger =
+        scaffold::begin(&root, &name, ui, kind, governance).map_err(|e| e.to_string())?;
     println!(
         "Started change {:?} (kind: {}, ui: {}). Current phase: {}.",
         name,
@@ -415,7 +515,86 @@ fn cmd_begin(
             kind.label()
         );
     }
+    // The strict tier is a durable, per-change bit (`conduct` and `begin --strict`
+    // are the only setters). Turn it on, persist it, and seed the current phase's
+    // judgment stub so the very first gate has an artifact to author.
+    if strict {
+        ledger.set_strict();
+        ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+        if let Some(created) = scaffold::seed_judgment_template(&root, &name, ledger.phase)
+            .map_err(|e| e.to_string())?
+        {
+            println!(
+                "  + {created} (seeded {} judgment stub)",
+                ledger.phase.label()
+            );
+        }
+        println!(
+            "Strict tier ON: judgment artifacts are gate-enforced. \
+             Escape: `mpd brief <phase>` scaffolds a stub; \
+             `mpd gate <phase> --pass --waive-artifact \"reason\"` waives (audited)."
+        );
+    }
     println!("Next: mpd next");
+    Ok(0)
+}
+
+/// `mpd conduct` — the harness entry point: `begin` under the strict tier, plus
+/// the call-loop contract so an orchestrator knows the exact verb sequence.
+fn cmd_conduct(
+    name: String,
+    ui: bool,
+    fix: bool,
+    chore: bool,
+    risk: Option<String>,
+    threat_profile: Option<String>,
+) -> CmdResult {
+    let name_for_contract = name.clone();
+    let code = cmd_begin(name, ui, fix, chore, risk, threat_profile, true)?;
+    print_conduct_contract(&name_for_contract);
+    Ok(code)
+}
+
+/// Print the harness call-loop contract (design.md D2): the fixed `next → spawn →
+/// gate` motion over the unchanged verbs, so a dropped call never silently
+/// degrades a strict run.
+fn print_conduct_contract(name: &str) {
+    println!("\nStrict harness call-loop (drive mpd with the unchanged verbs):");
+    println!("  loop:");
+    println!(
+        "    brief=$(mpd next --harness claude-code --context --json)  \
+         # slice + persona + model + artifact_path + gate_command"
+    );
+    println!("    break if brief.phase == \"done\"");
+    println!("    # spawn the persona at brief.model, fill brief.artifact_path, do the work");
+    println!(
+        "    mpd gate <phase> --pass --evidence <artifact_path>        \
+         # strict checks auto-apply from ledger.strict"
+    );
+    println!("  mpd archive --yes");
+    println!("\nStarted {name:?} under the strict tier. Next: mpd next");
+}
+
+/// `mpd brief <phase>` — scaffold a phase's judgment-artifact template into the
+/// change dir if absent (the strict-mode escape path; never overwrites authored
+/// content). Universal: works in both tiers.
+fn cmd_brief(phase: String, change: Option<String>) -> CmdResult {
+    let root = find_root()?;
+    let change = resolve_change(&root, change)?;
+    let phase = Phase::from_slug(&phase).ok_or_else(|| format!("unknown phase {phase:?}"))?;
+    if phase.judgment_artifact().is_none() {
+        return Err(format!(
+            "phase {:?} has no judgment artifact to scaffold",
+            phase.slug()
+        ));
+    }
+    match scaffold::seed_judgment_template(&root, &change, phase).map_err(|e| e.to_string())? {
+        Some(created) => println!("  + {created} (seeded {} judgment stub)", phase.label()),
+        None => println!(
+            "{}'s judgment artifact already exists — left untouched.",
+            phase.label()
+        ),
+    }
     Ok(0)
 }
 
@@ -539,7 +718,7 @@ fn manifest_view(root: &Path, change: &str) -> ManifestView {
     }
 }
 
-fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
+fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
@@ -616,6 +795,39 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
         return Ok(0);
     }
 
+    // `--brief`: a compact one-block summary for a quick glance or a low-context
+    // harness poll. `--json` (handled above) is unaffected.
+    if brief {
+        println!(
+            "Change: {}  phase: {}  ({} tier)",
+            ledger.change,
+            ledger.phase.label(),
+            if ledger.strict { "strict" } else { "manual" }
+        );
+        println!(
+            "Governance: risk {}, threat profile {} — review attempt {}/{}",
+            ledger.governance.risk,
+            ledger.governance.threat_profile,
+            ledger.next_attempt(ledger.phase),
+            ledger.governance.risk.attempt_limit()
+        );
+        if ready {
+            println!("Ready to archive: yes  →  mpd archive --yes");
+        } else {
+            println!("Ready to archive: no ({} reason(s))", reasons.len());
+            for r in reasons.iter().take(3) {
+                println!("  - {r}");
+            }
+            if reasons.len() > 3 {
+                println!("  … {} more (run `mpd status`)", reasons.len() - 3);
+            }
+            if ledger.phase != Phase::Done {
+                println!("→ next: mpd next");
+            }
+        }
+        return Ok(0);
+    }
+
     println!("Change: {}  (ui: {})", ledger.change, ledger.ui);
     println!(
         "Governance: risk {}, threat profile {}",
@@ -662,7 +874,15 @@ fn cmd_status(change: Option<String>, json: bool) -> CmdResult {
             .any(|e| e.record.verdict == Verdict::Fail)
     {
         println!("\nGate history:");
-        for ev in &ledger.history {
+        // Window to the most recent events so a long-lived change (many retries)
+        // does not flood the terminal; the full trail is always in `--json`.
+        const HISTORY_WINDOW: usize = 12;
+        let total = ledger.history.len();
+        let skip = total.saturating_sub(HISTORY_WINDOW);
+        if skip > 0 {
+            println!("  … {skip} earlier event(s) omitted (see `mpd status --json`)");
+        }
+        for ev in ledger.history.iter().skip(skip) {
             let v = match ev.record.verdict {
                 Verdict::Pass => "PASS",
                 Verdict::ConditionalPass => "COND",
@@ -826,7 +1046,13 @@ fn print_release_closure_facts(facts: &serde_json::Value) {
     }
 }
 
-fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool) -> CmdResult {
+fn cmd_next(
+    change: Option<String>,
+    harness_kind: String,
+    json: bool,
+    full: bool,
+    context: bool,
+) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
@@ -869,6 +1095,7 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool
         ledger.phase,
         &harness_kind,
         &ledger.governance,
+        ledger.strict,
         ledger.next_attempt(ledger.phase),
         !ledger.attempt_authorized(ledger.phase),
         ledger
@@ -931,9 +1158,30 @@ fn cmd_next(change: Option<String>, harness_kind: String, json: bool, full: bool
                 .collect();
             v["directives"] = serde_json::json!(arr);
         }
+        // `--context` enriches the machine envelope with the phase's judgment
+        // artifact path and the strict `gate_command` (design.md D2 loop): a
+        // harness reads `artifact_path`, fills it, then records the exact strict
+        // gate. Both are omitted without `--context` so the default envelope is
+        // unchanged.
+        if context {
+            v["artifact_path"] = match ledger.phase.judgment_artifact() {
+                Some((f, _)) => serde_json::Value::String(f.to_string()),
+                None => serde_json::Value::Null,
+            };
+            v["gate_command"] = serde_json::Value::String(strict_gate_command(ledger.phase));
+        }
         v["evidence"] = evidence_hint.clone().unwrap_or(serde_json::Value::Null);
         v["release_closure"] = release_closure;
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        return Ok(0);
+    }
+
+    // `--context` (text): emit ONLY the phase slice — persona + model, the
+    // upstream artifact pointers, the manifest scope, the extracted
+    // `## Conditions for Builder` block, and the active persona directive —
+    // instead of the full brief, to cut a harness's context load (task 3.2).
+    if context {
+        render_context_slice(&root, &change, &ledger, &brief);
         return Ok(0);
     }
 
@@ -986,7 +1234,7 @@ fn cmd_gate(
     pass: bool,
     conditional: bool,
     fail: bool,
-    evidence: Option<String>,
+    mut evidence: Option<String>,
     by: Option<String>,
     conditions: Vec<String>,
     failure_class: Option<String>,
@@ -996,6 +1244,8 @@ fn cmd_gate(
     harm: Option<String>,
     exact_fix: Option<String>,
     reuse: Option<String>,
+    waive_artifact: Option<String>,
+    autonomous: bool,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
@@ -1012,6 +1262,43 @@ fn cmd_gate(
                     .into(),
             )
         }
+    };
+
+    // Strict-tier waiver validation (Cond 17), at the TOP alongside the
+    // `--reuse requires --pass` rule above: a waiver never combines with `--reuse`
+    // (the reuse seam must not skip the autonomous halt or the artifact check),
+    // requires `--pass` (it can never convert a FAIL), and is meaningless on a
+    // phase with no judgment artifact. The reason is bounded here so an invalid
+    // reason is rejected before it could suppress any check.
+    let waiver_reason = match &waive_artifact {
+        Some(raw) => {
+            if reuse.is_some() {
+                return Err("--waive-artifact cannot combine with --reuse".into());
+            }
+            if !pass {
+                return Err("--waive-artifact requires --pass".into());
+            }
+            if phase.judgment_artifact().is_none() {
+                return Err(format!(
+                    "--waive-artifact is invalid on {}: it has no judgment artifact to waive",
+                    phase.label()
+                ));
+            }
+            // Under --autonomous, waiving a SECURITY phase's artifact is a judgment
+            // call reserved for a human — halt-and-report rather than self-waive
+            // (design.md D7 / Cond 12). Non-Security judgment phases may still be
+            // waived autonomously. Checked here, before any state mutation.
+            if autonomous && matches!(phase, Phase::SecurityPlan | Phase::SecurityCode) {
+                return Ok(autonomous_halt(&format!(
+                    "waiving the {} judgment artifact requires a human decision; \
+                     re-run without --autonomous or author it (`mpd brief {}`)",
+                    phase.label(),
+                    phase.slug()
+                )));
+            }
+            Some(bounded_text(raw, "waiver reason")?)
+        }
+        None => None,
     };
 
     let exploit_fields_present = [&attacker, &capability, &boundary, &harm, &exact_fix]
@@ -1042,6 +1329,15 @@ fn cmd_gate(
     };
 
     let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    // A waiver only means something in the strict tier — it waives the strict
+    // judgment-artifact check. Refuse it on a manual-tier change rather than
+    // record a phantom waiver, so the manual tier stays byte-identical (D3/R1).
+    if waiver_reason.is_some() && !ledger.strict {
+        return Err(
+            "--waive-artifact requires the strict tier (start with `mpd conduct` or `mpd begin --strict`)"
+                .into(),
+        );
+    }
     if reuse.is_none() && !ledger.attempt_authorized(phase) {
         return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), ledger.governance.risk));
     }
@@ -1063,6 +1359,18 @@ fn cmd_gate(
     // Reuse is a distinct append-only gate event. It never runs checks and
     // only accepts the original executed receipt for this exact phase.
     if let Some(receipt_hex) = reuse {
+        // Cond 13: the reuse path returns before the `advances()` block, so in
+        // strict mode the phase's OWN judgment artifact must still exist and pass
+        // the structural check here — otherwise reuse bypasses the anti-evaporation
+        // guarantee at gate time. Run it first so an incomplete artifact refuses
+        // deterministically, ahead of receipt evaluation. A waiver cannot reach
+        // this path (waive + reuse is rejected at the top).
+        if ledger.strict {
+            if let Some(msg) = strict_artifact_issues(&root, &change, phase, ledger.governance.risk)
+            {
+                return Ok(gate_blocked(&msg));
+            }
+        }
         let requested = crate::digest::Digest::from_hex(&receipt_hex)?;
         let origin = ledger
             .history
@@ -1127,8 +1435,20 @@ fn cmd_gate(
             println!("Running tests: {cmd}");
             let outcome = tests_runner::run(&cmd, &root);
             if !outcome.verified() {
+                // When the command exited 0 but no pass count was recognized, the
+                // failure is easy to mistake for a broken gate — spell out the
+                // cause so a `"test": "true"` placeholder is diagnosable from
+                // stderr alone. A genuine failure (a real count, non-zero exit)
+                // keeps the bare summary.
+                let hint = if !matches!(outcome.passed, Some(n) if n > 0) {
+                    "\n  hint: the runner emitted no recognizable pass count; a \
+                     placeholder like `true` always refuses — point \"test\" at a \
+                     real suite that prints a pass count."
+                } else {
+                    ""
+                };
                 return Ok(gate_blocked(&format!(
-                    "{} gate refused: {} (command: {})",
+                    "{} gate refused: {} (command: {}){hint}",
                     phase.label(),
                     outcome.summary,
                     outcome.command
@@ -1189,7 +1509,7 @@ fn cmd_gate(
                 .join("documentation.md");
             // Symlink-refusing, size-capped read (a symlinked doc yields "" and
             // fails the structural check — never exfiltrated).
-            let text = openspec_core::read_capped(&path).unwrap_or_default();
+            let text = read_contained(&root, &path);
             let issues = check_documentation(&text);
             if !issues.is_empty() {
                 for issue in &issues {
@@ -1221,6 +1541,49 @@ fn cmd_gate(
                     .command = Some(outcome.command);
             }
         }
+        // Strict tier (fires only when `ledger.strict`; the manual tier is inert
+        // and byte-identical to today). This runs AFTER every objective gate
+        // above, so a waiver can never skip tests/secret/doc/deploy (Cond 5).
+        if ledger.strict {
+            // `--evidence` must resolve to a real contained file — its OWN
+            // artifact for a judgment phase — and defaults to that artifact when
+            // omitted. Validation is metadata-only; it never reads content into
+            // output (Cond 2).
+            evidence = validate_evidence(&root, &change, phase, evidence)?;
+            // A validly-scoped waiver for this phase + attempt (recorded by this
+            // very invocation, or already on file for this attempt) skips the
+            // judgment-artifact structural check — nothing else (Cond 5, Cond 15).
+            let waived = waiver_reason.is_some()
+                || ledger
+                    .waivers
+                    .iter()
+                    .any(|w| w.phase == phase && w.attempt == attempt);
+            if !waived {
+                if let Some(msg) =
+                    strict_artifact_issues(&root, &change, phase, ledger.governance.risk)
+                {
+                    return Ok(gate_blocked(&msg));
+                }
+            }
+        }
+    }
+
+    // Record an attempt-scoped waiver (append-only) once every objective gate and
+    // the strict evidence check have passed. A waiver only reaches here on a
+    // PASS (Cond 17), so it can never convert a FAIL; it is surfaced loudly and
+    // counted in the archive audit summary, but bypasses no objective gate (Cond 5).
+    if let Some(reason) = waiver_reason {
+        println!(
+            "  ⚠ WAIVED: {} judgment-artifact check waived — {} (attempt {attempt}, audited).",
+            phase.label(),
+            harness::terminal_safe(&reason)
+        );
+        ledger.waivers.push(Waiver {
+            phase,
+            reason,
+            attempt,
+            at_epoch_secs: completed,
+        });
     }
 
     let by = by.unwrap_or_else(|| phase.persona().name.to_string());
@@ -1287,6 +1650,7 @@ fn cmd_reconcile(
     risk: Option<Vec<String>>,
     threat_profile: Option<Vec<String>>,
     change: Option<String>,
+    autonomous: bool,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
@@ -1312,6 +1676,30 @@ fn cmd_reconcile(
             Some(v[0].clone()),
         )
     };
+    // Under --autonomous, only rigor-neutral or rigor-*strengthening* moves may
+    // proceed: --continue/--narrow, and a --risk UPGRADE. ANY threat-profile
+    // change (the enum is unordered — every change could weaken a boundary) and
+    // any --risk DOWNGRADE halt-and-report for a human (design.md D7 / Cond 12).
+    // Evaluated before `reconcile` mutates anything.
+    if autonomous {
+        match kind {
+            ReconciliationKind::ThreatProfile => {
+                return Ok(autonomous_halt(
+                    "a threat-profile change re-frames the security review — a human must decide",
+                ));
+            }
+            ReconciliationKind::Risk => {
+                let new: RiskLevel = value.as_deref().ok_or("--risk requires a value")?.parse()?;
+                if new.rank() < ledger.governance.risk.rank() {
+                    return Ok(autonomous_halt(&format!(
+                        "a risk downgrade ({} → {}) weakens rigor — a human must decide",
+                        ledger.governance.risk, new
+                    )));
+                }
+            }
+            ReconciliationKind::Continue | ReconciliationKind::Narrow => {}
+        }
+    }
     ledger.reconcile(kind, reason, value)?;
     ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
     println!("Recorded reconciliation for {} attempt {}. Current governance: risk {}, threat profile {}.", ledger.phase.label(), ledger.next_attempt(ledger.phase), ledger.governance.risk, ledger.governance.threat_profile);
@@ -1329,7 +1717,10 @@ struct ArtifactBudget {
 fn artifact_budget(project: &Project, change: &str, risk: RiskLevel) -> ArtifactBudget {
     let mut words = 0usize;
     for name in REQUIRED_ARTIFACTS {
-        match openspec_core::read_capped(&project.change_dir(change).join(name)) {
+        let p = project.change_dir(change).join(name);
+        match openspec_core::assert_contained(&project.root, &p)
+            .and_then(|()| openspec_core::read_capped(&p))
+        {
             Ok(text) => words = words.saturating_add(text.split_whitespace().count()),
             Err(_) => {
                 return ArtifactBudget {
@@ -1360,6 +1751,15 @@ fn gate_blocked(msg: &str) -> i32 {
     1
 }
 
+/// A `--autonomous` halt-and-report (design.md D7 / Cond 12): mpd refuses to make
+/// a rigor-weakening decision a human must own, prints why, and exits with a
+/// distinct code (3) a harness can branch on — never 1 (a blocked objective gate)
+/// or 2 (a usage error).
+fn autonomous_halt(msg: &str) -> i32 {
+    eprintln!("reconciliation required — human decision: {msg}");
+    3
+}
+
 /// The durable documentation target `<root>/<docs_dir>/<change>.md`. Validates
 /// that `docs_dir` is a project-relative subdirectory (no `..`, not absolute) —
 /// docs always live under the project they are for.
@@ -1387,12 +1787,15 @@ fn has_unfilled_placeholder(text: &str) -> bool {
         .any(|line| line.split('`').step_by(2).any(|seg| seg.contains("<!--")))
 }
 
-/// Structural completeness check for a documentation file. Returns the list of
-/// problems (empty ⇒ complete): missing sections, unfilled template
-/// placeholders, or too-short content.
-fn check_documentation(text: &str) -> Vec<String> {
+/// Structural completeness check shared by the documentation gate and the strict
+/// judgment-artifact gate. Returns the list of problems (empty ⇒ complete): each
+/// required `section` missing (matched at `##` level, case-insensitively, by
+/// heading prefix — so "Functional details" matches "Functional"), any unfilled
+/// `<!-- … -->` template placeholder, or content shorter than `min_len` trimmed
+/// bytes.
+fn check_sections(text: &str, sections: &[&str], min_len: usize) -> Vec<String> {
     let mut issues = Vec::new();
-    for section in REQUIRED_DOC_SECTIONS {
+    for section in sections {
         let present = text.lines().any(|line| {
             let trimmed = line.trim_start();
             trimmed.starts_with("##")
@@ -1409,10 +1812,305 @@ fn check_documentation(text: &str) -> Vec<String> {
     if has_unfilled_placeholder(text) {
         issues.push("unfilled template placeholders remain (<!-- … -->)".to_string());
     }
-    if text.trim().len() < 120 {
+    if text.trim().len() < min_len {
         issues.push("documentation is too short to be meaningful".to_string());
     }
     issues
+}
+
+/// Structural completeness check for a `documentation.md` file — the required doc
+/// sections and a 120-char floor. A thin, behavior-preserving wrapper over
+/// [`check_sections`].
+fn check_documentation(text: &str) -> Vec<String> {
+    check_sections(text, REQUIRED_DOC_SECTIONS, 120)
+}
+
+/// Upper bound on an extracted `--context` section render (Cond 11 — the human
+/// slice must be length-bounded). Generous enough to carry a full Conditions for
+/// Builder block, small enough to keep a hostile design.md from flooding a
+/// terminal; the full artifact is always one `read_capped` away.
+const CONTEXT_SECTION_MAX: usize = 8000;
+
+/// The `##`-heading level of a (left-trimmed) line — the count of leading `#`.
+fn heading_level(trimmed: &str) -> usize {
+    trimmed.chars().take_while(|c| *c == '#').count()
+}
+
+/// Extract the body beneath the first `##`-level heading whose title matches
+/// `section` (case-insensitive prefix — the same scan as [`check_sections`]),
+/// from that heading to the next `#`/`##` boundary (a deeper `###` subheading
+/// stays inside). Returns the trimmed body, made `terminal_safe` and truncated to
+/// `max_len` bytes with an ellipsis (Cond 11 — new user-controlled text in the
+/// human `--context` render must be terminal-safe AND length-bounded). `None`
+/// when the section is absent or its body is empty.
+fn extract_section(text: &str, section: &str, max_len: usize) -> Option<String> {
+    let needle = section.to_ascii_lowercase();
+    let mut in_section = false;
+    let mut body = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let level = heading_level(trimmed);
+        if in_section {
+            // A new top-level or level-2 heading ends the section; `###`+ is body.
+            if (1..=2).contains(&level) {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        } else if level == 2 {
+            let title = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+            if title.starts_with(&needle) {
+                in_section = true;
+            }
+        }
+    }
+    if !in_section {
+        return None;
+    }
+    let safe = harness::terminal_safe(body.trim());
+    if safe.is_empty() {
+        return None;
+    }
+    if safe.len() <= max_len {
+        return Some(safe);
+    }
+    // Truncate at a UTF-8 char boundary at or below max_len.
+    let mut end = max_len;
+    while end > 0 && !safe.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}…", &safe[..end]))
+}
+
+/// The strict-tier gate command for a phase: it records the phase's own judgment
+/// artifact as evidence when it has one, else a bare pass. Shared by the
+/// `--context` JSON envelope and text slice.
+fn strict_gate_command(phase: Phase) -> String {
+    match phase.judgment_artifact() {
+        Some((filename, _)) => {
+            format!("mpd gate {} --pass --evidence {filename}", phase.slug())
+        }
+        None => format!("mpd gate {} --pass", phase.slug()),
+    }
+}
+
+/// The upstream judgment artifacts this phase's persona should read, as
+/// `(phase label, filename)`. Resolves [`Phase::upstream_context`] to each
+/// upstream phase's [`Phase::judgment_artifact`], skipping phases with none and
+/// phases the change's applicability excludes (task 3.2).
+fn upstream_artifact_pointers(
+    phase: Phase,
+    applicability: crate::phase::Applicability,
+) -> Vec<(&'static str, &'static str)> {
+    let applicable = Phase::applicable(applicability);
+    phase
+        .upstream_context()
+        .iter()
+        .filter(|p| applicable.contains(p))
+        .filter_map(|p| p.judgment_artifact().map(|(f, _)| (p.label(), f)))
+        .collect()
+}
+
+/// Render the `mpd next --context` phase slice (text): persona + model, the
+/// upstream artifact pointers, the change's manifest scope, the extracted
+/// `## Conditions for Builder` block from design.md, and the active persona
+/// directive — the minimal context a persona needs, in place of the full brief.
+fn render_context_slice(
+    root: &Path,
+    change: &str,
+    ledger: &ledger::Ledger,
+    brief: &harness::NextBrief,
+) {
+    println!("▸ {} — {}  [context slice]", brief.label, brief.change);
+    let model_line = match &brief.model_note {
+        Some(note) => format!("{} ({note})", brief.model),
+        None => brief.model.clone(),
+    };
+    println!("  Persona: {} (model: {})", brief.persona, model_line);
+    if brief.deep_tier_bump {
+        println!("  risk=high → deep tier");
+    }
+    if brief.reconciliation_required && ledger.strict {
+        println!("  reconciliation required — human decision");
+    }
+
+    let pointers = upstream_artifact_pointers(ledger.phase, ledger.applicability());
+    if !pointers.is_empty() {
+        println!("\n  Read upstream artifacts:");
+        for (label, file) in pointers {
+            println!("    - {label}: {file}");
+        }
+    }
+
+    let manifest = manifest_view(root, change);
+    println!("\n  Manifest scope ({} pattern(s)):", manifest.scope.len());
+    for p in manifest.scope.iter().take(20) {
+        println!("    - {}", harness::terminal_safe(p));
+    }
+    if manifest.scope.len() > 20 {
+        println!("    … {} more", manifest.scope.len() - 20);
+    }
+
+    let design = read_contained(
+        root,
+        &Project::new(root).change_dir(change).join("design.md"),
+    );
+    // The Conditions for Builder are the invariants the persona MUST honor, so
+    // the bound is generous (still bounded per Cond 11 — the full file is one
+    // `read_capped` away via the artifact pointer if it ever exceeds this).
+    match extract_section(&design, "Conditions for Builder", CONTEXT_SECTION_MAX) {
+        Some(block) => println!("\n  ## Conditions for Builder\n{block}"),
+        None => {
+            println!("\n  (no `## Conditions for Builder` section in design.md yet)")
+        }
+    }
+
+    if let Some(d) = crate::directives::for_persona(root, &brief.persona) {
+        if d.modified {
+            println!(
+                "\n  ⚠ project directive for {} differs from the bundled default — \
+                 review it before trusting it.",
+                brief.persona
+            );
+        }
+        println!("\n───── directive: {} ─────\n{}", brief.persona, d.text);
+    }
+
+    println!("\n  When done: {}", strict_gate_command(ledger.phase));
+}
+
+/// The minimum authored-body length for a strict judgment artifact — the same
+/// 120-byte floor the documentation gate uses.
+const JUDGMENT_MIN_LEN: usize = 120;
+
+/// Read a project file only if it stays within `root` after symlink
+/// resolution, else `""`. `read_capped` alone lstat's only the final path
+/// component, so an intermediate directory symlink (a symlinked change dir or
+/// `.mpd/`) would be followed and read through; `assert_contained` refuses that
+/// (Cond 1). A refused path reads as `""` and fails the caller's structural
+/// check / reports fail-closed — never followed, never surfaced.
+fn read_contained(root: &Path, path: &Path) -> String {
+    if openspec_core::assert_contained(root, path).is_ok() {
+        openspec_core::read_capped(path).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// The strict-tier structural check of `phase`'s judgment artifact. Returns
+/// `None` when the artifact is complete (or the phase has none), or the
+/// escape-bearing refusal message when it is missing/incomplete (Cond 15). The
+/// read goes through [`read_contained`] (containment-checked, symlink-refusing,
+/// size-capped): a symlinked change dir / artifact or an oversized file reads as
+/// `""` and fails the structural check — never followed, never read through
+/// (an intermediate-directory symlink escape is refused too). Artifact content is
+/// never surfaced (only the structural issue list). High-risk Security (code)
+/// additionally requires the `Independent review` + `Refutation` sections
+/// (design.md D6, layered on here rather than in `judgment_artifact`).
+fn strict_artifact_issues(
+    root: &Path,
+    change: &str,
+    phase: Phase,
+    risk: RiskLevel,
+) -> Option<String> {
+    let (filename, sections) = phase.judgment_artifact()?;
+    let path = Project::new(root).change_dir(change).join(filename);
+    let text = read_contained(root, &path);
+    let mut required: Vec<&str> = sections.to_vec();
+    if phase == Phase::SecurityCode && risk == RiskLevel::High {
+        required.push("Independent review");
+        required.push("Refutation");
+    }
+    let issues = check_sections(&text, &required, JUDGMENT_MIN_LEN);
+    if issues.is_empty() {
+        return None;
+    }
+    for issue in &issues {
+        eprintln!("  artifact: {issue}");
+    }
+    Some(format!(
+        "{} gate refused: {filename} incomplete ({} issue(s)). \
+         Author it (`mpd brief {slug}`) or waive it \
+         (`mpd gate {slug} --pass --waive-artifact \"reason\"`).",
+        phase.label(),
+        issues.len(),
+        slug = phase.slug(),
+    ))
+}
+
+/// Validate a strict-mode `--evidence` pointer WITHOUT reading its content into
+/// any output (Cond 2). Strips the optional `#anchor` at the FIRST `#`, rejects
+/// an absolute path, joins the remainder to the change dir, and runs
+/// [`openspec_core::assert_contained`] (which refuses `.`/`..`/empty-component/
+/// intermediate-symlink/escape — so ad-hoc absolute checks are not relied on
+/// alone). Existence is confirmed via `symlink_metadata` (never following a
+/// link) and the target must be a non-empty regular file. For a judgment phase
+/// the post-`join` `PathBuf` MUST equal the change dir's own judgment artifact
+/// exactly — a planted `subdir/security-code.md` cannot alias. When `--evidence`
+/// is omitted it defaults to that exact artifact (or to `None` for a
+/// non-judgment phase, which records no evidence). Returns the pointer to record.
+fn validate_evidence(
+    root: &Path,
+    change: &str,
+    phase: Phase,
+    ev: Option<String>,
+) -> Result<Option<String>, String> {
+    let change_dir = Project::new(root).change_dir(change);
+    let artifact = phase.judgment_artifact();
+    // An omitted pointer defaults to the phase's own artifact (a safe constant
+    // basename); its existence and completeness are owned by the separate
+    // judgment-artifact check, so no path validation is needed here. A
+    // non-judgment phase with no pointer records nothing.
+    let raw = match ev {
+        Some(e) => e,
+        None => {
+            return Ok(artifact.map(|(filename, _)| filename.to_string()));
+        }
+    };
+    // Strip at the FIRST '#': the anchor is a human pointer, not part of the path.
+    let stripped = raw.split('#').next().unwrap_or("").trim();
+    if stripped.is_empty() {
+        return Err("--evidence must name a file (the path before '#' is empty)".into());
+    }
+    let stripped_path = Path::new(stripped);
+    // Reject an absolute path BEFORE joining — `Path::join` replaces the base on
+    // an absolute argument, which would silently escape the change dir.
+    if stripped_path.is_absolute() {
+        return Err(format!(
+            "--evidence path {stripped:?} must be relative to the change directory"
+        ));
+    }
+    let joined = change_dir.join(stripped_path);
+    openspec_core::assert_contained(&change_dir, &joined).map_err(|e| e.to_string())?;
+    // Existence via symlink_metadata (never follow); must be a non-empty file.
+    let md = std::fs::symlink_metadata(&joined).map_err(|_| {
+        format!("--evidence file {stripped:?} does not exist in the change directory")
+    })?;
+    if md.file_type().is_symlink() {
+        return Err(format!(
+            "--evidence file {stripped:?} is a symlink; refusing to follow it"
+        ));
+    }
+    if !md.is_file() {
+        return Err(format!(
+            "--evidence path {stripped:?} is not a regular file"
+        ));
+    }
+    if md.len() == 0 {
+        return Err(format!("--evidence file {stripped:?} is empty"));
+    }
+    // For a judgment phase the evidence MUST be that phase's OWN artifact —
+    // compare the post-`join` PathBufs, not a basename (Cond 2, kills aliasing).
+    if let Some((filename, _)) = artifact {
+        let expected = change_dir.join(filename);
+        if joined != expected {
+            return Err(format!(
+                "--evidence for {} must point to its own artifact {filename:?}, not {stripped:?}",
+                phase.label()
+            ));
+        }
+    }
+    Ok(Some(raw))
 }
 
 /// The core OpenSpec artifacts every change must fill before archive.
@@ -1429,7 +2127,7 @@ fn artifact_stub_issues(project: &Project, change: &str) -> Vec<String> {
     let dir = project.change_dir(change);
     let mut issues = Vec::new();
     for name in REQUIRED_ARTIFACTS {
-        let text = openspec_core::read_capped(&dir.join(name)).unwrap_or_default();
+        let text = read_contained(&project.root, &dir.join(name));
         if text.trim().is_empty() {
             issues.push(format!("{name} is missing or empty"));
         } else if has_unfilled_placeholder(&text) {
@@ -1439,6 +2137,75 @@ fn artifact_stub_issues(project: &Project, change: &str) -> Vec<String> {
         }
     }
     issues
+}
+
+/// The archive-time strict re-check (design.md Cond 9 / B2). A change's judgment
+/// gates all passed at gate time, but an artifact can still evaporate before the
+/// change is folded into the permanent record — the exact CARC hole. Under
+/// `ledger.strict`, sweep every APPLICABLE judgment phase and re-run its
+/// structural check via [`strict_artifact_issues`], collecting a refusal for any
+/// that no longer passes. A phase whose passing gate carried a validly-scoped
+/// waiver (a waiver for that phase AND that phase's recorded gate attempt) is
+/// treated as satisfied and surfaced WAIVED, never blocking — otherwise a
+/// legitimate gate-time waiver would be an un-archivable dead-end. Returns the
+/// escape-bearing refusals (empty ⇒ every artifact survived) and the labels of
+/// the phases counted WAIVED in the audit summary. Reads go through the same
+/// symlink-refusing, size-capped path as the gate (Cond 1); no artifact content
+/// is surfaced.
+fn strict_archive_recheck(
+    root: &Path,
+    change: &str,
+    ledger: &ledger::Ledger,
+) -> (Vec<String>, Vec<&'static str>) {
+    let mut refusals = Vec::new();
+    let mut waived = Vec::new();
+    for phase in Phase::applicable(ledger.applicability()) {
+        if phase.judgment_artifact().is_none() {
+            continue;
+        }
+        // The waiver is attempt-scoped to the phase's *recorded* passing gate;
+        // a rewind (`invalidate_from_security`) has already dropped waivers for
+        // any rewound phase, so a surviving match is for the current attempt.
+        let attempt = ledger.gates.get(&phase).map(|r| r.attempt).unwrap_or(0);
+        let waived_here = ledger
+            .waivers
+            .iter()
+            .any(|w| w.phase == phase && w.attempt == attempt);
+        if waived_here {
+            waived.push(phase.label());
+            continue;
+        }
+        if let Some(msg) = strict_artifact_issues(root, change, phase, ledger.governance.risk) {
+            refusals.push(msg);
+        }
+    }
+    (refusals, waived)
+}
+
+/// The archive transient-path pre-flight (design.md Cond 8). A transient `.mpd/`
+/// path (the current-change pointer, scratch tmp, a pending closure, publish
+/// parity observations) that exists on disk but is NOT covered by
+/// `.mpd/.gitignore` would be swept into the commit/archive. Returns the
+/// un-covered transient entries (empty ⇒ clean), demanding exactly the set
+/// [`scaffold::TRANSIENT_GITIGNORE_ENTRIES`] that `mpd doctor --fix` heals, so a
+/// `--fix` always fully clears what this refuses. The `.mpd/.gitignore` read is
+/// symlink-refusing + size-capped (Cond 1): a symlinked/oversized file reads as
+/// `""` ⇒ nothing is covered ⇒ every existing transient is reported (fail-closed).
+fn uncovered_transient_paths(root: &Path) -> Vec<&'static str> {
+    let mpd = ledger::mpd_dir(root);
+    let gitignore = read_contained(root, &mpd.join(".gitignore"));
+    let covered: std::collections::BTreeSet<&str> = gitignore.lines().map(|l| l.trim()).collect();
+    scaffold::TRANSIENT_GITIGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|entry| {
+            // Only an existing transient path is "in scope" — a pattern whose
+            // target isn't on disk can't leak. `symlink_metadata` never follows
+            // a link, so a symlinked transient still counts as present.
+            let on_disk = mpd.join(entry.trim_matches('/')).symlink_metadata().is_ok();
+            on_disk && !covered.contains(entry)
+        })
+        .collect()
 }
 
 fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdResult {
@@ -1591,6 +2358,10 @@ fn archived_manifest(
     let path = root
         .join(&closure_record.archive_path)
         .join("manifest.json");
+    // Contain before read (Cond 1 class): the archive path is ledger-authored but
+    // an intermediate symlink would otherwise be followed by read_capped's
+    // final-only lstat.
+    openspec_core::assert_contained(root, &path).map_err(|e| e.to_string())?;
     let text = openspec_core::read_capped(&path).map_err(|e| e.to_string())?;
     let manifest: closure::ChangeManifest =
         serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -1964,6 +2735,45 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         return Ok(1);
     }
 
+    // Irreversibility guard #3 (strict tier only): the judgment artifacts that
+    // passed at gate time must still be present and complete now — a re-check
+    // against the exact evaporation this change fixes (design.md Cond 9 / B2).
+    // A validly-scoped waiver for an applicable phase is surfaced WAIVED, never
+    // blocking. Inert when `strict=false`, so the manual tier is unchanged.
+    if ledger.strict {
+        let (refusals, waived) = strict_archive_recheck(&root, &change, &ledger);
+        for label in &waived {
+            println!("  ⚠ WAIVED: {label} judgment artifact (audited, not re-checked).");
+        }
+        if !refusals.is_empty() {
+            eprintln!(
+                "Cannot archive {change:?} — judgment artifacts evaporated after their gate:"
+            );
+            for msg in &refusals {
+                eprintln!("  - {msg}");
+            }
+            return Ok(1);
+        }
+    }
+
+    // Transient-path pre-flight (design.md Cond 8): an un-gitignored transient
+    // `.mpd/` file would be swept into the permanent record. Warn on a dry-run;
+    // fail-closed on `--yes`. `mpd doctor --fix` heals exactly this set.
+    let uncovered = uncovered_transient_paths(&root);
+    if !uncovered.is_empty() {
+        eprintln!(
+            "Transient .mpd/ path(s) are not covered by .mpd/.gitignore and would be committed:"
+        );
+        for entry in &uncovered {
+            eprintln!("  - .mpd{entry}");
+        }
+        if yes {
+            eprintln!("Refusing to archive. Run `mpd doctor --fix` then re-archive.");
+            return Ok(1);
+        }
+        eprintln!("Warning: run `mpd doctor --fix` before archiving with --yes.");
+    }
+
     let plan = project
         .plan_archive(&change, skip_specs)
         .map_err(|e| e.to_string())?;
@@ -1981,6 +2791,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         // Catch a pre-planted symlinked docs dir/target now, before anything is
         // moved or written.
         openspec_core::assert_contained(&root, &target).map_err(|e| e.to_string())?;
+        openspec_core::assert_contained(&project.root, &doc_src).map_err(|e| e.to_string())?;
         let content = openspec_core::read_capped(&doc_src).map_err(|e| e.to_string())?;
         Some((target, content))
     } else {
@@ -2154,8 +2965,157 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     Ok(0)
 }
 
-fn cmd_doctor(json: bool) -> CmdResult {
+/// `mpd use <change>` — set `.mpd/current` to an existing change (design.md D5,
+/// Cond 6). Recovers a cleared pointer (the archive/abandon housekeeping removes
+/// `.mpd/current`) without re-running `begin`. The argument becomes a path
+/// component in `set_current`, so it is `validate_change_name`-checked AND the
+/// change's ledger must already exist before we trust it.
+fn cmd_use(change: String) -> CmdResult {
+    let root = find_root()?;
+    openspec_core::validate_change_name(&change)?;
+    if !ledger::state_path(&root, &change).is_file() {
+        return Err(format!(
+            "no ledger for change {change:?}; run `mpd begin {change}` first"
+        ));
+    }
+    ledger::set_current(&root, &change).map_err(|e| e.to_string())?;
+    println!("Current change set to {change:?}.");
+    Ok(0)
+}
+
+/// Add-only heal of `.mpd/.gitignore` so it covers exactly the transient set the
+/// archive pre-flight demands ([`scaffold::TRANSIENT_GITIGNORE_ENTRIES`], the
+/// single source of truth), returning the entries appended (empty ⇒ already
+/// complete). Fail-closed (design.md Cond 7): the existing file is read via
+/// `read_capped` (symlink-refusing + size-capped), so a symlinked/oversized
+/// `.gitignore` is a hard refusal — never followed, never overwritten. Immediately
+/// before writing we re-run `assert_contained` (the double-check in
+/// `Config::save`/`write_new`). The append preserves every existing line, forces a
+/// newline boundary so we never fuse onto a trailing partial line, and writes ONLY
+/// `.mpd/.gitignore` — never the project-root `.gitignore`, never a delete/truncate.
+fn fix_gitignore(root: &Path) -> Result<Vec<&'static str>, String> {
+    let path = ledger::mpd_dir(root).join(".gitignore");
+    // F1: contain BEFORE any read. `read_capped`/`symlink_metadata` lstat only
+    // the final component, so an intermediate `.mpd/` symlink would otherwise be
+    // followed and read through; refuse (fail-closed) if the path escapes root.
+    openspec_core::assert_contained(root, &path)
+        .map_err(|e| format!("refusing to heal .mpd/.gitignore (fail-closed): {e}"))?;
+    // If the path exists in ANY form, `read_capped` decides: a symlink or an
+    // oversized file becomes a hard error (fail-closed, no write). Only a truly
+    // absent file reads as empty and is created fresh.
+    let existing = match path.symlink_metadata() {
+        Ok(_) => openspec_core::read_capped(&path)
+            .map_err(|e| format!("refusing to heal .mpd/.gitignore (fail-closed): {e}"))?,
+        Err(_) => String::new(),
+    };
+    let present: std::collections::BTreeSet<&str> = existing.lines().map(|l| l.trim()).collect();
+    let missing: Vec<&'static str> = scaffold::TRANSIENT_GITIGNORE_ENTRIES
+        .iter()
+        .copied()
+        .filter(|entry| !present.contains(entry))
+        .collect();
+    if missing.is_empty() {
+        return Ok(missing); // idempotent: nothing to add.
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for entry in &missing {
+        out.push_str(entry);
+        out.push('\n');
+    }
+    // F2: re-assert containment IMMEDIATELY before the write (after
+    // create_dir_all) — the double-check pattern in `Config::save`/`write_new`,
+    // catching a symlink planted between the read and the write (TOCTOU).
+    openspec_core::assert_contained(root, &path).map_err(|e| e.to_string())?;
+    std::fs::write(&path, out).map_err(|e| e.to_string())?;
+    Ok(missing)
+}
+
+/// `mpd doctor --fix`: the gitignore heal (design.md Cond 7). Requires a project
+/// root; reports exactly what it appended. All the read-only diagnostics stay on
+/// the bare-`doctor` report — `--fix` performs only the one add-only write.
+fn cmd_doctor_fix(root: Option<&Path>) -> CmdResult {
+    let root = root.ok_or_else(|| "no openspec/ project found (run `mpd init`)".to_string())?;
+    let healed = fix_gitignore(root)?;
+    if healed.is_empty() {
+        println!(
+            "mpd doctor --fix: .mpd/.gitignore already covers every transient path (no change)."
+        );
+    } else {
+        println!(
+            "mpd doctor --fix: appended {} missing entr{} to .mpd/.gitignore:",
+            healed.len(),
+            if healed.len() == 1 { "y" } else { "ies" }
+        );
+        for entry in &healed {
+            println!("  + .mpd{entry}");
+        }
+    }
+    Ok(0)
+}
+
+/// A read-only sanity verdict on the configured test command: flags the classic
+/// no-op stubs (`true`, `:`, empty) that exit 0 without running a test, so the
+/// Build/Test gate would pass with no verifiable pass count. NEVER runs the
+/// command and NEVER mutates config.json (design.md Cond 7). `None` ⇒ nothing to
+/// flag (a real-looking command, or an unset one the report already surfaces).
+fn test_command_sanity(test_cmd: Option<&str>) -> Option<String> {
+    let trimmed = test_cmd?.trim();
+    if trimmed.is_empty() {
+        return Some("empty — exits with no test run (no verifiable pass count)".to_string());
+    }
+    // The first shell word decides. `:` and `true` (bare or absolute path) are
+    // the always-succeed no-ops that emit no parseable pass count.
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if first == ":" || base == "true" {
+        return Some(format!(
+            "`{}` is a no-op that always exits 0 without running tests (no verifiable pass count)",
+            harness::terminal_safe(trimmed)
+        ));
+    }
+    None
+}
+
+/// The current phase and how long it has sat there, from the current change's
+/// `phase_started_at_epoch_secs`. Read-only; `None` when there is no current
+/// change, no loadable ledger, or an unseeded timestamp.
+fn phase_stall(root: Option<&Path>) -> Option<(Phase, u64)> {
+    let root = root?;
+    let change = ledger::current(root)?;
+    let led = ledger::load(root, &change).ok()?;
+    let started = led.phase_started_at_epoch_secs;
+    if started == 0 {
+        return None;
+    }
+    Some((led.phase, ledger::now_epoch_secs().saturating_sub(started)))
+}
+
+/// Render a coarse elapsed-seconds duration for the human `doctor` report.
+fn humanize_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600)
+    }
+}
+
+fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
     let root = find_root().ok();
+    if fix {
+        // `--fix` performs the one add-only gitignore write and reports it; the
+        // read-only diagnostics belong to the bare report below.
+        return cmd_doctor_fix(root.as_deref());
+    }
     let git = root
         .as_ref()
         .map(|r| githooks::is_git_repo(r))
@@ -2203,6 +3163,9 @@ fn cmd_doctor(json: bool) -> CmdResult {
         .and_then(|c| c.default_ref.clone());
     let closure_timeout_secs = closure_cfg.as_ref().map(|c| c.remote_timeout_secs());
     let closure_path_limit = closure_cfg.as_ref().map(|c| c.human_path_list_limit());
+    // Read-only diagnostics (design.md Cond 7): neither mutates config.json.
+    let test_sanity = test_command_sanity(test_cmd.as_deref());
+    let stall = phase_stall(root.as_deref());
 
     if json {
         let v = serde_json::json!({
@@ -2221,6 +3184,11 @@ fn cmd_doctor(json: bool) -> CmdResult {
             "current_change": current,
             "pending_closure": pending_closure.as_ref().map(|v| serde_json::json!({"change":v.change,"stage":stage_label(v.stage),"write_eligible":v.write_eligible})),
             "hermetic_reuse_configured": hermetic_reuse,
+            "test_command_sanity": test_sanity,
+            "phase_stall": stall.map(|(phase, age)| serde_json::json!({
+                "phase": phase.slug(),
+                "age_secs": age,
+            })),
             "closure": {
                 "default_remote": closure_default_remote,
                 "default_ref": closure_default_ref,
@@ -2252,6 +3220,14 @@ fn cmd_doctor(json: bool) -> CmdResult {
             .unwrap_or("(unset — Build/Test gates will refuse)")
     );
     println!(
+        "  test cmd sanity:     {}",
+        match (test_cmd.as_deref(), &test_sanity) {
+            (None, _) => "(no command configured)".to_string(),
+            (Some(_), Some(warn)) => format!("warning: {warn}"),
+            (Some(_), None) => "ok".to_string(),
+        }
+    );
+    println!(
         "  deploy command:      {}",
         deploy_cmd
             .as_deref()
@@ -2264,6 +3240,13 @@ fn cmd_doctor(json: bool) -> CmdResult {
     println!(
         "  current change:      {}",
         current.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  phase stall age:     {}",
+        match &stall {
+            Some((phase, age)) => format!("{} for {}", phase.slug(), humanize_secs(*age)),
+            None => "(no current change)".to_string(),
+        }
     );
     println!(
         "  pending closure:     {}",
@@ -2300,7 +3283,126 @@ fn cmd_doctor(json: bool) -> CmdResult {
 
 #[cfg(test)]
 mod tests {
-    use super::has_unfilled_placeholder;
+    use super::{
+        check_documentation, check_sections, extract_section, has_unfilled_placeholder,
+        strict_gate_command, upstream_artifact_pointers, validate_evidence, REQUIRED_DOC_SECTIONS,
+    };
+    use crate::phase::{Applicability, Phase};
+    use proptest::prelude::*;
+
+    #[test]
+    fn extract_section_captures_body_to_next_h2_and_is_bounded() {
+        let text = "# Design\n\n## Context\nsome context\n\n\
+                    ## Conditions for Builder\n1. first invariant\n### sub\nstill inside\n\n\
+                    ## Risks\nnot included\n";
+        let block = extract_section(text, "Conditions for Builder", 4000).unwrap();
+        assert!(block.contains("1. first invariant"), "body: {block}");
+        assert!(
+            block.contains("still inside"),
+            "a deeper ### subheading stays inside the section: {block}"
+        );
+        assert!(
+            !block.contains("not included"),
+            "the next ## heading ends the section: {block}"
+        );
+        // Case-insensitive prefix match, like check_sections.
+        assert!(extract_section(text, "conditions", 4000).is_some());
+        // Absent section → None; present-but-empty → None.
+        assert!(extract_section(text, "Nonexistent", 4000).is_none());
+        assert!(extract_section("## Empty\n\n## Next\nx", "Empty", 4000).is_none());
+        // Length bound adds an ellipsis and never splits a char boundary.
+        let long = format!("## S\n{}\n", "x".repeat(50));
+        let bounded = extract_section(&long, "S", 10).unwrap();
+        assert!(bounded.ends_with('…') && bounded.len() <= 10 + '…'.len_utf8());
+        // Terminal control sequences are stripped (Cond 11).
+        let evil = "## S\nsafe\u{1b}]8;;evil\u{7}tail\n";
+        let cleaned = extract_section(evil, "S", 4000).unwrap();
+        assert!(
+            !cleaned.contains('\u{1b}') && !cleaned.contains('\u{7}'),
+            "control chars must be stripped: {cleaned:?}"
+        );
+        assert!(cleaned.contains("safe") && cleaned.contains("tail"));
+    }
+
+    #[test]
+    fn strict_gate_command_uses_own_artifact_or_bare_pass() {
+        assert_eq!(
+            strict_gate_command(Phase::SecurityCode),
+            "mpd gate security-code --pass --evidence security-code.md"
+        );
+        // A non-judgment phase has no artifact to record.
+        assert_eq!(strict_gate_command(Phase::Build), "mpd gate build --pass");
+    }
+
+    #[test]
+    fn upstream_pointers_resolve_artifacts_and_honor_applicability() {
+        // Security (code) reads the plan; the pointer is security-plan.md.
+        let ptrs = upstream_artifact_pointers(
+            Phase::SecurityCode,
+            Applicability {
+                ui: false,
+                docs: false,
+            },
+        );
+        assert_eq!(ptrs, vec![("Security (plan)", "security-plan.md")]);
+        // Design Sign-off's upstream is DesignMock (no judgment artifact →
+        // skipped) and Design Review (design-review.md). With ui=false BOTH are
+        // inapplicable design phases, so nothing resolves; with ui=true only the
+        // Design Review artifact shows (DesignMock has none).
+        let no_ui = upstream_artifact_pointers(
+            Phase::DesignSignoff,
+            Applicability {
+                ui: false,
+                docs: false,
+            },
+        );
+        assert!(no_ui.is_empty(), "design phases excluded when ui=false");
+        let with_ui = upstream_artifact_pointers(
+            Phase::DesignSignoff,
+            Applicability {
+                ui: true,
+                docs: false,
+            },
+        );
+        assert_eq!(with_ui, vec![("Design Review", "design-review.md")]);
+    }
+
+    #[test]
+    fn check_documentation_wraps_check_sections_identically() {
+        // check_documentation is now a thin wrapper over check_sections with the
+        // doc sections + a 120-char floor; the two MUST agree on every input, so
+        // the refactor is byte-identical to today (Cond 3).
+        let long = format!(
+            "## Purpose\n## Value\n## Scope\n## Functional details\n## Usage\n{}",
+            "content ".repeat(40)
+        );
+        let samples = [
+            "".to_string(),
+            "## Purpose\nx".to_string(),
+            "# Doc\n\n## Purpose\nThe why.\n## Value\nWorth it.".to_string(),
+            "## Purpose\n## Value\n## Scope\n## Functional\n## Usage\n".to_string(),
+            long,
+        ];
+        for s in &samples {
+            assert_eq!(
+                check_documentation(s),
+                check_sections(s, REQUIRED_DOC_SECTIONS, 120),
+                "wrapper diverged from check_sections on {s:?}"
+            );
+        }
+        // Load-bearing: the wrapper still flags a missing section and short body.
+        let issues = check_documentation("## Purpose\nshort");
+        assert!(issues.iter().any(|i| i == "missing section: Value"));
+        assert!(issues.iter().any(|i| i.contains("too short")));
+        // And check_sections honors an arbitrary min_len (parameter is real).
+        assert!(check_sections("## A\nx", &["A"], 1).is_empty());
+        assert!(check_sections("## A\nx", &["A"], 500)
+            .iter()
+            .any(|i| i.contains("too short")));
+        // The section match is a case-insensitive `##`-level prefix.
+        assert!(check_sections("## purpose and scope\ncontent", &["Purpose"], 1).is_empty());
+        assert!(!check_sections("# Purpose\ncontent", &["Purpose"], 1).is_empty());
+    }
 
     #[test]
     fn placeholder_detection_ignores_inline_code_mentions() {
@@ -2322,5 +3424,199 @@ mod tests {
         assert!(!has_unfilled_placeholder(
             "# Real\n\nAll content here, no comments.\n"
         ));
+    }
+
+    /// Build a read-only evidence-validation fixture under the OS temp dir: a
+    /// change dir carrying the phase's own artifact (`security-code.md`), a real
+    /// non-artifact in-tree file (`proposal.md`), and an out-of-tree secret
+    /// (`secret.md`). Idempotent (safe to call per proptest case); each caller
+    /// passes a distinct `tag` so concurrently-run tests never share a directory.
+    fn evidence_fixture(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("mpd-prop-ev-{}-{tag}", std::process::id()));
+        let change_dir = root.join("openspec/changes/guarded");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("security-code.md"), "authored findings\n").unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "not the artifact\n").unwrap();
+        std::fs::write(root.join("secret.md"), "TOP-SECRET-CANARY\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn validate_evidence_refuses_escape_absolute_and_basename_alias() {
+        // Cond 2 escape vectors the e2e R3 test does not cover: a same-basename
+        // file in a subdir must not alias; a `..` traversal to an out-of-tree
+        // secret is refused with no content leak; an absolute path is rejected
+        // before the join; the exact own artifact (optionally anchored) is
+        // accepted verbatim.
+        let root = evidence_fixture("concrete");
+        let cd = root.join("openspec/changes/guarded");
+        std::fs::create_dir_all(cd.join("subdir")).unwrap();
+        std::fs::write(cd.join("subdir/security-code.md"), "planted alias\n").unwrap();
+
+        let alias = validate_evidence(
+            &root,
+            "guarded",
+            Phase::SecurityCode,
+            Some("subdir/security-code.md".to_string()),
+        );
+        assert!(
+            alias.is_err(),
+            "a same-basename file in a subdir must not alias the own artifact: {alias:?}"
+        );
+
+        let escape = validate_evidence(
+            &root,
+            "guarded",
+            Phase::SecurityCode,
+            Some("../../../secret.md".to_string()),
+        );
+        assert!(
+            escape.is_err(),
+            "a traversal escape must be refused: {escape:?}"
+        );
+        assert!(
+            !format!("{escape:?}").contains("TOP-SECRET"),
+            "evidence validation must never surface out-of-tree content: {escape:?}"
+        );
+
+        let abs = validate_evidence(
+            &root,
+            "guarded",
+            Phase::SecurityCode,
+            Some(root.join("secret.md").display().to_string()),
+        );
+        assert!(
+            abs.is_err(),
+            "an absolute evidence path must be refused: {abs:?}"
+        );
+
+        let ok = validate_evidence(
+            &root,
+            "guarded",
+            Phase::SecurityCode,
+            Some("security-code.md#Findings".to_string()),
+        );
+        assert_eq!(
+            ok.expect("own artifact accepted").expect("Some pointer"),
+            "security-code.md#Findings",
+            "the own artifact (anchor stripped for resolution) is recorded verbatim"
+        );
+    }
+
+    proptest! {
+        /// Fuzz `validate_evidence` for a judgment phase over path-shaped inputs
+        /// assembled from adversarial components (`..`, `.`, the own artifact, a
+        /// sibling non-artifact, an out-of-tree secret, a subdir, random names,
+        /// plus an optional `#anchor`) — so the accept, alias, and traversal-
+        /// escape branches are all genuinely exercised, not left to chance. Every
+        /// input is EITHER rejected (Err) OR accepted as the RAW input verbatim,
+        /// and an accepted pointer always resolves (post-`#`-strip, post-join) to
+        /// the phase's OWN in-tree artifact and nothing else — so it can never
+        /// alias `proposal.md`/`subdir/security-code.md`, never reach
+        /// `../secret.md`, and never returns Ok(None) for a present pointer. The
+        /// returned value being the input itself proves no file content is ever
+        /// read into the result (Cond 2). It never panics.
+        #[test]
+        fn validate_evidence_only_ever_accepts_the_own_artifact(
+            parts in prop::collection::vec(
+                prop_oneof![
+                    Just("security-code.md".to_string()),
+                    Just("proposal.md".to_string()),
+                    Just("secret.md".to_string()),
+                    Just("subdir".to_string()),
+                    Just("..".to_string()),
+                    Just(".".to_string()),
+                    "[A-Za-z0-9]{1,6}",
+                ],
+                0..6,
+            ),
+            anchor in prop::option::of("#[A-Za-z]{0,6}"),
+        ) {
+            let ev = format!("{}{}", parts.join("/"), anchor.unwrap_or_default());
+            let root = evidence_fixture("prop");
+            let change_dir = root.join("openspec/changes/guarded");
+            // A planted same-basename file in a subdir must not alias the artifact.
+            std::fs::create_dir_all(change_dir.join("subdir")).unwrap();
+            std::fs::write(change_dir.join("subdir/security-code.md"), "planted\n").unwrap();
+            let own = change_dir.join("security-code.md");
+            match validate_evidence(&root, "guarded", Phase::SecurityCode, Some(ev.clone())) {
+                Err(_) => {}
+                Ok(None) => prop_assert!(false, "a present pointer must never yield Ok(None)"),
+                Ok(Some(v)) => {
+                    prop_assert_eq!(&v, &ev, "an accepted pointer is the raw input, unread");
+                    let stripped = ev.split('#').next().unwrap_or("").trim();
+                    prop_assert_eq!(
+                        change_dir.join(stripped),
+                        own.clone(),
+                        "only the phase's own in-tree artifact is ever accepted"
+                    );
+                }
+            }
+        }
+
+        /// Fuzz `check_sections`: it never panics on arbitrary text / section
+        /// lists / floors and reports at most one issue per section plus the two
+        /// global issues (placeholder + too-short). Metamorphic (min_len 0
+        /// isolates heading logic): a heading-free body reports its section
+        /// missing, and prepending that section's `##` heading clears exactly
+        /// that issue — detection is driven by a matching `##` heading, nothing
+        /// else.
+        #[test]
+        fn check_sections_never_panics_and_detects_by_heading(
+            section in "[A-Za-z][A-Za-z0-9]{0,15}",
+            body in ".{0,300}",
+            others in prop::collection::vec("[A-Za-z ]{0,10}", 0..4),
+            min_len in 0usize..300,
+        ) {
+            let mut sections: Vec<&str> = others.iter().map(String::as_str).collect();
+            sections.push(section.as_str());
+            let issues = check_sections(&body, &sections, min_len);
+            prop_assert!(
+                issues.len() <= sections.len() + 2,
+                "at most one issue per section plus placeholder + too-short"
+            );
+
+            // A body with every '#' neutralized carries no `##` heading.
+            let clean = body.replace('#', "x");
+            let want = format!("missing section: {section}");
+            prop_assert!(
+                check_sections(&clean, &[section.as_str()], 0).contains(&want),
+                "a heading-free body must report the section missing"
+            );
+            let with = format!("## {section}\n{clean}");
+            prop_assert!(
+                !check_sections(&with, &[section.as_str()], 0).contains(&want),
+                "prepending the section's `##` heading clears the missing-issue"
+            );
+        }
+
+        /// Fuzz `extract_section`: the document is BUILT to contain the section
+        /// (independent random text almost never matches a `##` heading, which
+        /// would leave the bounded render path unexercised), with a possibly
+        /// hostile single-line body that may carry control/escape bytes and run
+        /// far past the cap. Whatever the body and cap, the render is bounded
+        /// (≤ cap + one ellipsis), terminal-safe (no control chars beyond
+        /// `\n`/`\t`), and never empty when `Some` — a hostile design.md can
+        /// neither flood a terminal nor smuggle an escape sequence through the
+        /// `--context` slice (Cond 11). It never panics.
+        #[test]
+        fn extract_section_output_is_bounded_and_terminal_safe(
+            body in ".{0,500}",
+            section in "[A-Za-z][A-Za-z0-9]{0,10}",
+            max_len in 1usize..200,
+        ) {
+            let text = format!("# Doc\n\n## {section}\n{body}\n\n## After\ntail\n");
+            if let Some(out) = extract_section(&text, &section, max_len) {
+                prop_assert!(
+                    out.len() <= max_len + '…'.len_utf8(),
+                    "output must not exceed the cap plus a single ellipsis: {out:?}"
+                );
+                prop_assert!(
+                    out.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\t')),
+                    "terminal control sequences must be stripped: {out:?}"
+                );
+                prop_assert!(!out.is_empty(), "an empty body yields None, not Some(\"\")");
+            }
+        }
     }
 }

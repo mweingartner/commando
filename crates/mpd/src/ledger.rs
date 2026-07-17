@@ -55,6 +55,19 @@ impl RiskLevel {
             Self::High => 3,
         }
     }
+    /// A total order over rigor (Low < Medium < High), used to distinguish a
+    /// risk *upgrade* from a *downgrade* under `--autonomous` reconcile — a
+    /// downgrade weakens rigor and must halt for a human (design.md D7 / Cond
+    /// 12). Deliberately a method (not a `PartialOrd` derive) so the ordering is
+    /// an explicit, named rigor axis rather than an implicit enum-declaration
+    /// artifact.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+        }
+    }
     pub fn page_limit(self) -> Option<usize> {
         match self {
             Self::Low => Some(2),
@@ -123,6 +136,26 @@ pub struct Reconciliation {
     pub new: Option<String>,
     #[serde(default)]
     pub consumed: bool,
+}
+
+/// A recorded escape from a strict-tier judgment-artifact gate: the persona
+/// signed off but the structural artifact check was waived with a reason. A
+/// waiver never bypasses an objective gate and never converts a FAIL (design.md
+/// D5). It is **attempt-scoped** (mirroring [`Reconciliation`]): it applies only
+/// to the attempt it was recorded for, so a stale attempt-1 waiver cannot
+/// silently suppress the artifact gate on a re-run under a changed threat
+/// profile (design.md D7 / B1). `invalidate_from_security` drops waivers for the
+/// rewound phases, exactly as it drops their gate records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiver {
+    /// The judgment phase whose artifact check was waived.
+    pub phase: Phase,
+    /// Why the artifact was waived (bounded, terminal-safe).
+    pub reason: String,
+    /// The attempt this waiver authorizes — it applies to no other.
+    pub attempt: usize,
+    /// When it was recorded (epoch seconds).
+    pub at_epoch_secs: u64,
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -308,6 +341,20 @@ pub struct Ledger {
     pub history: Vec<GateEvent>,
     #[serde(default)]
     pub governance: Governance,
+    /// Whether this change runs under the strict (self-enforcing) tier. Write-once
+    /// and monotonic: set true by `conduct`/`begin --strict` via
+    /// [`Ledger::set_strict`] and NEVER reset to false by any code path (design.md
+    /// D1/D7, Cond 14), so a resumed harness keeps the strictness it opted into.
+    /// Additive and `#[serde(default)]` so a legacy ledger loads as `strict=false`
+    /// — the manual tier, byte-identical to today.
+    #[serde(default)]
+    pub strict: bool,
+    /// Append-only, attempt-scoped waivers of the strict judgment-artifact gate.
+    /// A waiver is surfaced loudly in status and counted in the archive audit
+    /// summary; it never bypasses an objective gate or converts a FAIL (design.md
+    /// D5/D7). Additive and `#[serde(default)]` so a legacy ledger loads with none.
+    #[serde(default)]
+    pub waivers: Vec<Waiver>,
     #[serde(default)]
     pub phase_started_at_epoch_secs: u64,
     /// The content-addressed record of this change's completed archive
@@ -351,9 +398,22 @@ impl Ledger {
             conditions: Vec::new(),
             history: Vec::new(),
             governance,
+            strict: false,
+            waivers: Vec::new(),
             phase_started_at_epoch_secs: now_epoch_secs(),
             archive_closure: None,
         }
+    }
+
+    /// Turn on the strict (self-enforcing) tier. Write-once / monotonic: this is
+    /// the ONLY path that mutates `strict`, and it only ever sets it true — there
+    /// is deliberately no true→false setter (design.md Cond 14), the linchpin the
+    /// whole enforcement hangs on.
+    // Consumed by the `conduct` / `begin --strict` bit-setter (a later stage);
+    // exercised now by the monotonicity test.
+    #[allow(dead_code)]
+    pub fn set_strict(&mut self) {
+        self.strict = true;
     }
 
     pub fn attempts_for(&self, phase: Phase) -> usize {
@@ -440,6 +500,11 @@ impl Ledger {
                 self.gates.remove(&p);
             }
         }
+        // Drop strict waivers for the rewound phases, exactly as their gate
+        // records are dropped: a waiver recorded for Security/downstream on a
+        // prior attempt must not silently suppress the artifact gate on the
+        // re-run under the changed threat profile (design.md D7 / B1).
+        self.waivers.retain(|w| w.phase < Phase::SecurityPlan);
         self.phase = Phase::SecurityPlan;
         self.phase_started_at_epoch_secs = now_epoch_secs();
     }
@@ -867,5 +932,75 @@ mod tests {
         let json = serde_json::to_string(&l).unwrap();
         let back: Ledger = serde_json::from_str(&json).unwrap();
         assert_eq!(l, back);
+    }
+
+    #[test]
+    fn legacy_ledger_defaults_strict_false_and_no_waivers() {
+        // A ledger serialized before the strict tier existed (no `strict`, no
+        // `waivers`) must load as the manual tier — strict=false, no waivers —
+        // via #[serde(default)], and round-trip forward cleanly (design.md
+        // "Legacy ledger breakage").
+        let json = r#"{
+            "change": "c", "schema": "mpd", "ui": false, "kind": "fix",
+            "phase": "build",
+            "gates": { "architecture": { "verdict": "pass", "by": "Architect", "at": "2026-07-11" } },
+            "conditions": []
+        }"#;
+        let l: Ledger = serde_json::from_str(json).unwrap();
+        assert!(!l.strict, "a legacy ledger is the manual tier");
+        assert!(l.waivers.is_empty());
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(l, back);
+    }
+
+    #[test]
+    fn strict_is_write_once_and_monotonic() {
+        // `set_strict` only ever turns strict ON; there is deliberately no
+        // true→false path (design.md Cond 14) — the linchpin of enforcement.
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        assert!(!l.strict, "a fresh ledger defaults to the manual tier");
+        l.set_strict();
+        assert!(l.strict);
+        // Idempotent: calling again keeps it on, never flips it off.
+        l.set_strict();
+        assert!(l.strict);
+    }
+
+    #[test]
+    fn security_rewind_drops_strict_waivers_for_rewound_phases() {
+        // A waiver recorded for a phase at/after Security (plan) is dropped when
+        // a governance change rewinds to Security (plan) — exactly as the gate
+        // records are — so a stale waiver can never suppress the artifact gate on
+        // the re-run (design.md D7 / B1). An upstream (Architecture) waiver
+        // survives, since that phase is not rewound.
+        let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        l.record(Phase::Architecture, pass("Architect"));
+        l.record(Phase::SecurityPlan, pass("Security"));
+        l.record(Phase::Build, pass("Builder"));
+        l.waivers.push(Waiver {
+            phase: Phase::Architecture,
+            reason: "design.md already carries the conditions".into(),
+            attempt: 1,
+            at_epoch_secs: 0,
+        });
+        l.waivers.push(Waiver {
+            phase: Phase::SecurityCode,
+            reason: "stale attempt-1 waiver".into(),
+            attempt: 1,
+            at_epoch_secs: 0,
+        });
+        l.reconcile(
+            ReconciliationKind::ThreatProfile,
+            "input is now untrusted".into(),
+            Some("local-untrusted-input".into()),
+        )
+        .unwrap();
+        assert_eq!(l.phase, Phase::SecurityPlan);
+        let phases: Vec<_> = l.waivers.iter().map(|w| w.phase).collect();
+        assert_eq!(
+            phases,
+            vec![Phase::Architecture],
+            "only the upstream (non-rewound) waiver survives the rewind"
+        );
     }
 }

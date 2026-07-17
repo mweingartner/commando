@@ -12,7 +12,7 @@
 //! Luna (GPT-5.6, lightest) exists but is not assigned by default.
 
 use crate::config::Config;
-use crate::ledger::Governance;
+use crate::ledger::{Governance, RiskLevel};
 use crate::personas;
 use crate::phase::Phase;
 use serde::Serialize;
@@ -46,6 +46,12 @@ pub struct NextBrief {
     pub gate_command: String,
     pub risk: String,
     pub threat_profile: String,
+    /// Whether this change runs under the strict (self-enforcing) tier — surfaces
+    /// the stronger "human decision" phrasing when reconciliation is required.
+    pub strict: bool,
+    /// True when `risk=High` elevated a standard-tier persona (Security/Tester)
+    /// to the harness deep model (design.md D6 / Cond 10). Surfaced as a note.
+    pub deep_tier_bump: bool,
     pub attempt: usize,
     pub attempt_limit: usize,
     pub reconciliation_required: bool,
@@ -75,6 +81,45 @@ pub fn model_for(cfg: &Config, harness: &str, phase: Phase) -> (String, Option<S
         .or_else(|| builtin_fallback(&model))
         .map(|f| format!("fall back to {f} if unavailable"));
     (model, note)
+}
+
+/// Resolve `(model, note, bumped)` for a phase under a harness, applying the
+/// `risk=High` deep-tier bump for the Security and Tester personas (design.md D6
+/// / Cond 10). Baseline resolution is [`model_for`]; on top of it, at
+/// `risk=High`, Security/Tester elevate to the harness **deep** default ONLY WHEN
+/// their resolved model equals the harness **standard** default — the seeded
+/// case. `default_models()` seeds an explicit standard-tier entry for every
+/// persona, so a naive "fall back to the deep default" bump would be a dead
+/// no-op; this overrides that seeded entry. A **custom/non-standard pin** (the
+/// resolved model differs from the standard default) is a deliberate operator
+/// choice and is left untouched — bumping it would be a rigor *inversion* (mpd
+/// cannot rank a pinned model). The elevated model is the built-in deep default
+/// (a compile-time-safe constant) resolved via the same `builtin_default`/
+/// fallback path `model_for` uses, so `valid_model_id` degradation is preserved
+/// and no unsafe config id can reach a rendered `--model`. It only ever
+/// *strengthens*; the documented opt-out is to lower the risk.
+pub fn model_for_governed(
+    cfg: &Config,
+    harness: &str,
+    phase: Phase,
+    risk: RiskLevel,
+) -> (String, Option<String>, bool) {
+    let (model, note) = model_for(cfg, harness, phase);
+    let persona = phase.persona().name;
+    let eligible = risk == RiskLevel::High
+        && matches!(persona, "Security" | "Tester")
+        && model == builtin_default(harness, false);
+    if !eligible {
+        return (model, note, false);
+    }
+    // Override the seeded standard entry with the harness deep default. Compute
+    // the note through the same fallback path (deep default → its fallback).
+    let deep = builtin_default(harness, true).to_string();
+    let deep_note = cfg
+        .model_fallback(&deep)
+        .or_else(|| builtin_fallback(&deep))
+        .map(|f| format!("fall back to {f} if unavailable"));
+    (deep, deep_note, true)
 }
 
 /// The built-in default model for a harness/tier when config is silent. The
@@ -122,13 +167,15 @@ pub fn brief(
     phase: Phase,
     harness: &str,
     governance: &Governance,
+    strict: bool,
     attempt: usize,
     reconciliation_required: bool,
     attempt_authorization: Option<String>,
     artifact_warning: Option<String>,
 ) -> NextBrief {
     let persona = phase.persona();
-    let (model, model_note) = model_for(cfg, harness, phase);
+    let (model, model_note, deep_tier_bump) =
+        model_for_governed(cfg, harness, phase, governance.risk);
     NextBrief {
         change: change.to_string(),
         phase: phase.slug().to_string(),
@@ -146,6 +193,8 @@ pub fn brief(
         gate_command: format!("mpd gate {} --pass --evidence <pointer>", phase.slug()),
         risk: governance.risk.to_string(),
         threat_profile: governance.threat_profile.to_string(),
+        strict,
+        deep_tier_bump,
         attempt,
         attempt_limit: governance.risk.attempt_limit(),
         reconciliation_required,
@@ -173,7 +222,22 @@ fn governance_lines(b: &NextBrief) -> String {
             b.attempt, kind, b.attempt_limit
         ));
     } else if b.reconciliation_required {
-        out.push_str("  Reconciliation required before this attempt.\n");
+        if b.strict {
+            // Under the strict tier an excess attempt is not something a harness
+            // may self-authorize — it is a halt-and-report point for a human
+            // (design.md D7 / Cond 12).
+            out.push_str(
+                "  Reconciliation required — human decision: a human must authorize this excess attempt (`mpd reconcile ...`).\n",
+            );
+        } else {
+            out.push_str("  Reconciliation required before this attempt.\n");
+        }
+    }
+    if b.deep_tier_bump {
+        out.push_str(&format!(
+            "  risk=high → deep tier: {} elevated to the deep model {}.\n",
+            b.persona, b.model
+        ));
     }
     if let Some(w) = &b.artifact_warning {
         out.push_str(&format!("  Warning: {}\n", terminal_safe(w)));
@@ -411,6 +475,77 @@ mod tests {
         assert_eq!(builtin_fallback(""), None);
     }
 
+    #[test]
+    fn high_risk_bumps_seeded_security_and_tester_to_the_deep_tier() {
+        // R8: on a default-init project (config seeds the standard tier for every
+        // persona), risk=High elevates Security AND Tester to the harness deep
+        // model — overriding the seeded standard entry — and only ever
+        // strengthens. Deep phases and other personas are unaffected; below High
+        // nothing bumps.
+        let (models, fallbacks) = crate::config::default_models();
+        let cfg = Config {
+            models,
+            model_fallbacks: fallbacks,
+            ..Config::default()
+        };
+        for (harness, deep, std) in [
+            ("claude-code", "fable", "sonnet"),
+            ("codex", "sol", "terra"),
+        ] {
+            for phase in [Phase::SecurityPlan, Phase::SecurityCode, Phase::Test] {
+                // Baseline: below High, the seeded standard tier stands.
+                let (m, _, bumped) = model_for_governed(&cfg, harness, phase, RiskLevel::Medium);
+                assert_eq!(
+                    (m.as_str(), bumped),
+                    (std, false),
+                    "{harness}/{phase:?} medium"
+                );
+                // High: elevated to the deep default, flagged as bumped.
+                let (m, note, bumped) = model_for_governed(&cfg, harness, phase, RiskLevel::High);
+                assert_eq!(
+                    (m.as_str(), bumped),
+                    (deep, true),
+                    "{harness}/{phase:?} high"
+                );
+                // The deep note is carried through the same fallback path.
+                if deep == "fable" {
+                    assert_eq!(note.as_deref(), Some("fall back to opus if unavailable"));
+                }
+            }
+            // A deep-tier persona (Architect) never "bumps" — it is already deep.
+            let (m, _, bumped) =
+                model_for_governed(&cfg, harness, Phase::Architecture, RiskLevel::High);
+            assert_eq!((m.as_str(), bumped), (deep, false));
+            // The Builder is standard-tier but out of the elevated set.
+            let (m, _, bumped) = model_for_governed(&cfg, harness, Phase::Build, RiskLevel::High);
+            assert_eq!((m.as_str(), bumped), (std, false));
+        }
+    }
+
+    #[test]
+    fn high_risk_leaves_a_custom_security_pin_untouched() {
+        // R16: a user-customized (non-standard) pin for Security/Tester is a
+        // deliberate operator choice — the bump must NOT override it, even at
+        // High (bumping a pin mpd cannot rank would be a rigor inversion).
+        let mut persona_map = BTreeMap::new();
+        persona_map.insert("Security".to_string(), "my-strong-model".to_string());
+        persona_map.insert("Tester".to_string(), "my-strong-model".to_string());
+        let mut models = ModelMap::new();
+        models.insert("claude-code".to_string(), persona_map);
+        let cfg = Config {
+            models,
+            ..Config::default()
+        };
+        for phase in [Phase::SecurityPlan, Phase::SecurityCode, Phase::Test] {
+            let (m, _, bumped) = model_for_governed(&cfg, "claude-code", phase, RiskLevel::High);
+            assert_eq!(
+                (m.as_str(), bumped),
+                ("my-strong-model", false),
+                "a custom pin must survive the high-risk bump on {phase:?}"
+            );
+        }
+    }
+
     proptest! {
         /// Metamorphic: whatever a project config declares as a persona's model
         /// id, once resolved through `model_for`, an id `Config::model_for`
@@ -443,6 +578,7 @@ mod tests {
                     Phase::Architecture,
                     "claude-code",
                     &Governance::default(),
+                    false,
                     1,
                     false,
                     None,
@@ -458,6 +594,56 @@ mod tests {
                         "a rejected model id must never surface on the rendered model line"
                     );
                 }
+            }
+        }
+
+        /// Cond 10 extended to the bumped path: whatever a config declares for
+        /// Security, at risk=High the governed resolution must (a) never leak a
+        /// rejected id, (b) only ever strengthen — the resolved model is either
+        /// the valid custom pin (untouched, `bumped=false`) or the built-in deep
+        /// default (`bumped=true`), never the raw unsafe id, and never the
+        /// standard default when a bump was possible.
+        #[test]
+        fn high_risk_security_bump_never_leaks_an_unsafe_id(id in ".*") {
+            let mut persona_map = BTreeMap::new();
+            persona_map.insert("Security".to_string(), id.clone());
+            let mut models = ModelMap::new();
+            models.insert("claude-code".to_string(), persona_map);
+            let cfg = Config { models, ..Config::default() };
+
+            let considered_valid = cfg.model_for("claude-code", "Security").is_some();
+            let (model, _note, bumped) =
+                model_for_governed(&cfg, "claude-code", Phase::SecurityCode, RiskLevel::High);
+
+            if considered_valid && id != "sonnet" {
+                // A valid, non-standard custom pin survives untouched.
+                prop_assert_eq!(&model, &id);
+                prop_assert!(!bumped, "a custom pin must not be bumped");
+            } else {
+                // Either the id is invalid (degrades) or it equals the standard
+                // default ("sonnet") — both cases elevate to the deep default.
+                prop_assert_eq!(model.as_str(), "fable", "seeded/degraded case must bump to deep");
+                prop_assert!(bumped);
+            }
+            // The raw unsafe id never surfaces on the rendered model line.
+            let b = brief(
+                &cfg,
+                "change",
+                Phase::SecurityCode,
+                "claude-code",
+                &Governance { risk: RiskLevel::High, ..Governance::default() },
+                false,
+                1,
+                false,
+                None,
+                None,
+            );
+            let rendered = render_claude_code(&b);
+            if !considered_valid && !id.is_empty() && id != "fable" {
+                prop_assert!(
+                    !rendered.contains(&format!("model: {id}")),
+                    "a rejected id must never surface on the rendered model line"
+                );
             }
         }
     }

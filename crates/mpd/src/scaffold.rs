@@ -18,13 +18,69 @@ const T_DESIGN: &str = include_str!("../assets/templates/design.md");
 const T_TASKS: &str = include_str!("../assets/templates/tasks.md");
 const T_DOCUMENTATION: &str = include_str!("../assets/templates/documentation.md");
 
+// Strict-tier judgment-artifact templates. Each carries the `##` sections its
+// phase's `judgment_artifact()` requires, plus `<!-- guidance -->` placeholders
+// so an unfilled stub fails `check_sections` until a persona authors it.
+const T_JUDGMENT_SECURITY_PLAN: &str =
+    include_str!("../assets/templates/judgment/security-plan.md");
+const T_JUDGMENT_SECURITY_CODE: &str =
+    include_str!("../assets/templates/judgment/security-code.md");
+const T_JUDGMENT_DESIGN_REVIEW: &str =
+    include_str!("../assets/templates/judgment/design-review.md");
+const T_JUDGMENT_DESIGN_SIGNOFF: &str =
+    include_str!("../assets/templates/judgment/design-signoff.md");
+const T_JUDGMENT_TEST: &str = include_str!("../assets/templates/judgment/test.md");
+const T_JUDGMENT_DOC_VALIDATION: &str =
+    include_str!("../assets/templates/judgment/doc-validation.md");
+
+/// The transient `.mpd/` paths that must never be committed — the single source
+/// of truth consumed by `init`'s `.mpd/.gitignore`, `mpd doctor --fix`'s heal,
+/// and the archive transient-path pre-flight (design.md Cond 8), so `--fix`
+/// always fully clears what the pre-flight demands. Each entry is a `.gitignore`
+/// pattern relative to `.mpd/` (leading `/` anchors it to the `.mpd/` root).
+pub const TRANSIENT_GITIGNORE_ENTRIES: &[&str] = &[
+    "/current",
+    "/tmp/",
+    "/pending-closure",
+    "/parity-observations.json",
+];
+
 const PROJECT_MD: &str = "# Project Context\n\n\
 <!-- Project-specific context for humans and agents. -->\n";
 const AGENTS_MD: &str = "# Agent Instructions\n\n\
 This project uses mpd (Model-Paired Development) over the OpenSpec format.\n\
 Run `mpd status` to see the current phase and `mpd next` for the next step.\n\
 Declare change scope in `manifest.json`; do not mix unrelated staged work.\n\
-After archive, commit and push normally, then run `mpd publish --verify`.\n";
+After archive, commit and push normally, then run `mpd publish --verify`.\n\n\
+## Two ways to drive mpd\n\n\
+**Humans — manual verbs.** Drive the pipeline by hand with full control: \
+`mpd next` for the next step, `mpd gate <phase> --pass` to record a verdict, \
+`mpd status` to inspect. Only the objective gates (build/test pass count, secret \
+scan, doc structure, deploy) are enforced; judgment artifacts are not demanded. \
+The flow is byte-identical to the classic one.\n\n\
+**Model harnesses — `mpd conduct <name>`.** Start the change under the strict \
+tier, then follow the printed call-loop over the *unchanged* verbs:\n\n\
+```\n\
+loop:\n\
+  brief=$(mpd next --harness claude-code --context --json)  # slice + persona + model + artifact_path + gate_command\n\
+  break if brief.phase == \"done\"\n\
+  # spawn the persona at brief.model, fill brief.artifact_path, do the work\n\
+  mpd gate <phase> --pass --evidence <artifact_path>        # strict checks auto-apply from ledger.strict\n\
+mpd archive --yes\n\
+```\n\n\
+Strict is a durable per-change bit: every judgment gate demands its own non-stub \
+artifact (security-plan.md, security-code.md, test.md, …), `--evidence` must \
+resolve to that phase's own artifact, and archive re-checks that the artifacts \
+survived. A dropped call degrades loudly, not silently.\n\n\
+**Both tiers share the escape verbs** — no strict requirement is a dead-end:\n\
+- `mpd brief <phase>` — scaffold a phase's judgment-artifact stub to author.\n\
+- `mpd gate <phase> --pass --waive-artifact \"reason\"` — waive the artifact \
+check (audited, loud WAIVED banner; never bypasses an objective gate or a FAIL).\n\
+- `mpd use <change>` — restore `.mpd/current` after it was cleared.\n\
+- `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent).\n\n\
+Strict is set once — at `conduct` or `begin --strict` — and is write-once: there \
+is no verb to promote an already-begun non-strict change to strict. Re-`begin` \
+under `conduct` instead.\n";
 
 /// Outcome of an `init`.
 #[derive(Debug, Default)]
@@ -120,7 +176,7 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
     // the commit/stop hooks nag about it every turn.
     write_new(
         &ledger::mpd_dir(root).join(".gitignore"),
-        "/current\n/tmp/\n/pending-closure\n/parity-observations.json\n",
+        &format!("{}\n", TRANSIENT_GITIGNORE_ENTRIES.join("\n")),
         root,
         &mut report,
     )?;
@@ -197,6 +253,55 @@ pub fn begin(
     Ok(ledger)
 }
 
+/// The bundled judgment-artifact template body for `phase`, if the strict tier
+/// requires one. The *filename* is owned by [`Phase::judgment_artifact`] (the
+/// single source of truth); this maps the same phase to the template seeded into
+/// the change dir. Architecture's artifact is the core `design.md` already seeded
+/// at `begin`, so it reuses the design template (re-seeding is a no-op).
+fn judgment_template(phase: Phase) -> Option<&'static str> {
+    Some(match phase {
+        Phase::SecurityPlan => T_JUDGMENT_SECURITY_PLAN,
+        Phase::SecurityCode => T_JUDGMENT_SECURITY_CODE,
+        Phase::DesignReview => T_JUDGMENT_DESIGN_REVIEW,
+        Phase::DesignSignoff => T_JUDGMENT_DESIGN_SIGNOFF,
+        Phase::Test => T_JUDGMENT_TEST,
+        Phase::DocValidation => T_JUDGMENT_DOC_VALIDATION,
+        Phase::Architecture => T_DESIGN,
+        _ => return None,
+    })
+}
+
+/// Seed `phase`'s judgment-artifact template into the change dir when the strict
+/// tier requires one and it is absent. Uses [`write_new`] — symlink-refusing and
+/// never overwriting authored content — so re-seeding an already-filled artifact
+/// is a no-op. Returns the repo-relative path if a file was actually created, or
+/// `None` (phase has no judgment artifact, or the artifact already exists). The
+/// stub deliberately fails `check_sections` (unfilled `<!-- … -->` placeholders)
+/// until a persona authors it, so seeding can never satisfy the gate by itself.
+pub fn seed_judgment_template(
+    root: &Path,
+    change: &str,
+    phase: Phase,
+) -> io::Result<Option<String>> {
+    validate_change_name(change).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let (filename, _sections) = match phase.judgment_artifact() {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let content = match judgment_template(phase) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let path = root
+        .join("openspec")
+        .join("changes")
+        .join(change)
+        .join(filename);
+    let mut report = InitReport::default();
+    write_new(&path, content, root, &mut report)?;
+    Ok(report.created.into_iter().next())
+}
+
 fn write_new(path: &Path, content: &str, root: &Path, report: &mut InitReport) -> io::Result<()> {
     if !path.exists() {
         // `exists()` follows symlinks, so a *dangling* symlink reads as absent —
@@ -260,6 +365,81 @@ mod tests {
         let err = write_new(&link, "DOCTRINE", &root, &mut report).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(!target.exists(), "must not create the symlink target");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn judgment_templates_carry_their_required_sections() {
+        use super::judgment_template;
+        use crate::phase::{Phase, PIPELINE};
+        // Every phase whose strict gate demands a judgment artifact must have a
+        // bundled template, and that template must contain each required `##`
+        // section verbatim — else a seeded stub could never pass the gate even
+        // when authored. (Single source of truth: judgment_artifact.)
+        for &p in PIPELINE.iter().chain(std::iter::once(&Phase::Done)) {
+            match p.judgment_artifact() {
+                Some((_file, sections)) => {
+                    let body =
+                        judgment_template(p).unwrap_or_else(|| panic!("{p:?} has no template"));
+                    for section in sections {
+                        assert!(
+                            body.contains(&format!("## {section}")),
+                            "{p:?} template missing `## {section}`"
+                        );
+                    }
+                }
+                None => assert!(
+                    judgment_template(p).is_none(),
+                    "{p:?} has no judgment artifact but carries a template"
+                ),
+            }
+        }
+        // The high-risk-only sections live in the security-code template.
+        let sc = judgment_template(Phase::SecurityCode).unwrap();
+        assert!(sc.contains("## Independent review") && sc.contains("## Refutation"));
+    }
+
+    #[test]
+    fn seed_judgment_template_writes_then_is_a_noop() {
+        use super::{init, seed_judgment_template};
+        use crate::ledger::{ChangeKind, Governance};
+        use crate::phase::Phase;
+        let root = std::env::temp_dir().join(format!("mpd-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        init(&root, Some("cargo test".into())).unwrap();
+        super::begin(
+            &root,
+            "seed-me",
+            false,
+            ChangeKind::Feature,
+            Governance::default(),
+        )
+        .unwrap();
+
+        // A judgment phase seeds its stub and reports the created path.
+        let created = seed_judgment_template(&root, "seed-me", Phase::SecurityCode).unwrap();
+        assert_eq!(
+            created.as_deref(),
+            Some("openspec/changes/seed-me/security-code.md")
+        );
+        let path = root.join("openspec/changes/seed-me/security-code.md");
+        let first = std::fs::read_to_string(&path).unwrap();
+
+        // Re-seeding is a no-op — never overwrites, reports nothing created.
+        std::fs::write(&path, "# authored\n").unwrap();
+        assert_eq!(
+            seed_judgment_template(&root, "seed-me", Phase::SecurityCode).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# authored\n");
+        assert_ne!(first, "# authored\n");
+
+        // A non-judgment phase seeds nothing.
+        assert_eq!(
+            seed_judgment_template(&root, "seed-me", Phase::Build).unwrap(),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

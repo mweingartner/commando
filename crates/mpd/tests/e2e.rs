@@ -236,6 +236,17 @@ fn build_gate_refuses_without_pass_count() {
         !out.status.success(),
         "build gate should refuse when no pass count is observed"
     );
+    // The refusal spells out the cause so a `"test": "true"` placeholder is
+    // diagnosable from stderr alone (Stage 4, Task 2.3).
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no recognizable pass count"),
+        "the refusal must hint at the missing pass count: {err}"
+    );
+    assert!(
+        err.contains("`true`"),
+        "the hint must name the placeholder footgun: {err}"
+    );
 }
 
 #[test]
@@ -950,6 +961,290 @@ fn doctor_json_reports_expected_shape_before_and_after_init() {
     assert!(configured_text.contains("origin / refs/heads/main"));
     assert!(configured_text.contains("remote timeout:      30s"));
     assert!(configured_text.contains("path list limit:     5"));
+}
+
+#[test]
+fn use_restores_cleared_current_pointer() {
+    // R6: `mpd use <change>` restores a cleared `.mpd/current` (the exact state
+    // the archive housekeeping at cli.rs and `closure abandon` leave behind),
+    // and refuses an invalid name or a change with no seeded ledger (Cond 6).
+    let sb = Sandbox::new("use");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "resume-me"]);
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["change"],
+        "resume-me",
+        "begin should have set the current pointer"
+    );
+
+    // Reproduce the post-archive/post-abandon cleared-pointer state.
+    std::fs::remove_file(sb.dir.join(".mpd/current")).unwrap();
+    assert!(
+        !sb.mpd(&["status", "--json"]).status.success(),
+        "with no current and no --change, status has nothing to resolve"
+    );
+
+    // `use` restores it.
+    let out = sb.mpd(&["use", "resume-me"]);
+    assert!(out.status.success(), "use failed: {}", stdout(&out));
+    assert_eq!(
+        std::fs::read_to_string(sb.dir.join(".mpd/current"))
+            .unwrap()
+            .trim(),
+        "resume-me"
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["change"],
+        "resume-me",
+        "status resolves again after use"
+    );
+
+    // An invalid name never reaches the filesystem; a valid-but-unseeded change
+    // is refused because no ledger exists (validate + existence, Cond 6).
+    assert!(
+        !sb.mpd(&["use", "Bad-Name"]).status.success(),
+        "use must reject an invalid change name"
+    );
+    let missing = sb.mpd(&["use", "no-such-change"]);
+    assert!(
+        !missing.status.success(),
+        "use must reject a change with no ledger"
+    );
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no ledger"));
+}
+
+#[test]
+fn doctor_fix_heals_dirty_gitignore_then_archive_succeeds() {
+    // R7 end-to-end: an un-gitignored transient makes `archive --yes` fail
+    // closed; `doctor --fix` heals exactly the demanded set; re-running is a
+    // no-op; archive then succeeds. Cond 7/8 (one shared transient constant).
+    let sb = Sandbox::new("fixheal");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    // A defect fix skips Design + Documentation, so a short walk reaches ready.
+    sb.mpd(&["begin", "heal-me", "--fix"]);
+    fill_artifacts(&sb, "heal-me");
+    for p in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let o = sb.mpd(&["gate", p, "--pass"]);
+        assert!(
+            o.status.success(),
+            "gate {p}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["ready_to_archive"],
+        true
+    );
+
+    // Make it dirty: drop `.mpd/.gitignore` so the on-disk `.mpd/current`
+    // transient is uncovered. `archive --yes` must refuse, fail-closed.
+    std::fs::remove_file(sb.dir.join(".mpd/.gitignore")).unwrap();
+    let refused = sb.mpd(&["archive", "--yes", "--skip-specs"]);
+    assert!(
+        !refused.status.success(),
+        "archive must refuse an un-gitignored transient"
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("Refusing to archive"));
+
+    // `doctor --fix` heals exactly the transient set the pre-flight demands.
+    let fixed = sb.mpd(&["doctor", "--fix"]);
+    assert!(fixed.status.success(), "fix failed: {}", stdout(&fixed));
+    let gi = std::fs::read_to_string(sb.dir.join(".mpd/.gitignore")).unwrap();
+    for entry in [
+        "/current",
+        "/tmp/",
+        "/pending-closure",
+        "/parity-observations.json",
+    ] {
+        assert!(
+            gi.lines().any(|l| l.trim() == entry),
+            "fix must add {entry}: {gi:?}"
+        );
+    }
+
+    // Idempotent: a second `--fix` writes nothing new and reports no change.
+    let again = sb.mpd(&["doctor", "--fix"]);
+    assert!(stdout(&again).contains("already covers"));
+    assert_eq!(
+        std::fs::read_to_string(sb.dir.join(".mpd/.gitignore")).unwrap(),
+        gi,
+        "a second --fix must be byte-identical (idempotent)"
+    );
+
+    // Archive now succeeds end-to-end.
+    let archived = sb.mpd(&["archive", "--yes", "--skip-specs"]);
+    assert!(
+        archived.status.success(),
+        "archive after heal failed: {}\n{}",
+        stdout(&archived),
+        String::from_utf8_lossy(&archived.stderr)
+    );
+    assert!(!sb.dir.join("openspec/changes/heal-me").exists());
+}
+
+#[test]
+fn doctor_fix_is_add_only_preserving_user_lines() {
+    // R7 (add-only): `--fix` appends only the MISSING transient entries and
+    // never rewrites, reorders, or drops an existing user line — even one with
+    // no trailing newline (the boundary is forced before appending).
+    let sb = Sandbox::new("addonly");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    // A pre-existing gitignore: a user comment + one already-present transient,
+    // deliberately missing a trailing newline.
+    sb.write(".mpd/.gitignore", "# my notes\n/current");
+    let out = sb.mpd(&["doctor", "--fix"]);
+    assert!(out.status.success(), "fix failed: {}", stdout(&out));
+    let gi = std::fs::read_to_string(sb.dir.join(".mpd/.gitignore")).unwrap();
+    // The user's lines survive verbatim, at the top, exactly once.
+    assert!(gi.starts_with("# my notes\n/current\n"), "add-only: {gi:?}");
+    assert_eq!(
+        gi.lines().filter(|l| l.trim() == "/current").count(),
+        1,
+        "the already-present entry must not be duplicated: {gi:?}"
+    );
+    assert!(gi.contains("# my notes"), "the user comment must survive");
+    // The three missing entries were appended.
+    for entry in ["/tmp/", "/pending-closure", "/parity-observations.json"] {
+        assert!(
+            gi.lines().any(|l| l.trim() == entry),
+            "missing {entry}: {gi:?}"
+        );
+    }
+    assert!(gi.ends_with('\n'), "must end newline-terminated: {gi:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_fails_closed_on_symlinked_gitignore() {
+    // R15: a symlinked `.mpd/.gitignore` is refused — never followed, never
+    // written, the outside target never read into output — and config.json is
+    // left untouched (the diagnostics are read-only; --fix writes only the
+    // gitignore) (Cond 7).
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new("fixlink");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    let secret = sb.dir.join("outside_secret.txt");
+    std::fs::write(&secret, "TOP-SECRET-CONTENT").unwrap();
+    let gi_path = sb.dir.join(".mpd/.gitignore");
+    std::fs::remove_file(&gi_path).unwrap();
+    symlink(&secret, &gi_path).unwrap();
+    let cfg_before = std::fs::read(sb.dir.join(".mpd/config.json")).unwrap();
+
+    let out = sb.mpd(&["doctor", "--fix"]);
+    assert!(
+        !out.status.success(),
+        "fix must refuse a symlinked gitignore"
+    );
+    // No content of the target is echoed.
+    assert!(!stdout(&out).contains("TOP-SECRET-CONTENT"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("TOP-SECRET-CONTENT"));
+    // The symlink was neither followed (target unchanged) nor replaced.
+    assert!(std::fs::symlink_metadata(&gi_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOP-SECRET-CONTENT",
+        "the symlink target must not be overwritten"
+    );
+    // config.json is untouched by a refused --fix.
+    assert_eq!(
+        std::fs::read(sb.dir.join(".mpd/config.json")).unwrap(),
+        cfg_before,
+        "--fix must never touch config.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_symlinked_change_dir_is_refused_and_never_surfaced() {
+    // Security(code) SEC-CTX-1: read_capped lstat's only the FINAL path
+    // component, so an INTERMEDIATE directory symlink (the change dir itself)
+    // would be followed. read_contained's assert_contained must refuse it, so a
+    // symlinked change dir pointing at an out-of-tree, fully-authored artifact
+    // is never read and no strict gate passes on it. NON-VACUOUS: reverting
+    // read_contained to a bare read_capped surfaces SECRET-OUT-OF-TREE below.
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new("symdir");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["conduct", "victim", "--risk", "medium"]);
+
+    // An out-of-tree change dir whose design.md carries a fully-valid
+    // "## Conditions for Builder" section with a secret marker.
+    let outside = sb.dir.join("outside_change");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        outside.join("design.md"),
+        "# Design\n\n## Conditions for Builder\n\nSECRET-OUT-OF-TREE must never be \
+         surfaced; this body is long enough to clear the structural min-length \
+         floor and look like a genuine authored artifact for the gate.\n",
+    )
+    .unwrap();
+
+    // Replace the real change dir with a symlink to the out-of-tree dir (an
+    // intermediate directory component of every change-dir read).
+    let change_dir = sb.dir.join("openspec/changes/victim");
+    std::fs::remove_dir_all(&change_dir).unwrap();
+    symlink(&outside, &change_dir).unwrap();
+
+    // next --context must not follow the symlink or surface out-of-tree content.
+    let ctx = sb.mpd(&["next", "--context"]);
+    let ctx_all = stdout(&ctx) + &String::from_utf8_lossy(&ctx.stderr);
+    assert!(
+        !ctx_all.contains("SECRET-OUT-OF-TREE"),
+        "next --context followed an intermediate change-dir symlink: {ctx_all}"
+    );
+
+    // A strict judgment gate must refuse and never surface out-of-tree content.
+    let gate = sb.mpd(&["gate", "architecture", "--pass", "--evidence", "design.md"]);
+    assert!(
+        !gate.status.success(),
+        "strict gate accepted a symlinked-out-of-tree change dir: {}",
+        stdout(&gate)
+    );
+    let gate_all = stdout(&gate) + &String::from_utf8_lossy(&gate.stderr);
+    assert!(
+        !gate_all.contains("SECRET-OUT-OF-TREE"),
+        "gate surfaced out-of-tree content: {gate_all}"
+    );
+}
+
+#[test]
+fn doctor_fix_fails_closed_on_oversized_gitignore() {
+    // R15: an oversized `.mpd/.gitignore` (past read_capped's 16 MiB cap) is
+    // refused rather than read/rewritten, and config.json is untouched.
+    let sb = Sandbox::new("fixbig");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    let gi_path = sb.dir.join(".mpd/.gitignore");
+    // 16 MiB + 1 byte of a benign, non-transient line.
+    let big = vec![b'x'; 16 * 1024 * 1024 + 1];
+    std::fs::write(&gi_path, &big).unwrap();
+    let cfg_before = std::fs::read(sb.dir.join(".mpd/config.json")).unwrap();
+
+    let out = sb.mpd(&["doctor", "--fix"]);
+    assert!(
+        !out.status.success(),
+        "fix must refuse an oversized gitignore"
+    );
+    // Not truncated or rewritten.
+    assert_eq!(
+        std::fs::metadata(&gi_path).unwrap().len(),
+        big.len() as u64,
+        "the oversized file must not be truncated/rewritten"
+    );
+    assert_eq!(
+        std::fs::read(sb.dir.join(".mpd/config.json")).unwrap(),
+        cfg_before,
+        "--fix must never touch config.json"
+    );
 }
 
 /// Drive a fresh feature change to the Documentation phase.
@@ -1870,5 +2165,1101 @@ fn next_reflects_pending_closure_after_archive_instead_of_stale_archive_hint() {
     assert_eq!(
         json_out["release_closure"]["pending_closure"]["write_eligible"],
         false
+    );
+}
+
+#[test]
+fn conduct_sets_strict_and_prints_call_loop_contract() {
+    let sb = Sandbox::new("conduct");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    let out = sb.mpd(&["conduct", "self-enforce", "--risk", "high"]);
+    assert!(
+        out.status.success(),
+        "conduct failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    // The harness call-loop contract (design.md D2) is printed verbatim enough
+    // that an orchestrator learns the exact verb sequence, not just that strict
+    // is on.
+    assert!(text.contains("Strict tier ON"), "stdout={text}");
+    assert!(
+        text.contains("Strict harness call-loop"),
+        "conduct must print the call-loop contract: {text}"
+    );
+    assert!(
+        text.contains("mpd next --harness claude-code --context --json"),
+        "contract must name the next-with-context call: {text}"
+    );
+    assert!(
+        text.contains("mpd gate <phase> --pass --evidence <artifact_path>"),
+        "contract must name the gate call: {text}"
+    );
+    assert!(text.contains("mpd archive --yes"), "stdout={text}");
+
+    // strict is a durable, persisted bit (survives session death), not a flag on
+    // this one invocation.
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/self-enforce.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["strict"], true,
+        "conduct must set ledger.strict: {state}"
+    );
+
+    // conduct refuses an existing change dir (the same guard `begin` has).
+    let dup = sb.mpd(&["conduct", "self-enforce"]);
+    assert!(
+        !dup.status.success(),
+        "conduct must refuse an existing change dir"
+    );
+}
+
+#[test]
+fn begin_strict_is_the_same_bit_setter_as_conduct() {
+    let sb = Sandbox::new("begin-strict");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    let out = sb.mpd(&["begin", "strict-thing", "--strict"]);
+    assert!(
+        out.status.success(),
+        "begin --strict failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("Strict tier ON"));
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/strict-thing.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["strict"], true, "begin --strict must set the bit");
+    // A plain begin stays the manual tier (strict absent/false) — no behavior
+    // change for a human.
+    let sb2 = Sandbox::new("begin-plain");
+    sb2.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb2.mpd(&["begin", "plain-thing"]);
+    let state2: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb2.dir.join(".mpd/state/plain-thing.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state2["strict"], false, "a plain begin is the manual tier");
+}
+
+#[test]
+fn brief_scaffolds_a_judgment_stub_that_still_fails_the_gate() {
+    let sb = Sandbox::new("brief");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["conduct", "review-me"]);
+    let artifact = sb.dir.join("openspec/changes/review-me/security-code.md");
+    assert!(!artifact.exists(), "the stub should not exist before brief");
+
+    let out = sb.mpd(&["brief", "security-code"]);
+    assert!(
+        out.status.success(),
+        "brief failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("judgment stub"), "{}", stdout(&out));
+    let body = std::fs::read_to_string(&artifact).unwrap();
+    // The template carries exactly the sections security-code's judgment_artifact
+    // requires, including the high-risk Independent review / Refutation sections.
+    for section in [
+        "## Findings",
+        "## Conditions verified",
+        "## Independent review",
+        "## Refutation",
+        "## Verdict",
+    ] {
+        assert!(body.contains(section), "stub missing {section}: {body}");
+    }
+    // A freshly-scaffolded stub is NOT authored — it still carries unfilled
+    // `<!-- … -->` placeholders, so it fails the strict gate until a persona
+    // writes real content. Seeding can never satisfy the gate by itself.
+    assert!(
+        body.contains("<!--"),
+        "the stub must retain placeholders so it fails check_sections: {body}"
+    );
+
+    // brief is idempotent: it never overwrites authored content.
+    std::fs::write(&artifact, "# authored\n\nreal content, no placeholders\n").unwrap();
+    let again = sb.mpd(&["brief", "security-code"]);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(
+        stdout(&again).contains("already exists"),
+        "second brief must not clobber authored content: {}",
+        stdout(&again)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "# authored\n\nreal content, no placeholders\n",
+        "brief must never overwrite an authored artifact"
+    );
+
+    // A non-judgment phase has no artifact to scaffold — brief rejects it.
+    let bad = sb.mpd(&["brief", "build"]);
+    assert!(!bad.status.success(), "brief build must be rejected");
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("no judgment artifact"));
+}
+
+// ─── Stage 3: the strict gate branch (Task 1.7; R3/R5/R10/R11/R13/R17) ───
+
+/// Author a valid (placeholder-free, all-sections, past the min-length floor)
+/// judgment artifact for `phase` in a strict change so its strict gate passes.
+fn author_judgment(sb: &Sandbox, change: &str, phase: &str) {
+    let (file, sections): (&str, &[&str]) = match phase {
+        "architecture" => ("design.md", &["Conditions for Builder"]),
+        "security-plan" => (
+            "security-plan.md",
+            &["Threat model", "Conditions for Builder", "Verdict"],
+        ),
+        "security-code" => (
+            "security-code.md",
+            &["Findings", "Conditions verified", "Verdict"],
+        ),
+        "test" => ("test.md", &["Coverage", "Results", "Verdict"]),
+        other => panic!("author_judgment: unhandled phase {other}"),
+    };
+    let mut body = format!("# {phase} judgment\n\n");
+    for s in sections {
+        body.push_str(&format!(
+            "## {s}\n\nReal authored content for the {s} section — substantial enough \
+             to clear the minimum-length floor and carrying no template placeholders \
+             whatsoever.\n\n"
+        ));
+    }
+    sb.write(&format!("openspec/changes/{change}/{file}"), &body);
+}
+
+fn assert_gate_ok(sb: &Sandbox, phase: &str) {
+    let out = sb.mpd(&["gate", phase, "--pass"]);
+    assert!(
+        out.status.success(),
+        "gate {phase}: stdout={} stderr={}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Drive a fresh strict `--fix` change through architecture + security-plan +
+/// build (authoring each judgment artifact) so the next gate is security-code.
+fn strict_to_security_code(sb: &Sandbox, change: &str) {
+    strict_to_security_code_risk(sb, change, "low");
+}
+
+/// As [`strict_to_security_code`], at an explicit risk level (a re-drive after a
+/// rewind needs `medium`/`high` so the attempt-2 gates stay within the limit).
+fn strict_to_security_code_risk(sb: &Sandbox, change: &str, risk: &str) {
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix", "--risk", risk])
+        .status
+        .success());
+    author_judgment(sb, change, "architecture");
+    assert_gate_ok(sb, "architecture");
+    author_judgment(sb, change, "security-plan");
+    assert_gate_ok(sb, "security-plan");
+    // build has no judgment artifact; the passing test command clears it.
+    assert_gate_ok(sb, "build");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-code"
+    );
+}
+
+#[test]
+fn strict_gate_requires_the_phases_own_authored_artifact() {
+    // R3: a judgment gate refuses without its artifact; `--evidence smoke` is
+    // rejected; evidence must resolve to the phase's OWN artifact (kills the
+    // CARC aliasing); it passes when the artifact is authored.
+    let sb = Sandbox::new("strict-r3");
+    strict_to_security_code(&sb, "guard-me");
+
+    // (1) Refused with no artifact on disk — read_capped("") fails check_sections.
+    let bad = sb.mpd(&["gate", "security-code", "--pass"]);
+    assert!(
+        !bad.status.success(),
+        "a missing judgment artifact must refuse the gate"
+    );
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        err.contains("security-code.md incomplete"),
+        "must fail structurally: {err}"
+    );
+    // The refusal prints the working escape (Cond 15).
+    assert!(
+        err.contains("mpd brief security-code"),
+        "no brief escape: {err}"
+    );
+    assert!(err.contains("--waive-artifact"), "no waive escape: {err}");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-code",
+        "a refused gate does not advance"
+    );
+
+    // (2) `--evidence smoke` (a non-file pointer) is rejected — the exact CARC hole.
+    author_judgment(&sb, "guard-me", "security-code");
+    let smoke = sb.mpd(&["gate", "security-code", "--pass", "--evidence", "smoke"]);
+    assert!(!smoke.status.success(), "--evidence smoke must be rejected");
+    assert!(String::from_utf8_lossy(&smoke.stderr).contains("does not exist"));
+
+    // (3) Evidence must be the phase's own artifact, not another real file.
+    let alias = sb.mpd(&["gate", "security-code", "--pass", "--evidence", "design.md"]);
+    assert!(
+        !alias.status.success(),
+        "aliasing another real artifact must be rejected"
+    );
+    assert!(String::from_utf8_lossy(&alias.stderr).contains("its own artifact"));
+
+    // (4) Passes when authored; omitted evidence defaults to the phase artifact.
+    let ok = sb.mpd(&["gate", "security-code", "--pass"]);
+    assert!(
+        ok.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let st = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(
+        st["gates"]["security-code"]["evidence"], "security-code.md",
+        "omitted --evidence defaults to the phase's own artifact"
+    );
+}
+
+#[test]
+fn strict_waiver_bypasses_only_the_artifact_check_never_objective_gates() {
+    // R5: a waiver bypasses ONLY the strict judgment check — never tests/secret/
+    // doc, never a FAIL; the reason is bounded + terminal-safe.
+    let sb = Sandbox::new("strict-r5");
+    strict_to_security_code(&sb, "waive-me");
+
+    // Positive: waive the (missing) security-code artifact → advances, loud
+    // banner, recorded as an attempt-scoped waiver.
+    let ok = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--waive-artifact",
+        "re-audited by a human offline",
+    ]);
+    assert!(
+        ok.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        stdout(&ok).contains("WAIVED"),
+        "loud banner: {}",
+        stdout(&ok)
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "test",
+        "the waiver advances only past the artifact check, to the next phase"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/waive-me.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["waivers"][0]["phase"], "security-code");
+    assert_eq!(state["waivers"][0]["attempt"], 1);
+    assert_eq!(
+        state["waivers"][0]["reason"],
+        "re-audited by a human offline"
+    );
+
+    // Negative 1: a waiver NEVER bypasses the objective test gate. Point the test
+    // command at a failing command; even with a waiver the test gate refuses, and
+    // no waiver is recorded for it.
+    sb.write(".mpd/config.json", "{\n  \"test\": \"false\"\n}\n");
+    let blocked = sb.mpd(&[
+        "gate",
+        "test",
+        "--pass",
+        "--waive-artifact",
+        "waive the artifact, not the tests",
+    ]);
+    assert!(
+        !blocked.status.success(),
+        "the objective test gate must still block through a waiver"
+    );
+    let state2: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/waive-me.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "test");
+    assert_eq!(
+        state2["waivers"].as_array().unwrap().len(),
+        1,
+        "the blocked gate recorded no new waiver"
+    );
+
+    // Negative 2: a blank reason is rejected (bounded_text).
+    sb.write(
+        ".mpd/config.json",
+        &format!("{{\n  \"test\": {PASSING_TEST_CMD:?}\n}}\n"),
+    );
+    let blank = sb.mpd(&["gate", "test", "--pass", "--waive-artifact", "   "]);
+    assert!(
+        !blank.status.success(),
+        "a blank waiver reason must be rejected"
+    );
+    assert!(String::from_utf8_lossy(&blank.stderr).contains("waiver reason must not be blank"));
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_symlinked_artifact_reads_empty_and_never_exfils() {
+    // R10 / Conditions 1–2: a symlinked artifact or evidence reads as empty and
+    // fails structurally — never followed — and validation surfaces no content.
+    use std::os::unix::fs::symlink;
+    let sb = Sandbox::new("strict-r10");
+    strict_to_security_code(&sb, "linky");
+
+    // A complete-looking artifact placed OUTSIDE the change, then linked in. A
+    // naive reader would follow the link, pass the gate, and leak the secret.
+    let canary = "canary-must-not-leak-marker";
+    let target = sb.dir.join("elsewhere.md");
+    std::fs::write(
+        &target,
+        format!(
+            "# x\n\n## Findings\n{canary}\n\n## Conditions verified\nverified.\n\n\
+             ## Verdict\nPASS, with plenty of authored content well past the floor.\n"
+        ),
+    )
+    .unwrap();
+    let artifact = sb.dir.join("openspec/changes/linky/security-code.md");
+    let _ = std::fs::remove_file(&artifact);
+    symlink(&target, &artifact).unwrap();
+
+    let out = sb.mpd(&["gate", "security-code", "--pass"]);
+    assert!(
+        !out.status.success(),
+        "a symlinked artifact must not satisfy the gate"
+    );
+    let combined = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        combined.contains("security-code.md incomplete"),
+        "a symlinked artifact reads empty and fails structurally: {combined}"
+    );
+    assert!(
+        !combined.contains(canary),
+        "artifact content must never be surfaced: {combined}"
+    );
+
+    // A symlinked --evidence pointer is likewise refused, never followed.
+    let ev = sb.dir.join("openspec/changes/linky/ev-link.md");
+    symlink(&target, &ev).unwrap();
+    let out2 = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--evidence",
+        "ev-link.md",
+    ]);
+    assert!(
+        !out2.status.success(),
+        "a symlinked evidence pointer must be refused"
+    );
+    let err2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        err2.contains("symlink"),
+        "evidence symlink must be refused: {err2}"
+    );
+    assert!(
+        !err2.contains(canary),
+        "evidence validation must exfil nothing: {err2}"
+    );
+}
+
+#[test]
+fn strict_waiver_is_attempt_scoped_across_a_reconcile_rewind() {
+    // R11 / B1: a waiver recorded at attempt 1 is dropped by a threat-profile
+    // rewind, so the attempt-2 re-run demands the artifact again.
+    let sb = Sandbox::new("strict-r11");
+    // High risk so the attempt-2 gates after the rewind stay within the limit.
+    strict_to_security_code_risk(&sb, "rewind-me", "high");
+
+    // Waive security-code at attempt 1 (no artifact authored) → advances.
+    let waived = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--waive-artifact",
+        "manually re-audited offline",
+    ]);
+    assert!(
+        waived.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&waived.stderr)
+    );
+
+    // A threat-profile reconcile rewinds to security-plan and DROPS the attempt-1
+    // security-code waiver.
+    let rec = sb.mpd(&[
+        "reconcile",
+        "--threat-profile",
+        "network-server",
+        "the input is now untrusted",
+    ]);
+    assert!(
+        rec.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&rec.stderr)
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-plan"
+    );
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/rewind-me.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["waivers"].as_array().unwrap().len(),
+        0,
+        "the rewind drops the attempt-1 security-code waiver"
+    );
+
+    // Re-drive to security-code (attempt 2). The dropped waiver no longer
+    // applies, so the gate demands the artifact again.
+    assert_gate_ok(&sb, "security-plan");
+    assert_gate_ok(&sb, "build");
+    let demand = sb.mpd(&["gate", "security-code", "--pass"]);
+    assert!(
+        !demand.status.success(),
+        "attempt 2 must demand the artifact again — the stale waiver is gone"
+    );
+    assert!(String::from_utf8_lossy(&demand.stderr).contains("security-code.md incomplete"));
+}
+
+#[test]
+fn strict_reuse_still_requires_the_phases_own_artifact() {
+    // R13 / B3: the `--reuse` early-return path still enforces the strict
+    // artifact check — its own artifact must exist and pass check_sections.
+    let sb = Sandbox::new("strict-r13");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "reuse-strict", "--strict", "--fix"])
+        .status
+        .success());
+    author_judgment(&sb, "reuse-strict", "architecture");
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+    let receipt = json(&sb.mpd(&["status", "--json"]))["gates"]["architecture"]["receipt"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Positive: with the artifact still complete, strict reuse proceeds.
+    let ok = sb.mpd(&["gate", "architecture", "--pass", "--reuse", &receipt]);
+    assert!(
+        ok.status.success(),
+        "strict reuse with a complete artifact must proceed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(stdout(&ok).contains("reused PASS"));
+
+    // Negative: evaporate the artifact → the reuse path refuses (before any
+    // receipt evaluation), with the escape.
+    sb.write(
+        "openspec/changes/reuse-strict/design.md",
+        "# gone\n\nno sections here, no conditions\n",
+    );
+    let bad = sb.mpd(&["gate", "architecture", "--pass", "--reuse", &receipt]);
+    assert!(
+        !bad.status.success(),
+        "reuse must not bypass the anti-evaporation guarantee"
+    );
+    let err = String::from_utf8_lossy(&bad.stderr);
+    assert!(err.contains("design.md incomplete"), "{err}");
+    assert!(
+        err.contains("mpd brief architecture"),
+        "escape missing: {err}"
+    );
+    assert!(
+        !stdout(&bad).contains("reused PASS"),
+        "an incomplete artifact must never yield a silent reused PASS"
+    );
+}
+
+#[test]
+fn strict_waive_artifact_is_rejected_with_reuse_and_requires_pass() {
+    // R17 / M1: `--waive-artifact` is rejected with `--reuse` (before the reuse
+    // early-return), requires `--pass`, and is rejected on a non-judgment phase.
+    let sb = Sandbox::new("strict-r17");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "combo", "--strict", "--fix"])
+        .status
+        .success());
+    author_judgment(&sb, "combo", "architecture");
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+    let receipt = json(&sb.mpd(&["status", "--json"]))["gates"]["architecture"]["receipt"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // waive + reuse is rejected at the top — never a silent reused PASS.
+    let combo = sb.mpd(&[
+        "gate",
+        "architecture",
+        "--pass",
+        "--reuse",
+        &receipt,
+        "--waive-artifact",
+        "x",
+    ]);
+    assert!(!combo.status.success(), "waive + reuse must be rejected");
+    assert!(String::from_utf8_lossy(&combo.stderr).contains("cannot combine with --reuse"));
+    assert!(
+        !stdout(&combo).contains("reused PASS"),
+        "must never be a silent reused PASS"
+    );
+
+    // waive requires --pass (it can never convert a FAIL).
+    let fail = sb.mpd(&[
+        "gate",
+        "security-plan",
+        "--fail",
+        "--class",
+        "product",
+        "--waive-artifact",
+        "x",
+    ]);
+    assert!(!fail.status.success());
+    assert!(String::from_utf8_lossy(&fail.stderr).contains("requires --pass"));
+
+    // waive on a non-judgment phase is rejected (audit hygiene). Advance to build.
+    author_judgment(&sb, "combo", "security-plan");
+    assert!(sb
+        .mpd(&["gate", "security-plan", "--pass"])
+        .status
+        .success());
+    let nonjud = sb.mpd(&["gate", "build", "--pass", "--waive-artifact", "x"]);
+    assert!(
+        !nonjud.status.success(),
+        "a non-judgment phase has no artifact to waive"
+    );
+    assert!(String::from_utf8_lossy(&nonjud.stderr).contains("no judgment artifact"));
+}
+
+#[test]
+fn manual_tier_rejects_a_waiver_and_stays_inert() {
+    // R1/D3: on a manual-tier (strict=false) change, `--waive-artifact` is
+    // refused rather than silently recording a phantom waiver — the manual tier
+    // is byte-identical to today.
+    let sb = Sandbox::new("manual-waive");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb.mpd(&["begin", "plain", "--fix"]).status.success());
+    fill_artifacts(&sb, "plain");
+    let out = sb.mpd(&["gate", "architecture", "--pass", "--waive-artifact", "x"]);
+    assert!(
+        !out.status.success(),
+        "a waiver on a manual-tier change must be refused"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires the strict tier"));
+    // A plain gate (no waiver) on the manual tier still passes untouched, and
+    // never records a waiver.
+    assert!(sb.mpd(&["gate", "architecture", "--pass"]).status.success());
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/plain.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["waivers"]
+            .as_array()
+            .map(|w| w.is_empty())
+            .unwrap_or(true),
+        "the manual tier records no waivers"
+    );
+}
+
+// ─── Stage 4: archive strict re-check + transient pre-flight (Task 1.8/2.3;
+// R4/R12 + the pre-flight half of R7) ───
+
+/// Drive a fresh strict `--fix` change all the way to archive-ready: fill the
+/// core artifacts, author + gate every judgment phase (architecture →
+/// security-plan → build → security-code → test), leaving the phase at Deploy
+/// with `ready_to_archive == true`. design.md doubles as the Architecture
+/// judgment artifact (it carries `## Conditions for Builder`), so it is authored
+/// via `author_judgment` rather than the placeholder-free-but-section-less
+/// `fill_artifacts`.
+fn strict_fix_to_archive_ready(sb: &Sandbox, change: &str) {
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix"])
+        .status
+        .success());
+    for name in ["proposal.md", "tasks.md"] {
+        sb.write(
+            &format!("openspec/changes/{change}/{name}"),
+            &format!("# {name}\n\nReal filled content, no template placeholders.\n"),
+        );
+    }
+    author_judgment(sb, change, "architecture");
+    assert_gate_ok(sb, "architecture");
+    author_judgment(sb, change, "security-plan");
+    assert_gate_ok(sb, "security-plan");
+    assert_gate_ok(sb, "build");
+    author_judgment(sb, change, "security-code");
+    assert_gate_ok(sb, "security-code");
+    author_judgment(sb, change, "test");
+    assert_gate_ok(sb, "test");
+    let s = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(s["phase"], "deploy", "a fix ends at deploy after test: {s}");
+    assert_eq!(s["ready_to_archive"], true, "{s}");
+}
+
+#[test]
+fn strict_archive_refuses_an_evaporated_judgment_artifact() {
+    // R4 / Cond 9: a judgment artifact that passed its gate can still evaporate
+    // before archive — the exact CARC hole this change closes. The archive
+    // re-check refuses (with the working escape); `mpd brief` re-creates only a
+    // placeholder stub (still refused); authoring real content lets it succeed.
+    let sb = Sandbox::new("archive-r4");
+    strict_fix_to_archive_ready(&sb, "evaporate");
+
+    // Evaporate the security-code artifact after its gate has already passed.
+    std::fs::remove_file(sb.dir.join("openspec/changes/evaporate/security-code.md")).unwrap();
+
+    // The re-check runs before the dry-run branch, so even a dry-run refuses.
+    let dry = sb.mpd(&["archive"]);
+    assert!(
+        !dry.status.success(),
+        "a dry-run must refuse an evaporated judgment artifact"
+    );
+    let derr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        derr.contains("evaporated after their gate"),
+        "must name the failure class: {derr}"
+    );
+    assert!(
+        derr.contains("security-code.md incomplete"),
+        "must name the evaporated artifact: {derr}"
+    );
+    assert!(
+        derr.contains("mpd brief security-code"),
+        "the refusal must print the working escape (Cond 15): {derr}"
+    );
+
+    // `--yes` fails closed too; the change directory is not moved.
+    let yes = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        !yes.status.success(),
+        "--yes must refuse an evaporated artifact"
+    );
+    assert!(
+        sb.dir.join("openspec/changes/evaporate").exists(),
+        "a refused archive must not move the change"
+    );
+
+    // `mpd brief` re-creates the stub — but a stub carries `<!-- … -->`
+    // placeholders, so the structural re-check STILL refuses (existence is not
+    // enough).
+    assert!(sb.mpd(&["brief", "security-code"]).status.success());
+    let stub = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        !stub.status.success(),
+        "a re-scaffolded placeholder stub must not satisfy the re-check"
+    );
+
+    // Authoring real content clears the re-check and the archive proceeds.
+    author_judgment(&sb, "evaporate", "security-code");
+    let ok = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        ok.status.success(),
+        "archive must succeed once the artifact is authored: {} / {}",
+        stdout(&ok),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(
+        !sb.dir.join("openspec/changes/evaporate").exists(),
+        "the change moved to the archive"
+    );
+}
+
+#[test]
+fn strict_archive_succeeds_with_a_gate_time_waived_phase() {
+    // R12 / B2 (Cond 9): a phase whose artifact was waived at gate time has no
+    // artifact on disk. The re-check must count it WAIVED (audit summary) instead
+    // of demanding the never-authored artifact — otherwise a legitimate waiver is
+    // an un-archivable dead-end.
+    let sb = Sandbox::new("archive-r12");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "waive-archive", "--strict", "--fix"])
+        .status
+        .success());
+    for name in ["proposal.md", "tasks.md"] {
+        sb.write(
+            &format!("openspec/changes/waive-archive/{name}"),
+            &format!("# {name}\n\nReal filled content, no template placeholders.\n"),
+        );
+    }
+    author_judgment(&sb, "waive-archive", "architecture");
+    assert_gate_ok(&sb, "architecture");
+    author_judgment(&sb, "waive-archive", "security-plan");
+    assert_gate_ok(&sb, "security-plan");
+    assert_gate_ok(&sb, "build");
+    // Waive security-code's artifact at gate time — it is never authored.
+    let waived = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--waive-artifact",
+        "re-audited by a human offline",
+    ]);
+    assert!(
+        waived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waived.stderr)
+    );
+    author_judgment(&sb, "waive-archive", "test");
+    assert_gate_ok(&sb, "test");
+
+    // No security-code.md exists, yet the archive must succeed and surface WAIVED.
+    assert!(!sb
+        .dir
+        .join("openspec/changes/waive-archive/security-code.md")
+        .exists());
+    let out = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        out.status.success(),
+        "a validly-waived phase must not block archive: {} / {}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let so = stdout(&out);
+    assert!(
+        so.contains("WAIVED") && so.contains("Security (code)"),
+        "the waived phase must appear in the archive audit summary: {so}"
+    );
+    assert!(
+        !sb.dir.join("openspec/changes/waive-archive").exists(),
+        "the change moved to the archive despite the waiver"
+    );
+}
+
+#[test]
+fn archive_preflight_refuses_uncovered_transient_paths() {
+    // Cond 8 (the pre-flight half of R7): an un-gitignored transient `.mpd/` path
+    // warns on a dry-run and fails-closed on `--yes`. Restoring full `.gitignore`
+    // coverage (what `mpd doctor --fix` writes) clears it and archive succeeds —
+    // the `doctor --fix` verb itself lands in a later stage.
+    let sb = Sandbox::new("archive-preflight");
+    strict_fix_to_archive_ready(&sb, "preflight");
+
+    // Dirty: drop `/current` from `.mpd/.gitignore` while `.mpd/current` exists,
+    // so the transient current-change pointer would be committed.
+    assert!(sb.dir.join(".mpd/current").exists());
+    sb.write(
+        ".mpd/.gitignore",
+        "/tmp/\n/pending-closure\n/parity-observations.json\n",
+    );
+
+    // A dry-run only warns (exit 0) and points at the heal verb.
+    let dry = sb.mpd(&["archive"]);
+    let derr = String::from_utf8_lossy(&dry.stderr);
+    assert!(
+        derr.contains(".mpd/current"),
+        "the dry-run must name the un-covered transient path: {derr}"
+    );
+    assert!(
+        derr.contains("mpd doctor --fix"),
+        "the dry-run must point at the heal verb: {derr}"
+    );
+    assert!(dry.status.success(), "a dry-run only warns: {derr}");
+
+    // `--yes` fails closed and moves nothing.
+    let yes = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        !yes.status.success(),
+        "--yes must fail closed on an un-covered transient path"
+    );
+    assert!(String::from_utf8_lossy(&yes.stderr).contains("Refusing to archive"));
+    assert!(
+        sb.dir.join("openspec/changes/preflight").exists(),
+        "a refused archive must not move the change"
+    );
+
+    // Restoring full coverage (exactly what `doctor --fix` writes) clears the
+    // pre-flight; archive succeeds.
+    sb.write(
+        ".mpd/.gitignore",
+        "/current\n/tmp/\n/pending-closure\n/parity-observations.json\n",
+    );
+    let ok = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        ok.status.success(),
+        "archive must succeed once transient coverage is restored: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+}
+
+// ─── Stage 6: model bump + next --context + status --brief + autonomous
+// reconcile (Task 3.1–3.4; R8/R9/R14/R16) ───
+
+#[test]
+fn next_context_emits_the_phase_slice_and_enriched_json() {
+    // Task 3.2: `--context` cuts a harness's load to the phase slice and enriches
+    // the machine envelope with `artifact_path` + the strict `gate_command`.
+    let sb = Sandbox::new("next-context");
+    strict_to_security_code(&sb, "ctx"); // at security-code; design.md carries Conditions
+
+    // JSON: artifact_path + strict gate_command for the current phase.
+    let j = json(&sb.mpd(&["next", "--harness", "claude-code", "--context", "--json"]));
+    assert_eq!(j["phase"], "security-code");
+    assert_eq!(j["artifact_path"], "security-code.md");
+    assert_eq!(
+        j["gate_command"],
+        "mpd gate security-code --pass --evidence security-code.md"
+    );
+    // Without --context the enrichment is absent (default envelope unchanged).
+    let plain = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
+    assert!(plain.get("artifact_path").is_none());
+
+    // Text slice: persona, the upstream artifact pointer, the manifest scope, and
+    // the extracted `## Conditions for Builder` block from design.md.
+    let s = stdout(&sb.mpd(&["next", "--harness", "claude-code", "--context"]));
+    assert!(s.contains("context slice"), "{s}");
+    assert!(
+        s.contains("## Conditions for Builder"),
+        "conditions block: {s}"
+    );
+    assert!(s.contains("security-plan.md"), "upstream pointer: {s}");
+    assert!(s.contains("Manifest scope"), "manifest scope: {s}");
+    assert!(
+        s.contains("mpd gate security-code --pass --evidence security-code.md"),
+        "strict gate command: {s}"
+    );
+}
+
+#[test]
+fn status_brief_is_compact_and_json_is_unaffected() {
+    // Task 3.3: `--brief` is an opt-in compact summary; `--json` is unchanged.
+    let sb = Sandbox::new("status-brief");
+    strict_to_security_code(&sb, "brf");
+
+    let s = stdout(&sb.mpd(&["status", "--brief"]));
+    assert!(s.contains("phase: Security (code)"), "{s}");
+    assert!(s.contains("strict tier"), "{s}");
+    assert!(s.contains("Ready to archive: no"), "{s}");
+    // The compact form omits the full report's verbose sections.
+    assert!(
+        !s.contains("Pipeline:"),
+        "brief omits the pipeline block: {s}"
+    );
+    assert!(
+        !s.contains("Evidence:"),
+        "brief omits the evidence block: {s}"
+    );
+
+    // --json --brief: json still wins, envelope unchanged.
+    let j = json(&sb.mpd(&["status", "--json", "--brief"]));
+    assert_eq!(j["phase"], "security-code");
+    assert!(j["ready_to_archive"].is_boolean());
+    assert!(j["gates"].is_object());
+}
+
+#[test]
+fn high_risk_next_shows_the_deep_tier_bump() {
+    // R8 (e2e): at risk=High the Security persona's resolved model is bumped from
+    // the seeded standard tier to the harness deep model, surfaced in the brief.
+    let sb = Sandbox::new("bump-next");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "hot", "--fix", "--risk", "high"]);
+    sb.mpd(&["gate", "architecture", "--pass"]); // advance to security-plan
+
+    let j = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
+    assert_eq!(j["phase"], "security-plan");
+    assert_eq!(
+        j["model"], "fable",
+        "Security is elevated to the deep model"
+    );
+    assert_eq!(j["deep_tier_bump"], true);
+    let text = stdout(&sb.mpd(&["next", "--harness", "claude-code"]));
+    assert!(
+        text.contains("risk=high → deep tier"),
+        "the bump note must render: {text}"
+    );
+}
+
+#[test]
+fn autonomous_reconcile_allows_safe_moves_and_halts_rigor_weakening() {
+    // R9 / R14 / Cond 12: under --autonomous, --continue/--narrow/a --risk upgrade
+    // proceed; any --risk downgrade and ANY threat-profile change halt-and-report
+    // (exit 3), applying nothing. Without --autonomous the same moves proceed.
+    let sb = Sandbox::new("auto-reconcile");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "gov", "--fix", "--risk", "medium"]);
+
+    let cont = sb.mpd(&["reconcile", "--autonomous", "--continue", "fix is staged"]);
+    assert!(
+        cont.status.success(),
+        "continue proceeds: {}",
+        String::from_utf8_lossy(&cont.stderr)
+    );
+    let narrow = sb.mpd(&["reconcile", "--autonomous", "--narrow", "reduced scope"]);
+    assert!(narrow.status.success(), "narrow proceeds");
+
+    // A risk UPGRADE (medium → high) proceeds.
+    let up = sb.mpd(&["reconcile", "--autonomous", "--risk", "high", "raise rigor"]);
+    assert!(
+        up.status.success(),
+        "risk upgrade proceeds: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["governance"]["risk"],
+        "high"
+    );
+
+    // A risk DOWNGRADE (high → low) halts with the distinct code 3, changing nothing.
+    let down = sb.mpd(&["reconcile", "--autonomous", "--risk", "low", "lower rigor"]);
+    assert_eq!(down.status.code(), Some(3), "downgrade halts");
+    assert!(String::from_utf8_lossy(&down.stderr).contains("human decision"));
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["governance"]["risk"],
+        "high",
+        "a halted downgrade applies nothing"
+    );
+
+    // ANY threat-profile change halts (the enum is unordered → all changes halt).
+    let tp = sb.mpd(&[
+        "reconcile",
+        "--autonomous",
+        "--threat-profile",
+        "network-server",
+        "new boundary",
+    ]);
+    assert_eq!(tp.status.code(), Some(3), "threat-profile change halts");
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["governance"]["threat_profile"],
+        "local-trusted-user",
+        "a halted threat-profile change applies nothing"
+    );
+
+    // Without --autonomous the same downgrade is a legitimate human decision.
+    let manual = sb.mpd(&["reconcile", "--risk", "low", "human lowers rigor"]);
+    assert!(
+        manual.status.success(),
+        "a human-driven downgrade proceeds: {}",
+        String::from_utf8_lossy(&manual.stderr)
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["governance"]["risk"],
+        "low"
+    );
+}
+
+#[test]
+fn autonomous_gate_halts_a_security_artifact_waiver_but_not_a_non_security_one() {
+    // R14 / Cond 12: under --autonomous a Security-phase artifact waiver is a
+    // human decision (halt-and-report, exit 3, records nothing); a non-Security
+    // judgment phase may still be waived autonomously.
+    let sb = Sandbox::new("auto-gate");
+    strict_to_security_code(&sb, "sec"); // at security-code
+
+    let halt = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--autonomous",
+        "--waive-artifact",
+        "trust me",
+    ]);
+    assert_eq!(
+        halt.status.code(),
+        Some(3),
+        "a Security waiver halts under --autonomous: {}",
+        String::from_utf8_lossy(&halt.stderr)
+    );
+    assert!(String::from_utf8_lossy(&halt.stderr).contains("human decision"));
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-code",
+        "the halted gate never advanced"
+    );
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.dir.join(".mpd/state/sec.json")).unwrap())
+            .unwrap();
+    assert!(
+        state["waivers"].as_array().unwrap().is_empty(),
+        "the halted waiver recorded nothing"
+    );
+
+    // A human-driven Security waiver (no --autonomous) proceeds.
+    let ok = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--waive-artifact",
+        "re-audited offline",
+    ]);
+    assert!(
+        ok.status.success(),
+        "a human-driven Security waiver proceeds: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    // A non-Security judgment phase (Architecture) may be waived autonomously.
+    let sb2 = Sandbox::new("auto-gate-arch");
+    sb2.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb2.mpd(&["begin", "archwaive", "--strict", "--fix"]);
+    let arch = sb2.mpd(&[
+        "gate",
+        "architecture",
+        "--pass",
+        "--autonomous",
+        "--waive-artifact",
+        "conditions live in the proposal",
+    ]);
+    assert!(
+        arch.status.success(),
+        "a non-Security autonomous waiver proceeds: {}",
+        String::from_utf8_lossy(&arch.stderr)
+    );
+    assert!(stdout(&arch).contains("WAIVED"), "{}", stdout(&arch));
+}
+
+#[test]
+fn strict_next_surfaces_human_decision_at_the_attempt_limit() {
+    // Task 3.4: a strict change that FAILs its only allowed attempt reaches a
+    // reconciliation the harness may not self-authorize; `mpd next` surfaces the
+    // human-decision halt rather than silently offering another attempt.
+    let sb = Sandbox::new("strict-next-halt");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "limit", "--strict", "--fix", "--risk", "low"]);
+    let fail = sb.mpd(&["gate", "architecture", "--fail", "--class", "product"]);
+    assert!(
+        fail.status.success(),
+        "recording a FAIL: {}",
+        String::from_utf8_lossy(&fail.stderr)
+    );
+    let s = stdout(&sb.mpd(&["next", "--harness", "claude-code"]));
+    assert!(
+        s.to_lowercase()
+            .contains("reconciliation required — human decision"),
+        "strict next must surface the human-decision halt at the attempt limit: {s}"
     );
 }

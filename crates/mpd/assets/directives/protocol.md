@@ -31,6 +31,57 @@ save time:
 - Everything else is mandatory. Small or docs-only changes use concise,
   proportionate artifacts; size or familiarity never bypasses a gate.
 
+## Two ways to drive mpd
+
+mpd exposes one code path under two tiers, selected per change by a durable
+`strict` bit. A dropped call in a strict run degrades loudly, not silently — the
+exact hole through which an adversarial record can otherwise evaporate.
+
+**Humans — manual verbs.** Drive the pipeline by hand with full control: `mpd
+next` for the next step, `mpd gate <phase> --pass` to record a verdict, `mpd
+status` to inspect. Only the objective gates (build/test pass count, secret scan,
+`documentation.md` structure, deploy, closure coherence) are enforced; judgment
+artifacts are not demanded. This tier is byte-identical to the classic flow.
+
+**Model harnesses — `mpd conduct <name>`.** `conduct` (or `begin --strict`)
+begins the change, sets `strict=true`, seeds the first phase's judgment stub, and
+prints the call-loop contract. The motion stays the *unchanged* `next → spawn
+persona → gate` verbs — there is no forked driver:
+
+```
+mpd conduct <name> --risk high
+loop:
+  brief=$(mpd next --harness claude-code --context --json)  # slice + persona + model + artifact_path + gate_command
+  break if brief.phase == "done"
+  # spawn the persona at brief.model, fill brief.artifact_path, do the work
+  mpd gate <phase> --pass --evidence <artifact_path>        # strict checks auto-apply from ledger.strict
+mpd archive --yes
+```
+
+Under strict, every judgment gate demands its own non-stub artifact
+(security-plan.md, security-code.md, design-review.md, design-signoff.md,
+test.md, doc-validation.md), `--evidence` must resolve to *that phase's own*
+artifact (not a basename alias), high-risk security-code additionally requires
+`Independent review` + `Refutation` sections, and archive re-checks that every
+applicable artifact survived post-gate. `strict` is write-once and survives
+session death, so a resumed harness gets the same strictness.
+
+**Both tiers share the escape verbs** — every strict requirement has a
+one-command escape, so a refusal is never a dead-end:
+
+- `mpd brief <phase>` — scaffold a phase's judgment-artifact stub to author.
+- `mpd gate <phase> --pass --waive-artifact "reason"` — waive the artifact check
+  with a bounded, append-only, audited reason (loud WAIVED banner; never bypasses
+  an objective gate and never converts a FAIL). Waivers are attempt-scoped; a
+  reconcile rewind drops them so a re-run demands the artifact again.
+- `mpd use <change>` — restore `.mpd/current` after it was cleared.
+- `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent,
+  fail-closed).
+
+Strict is set once, at `conduct`/`begin --strict`, and is monotonic (no path sets
+it back to false). There is no verb to promote an already-begun non-strict change
+to strict without re-`begin`ing under `conduct` — the harness opts in once.
+
 ## Proportional governance
 
 Every change declares a risk level (`low`, `medium`, or `high`) and a credible

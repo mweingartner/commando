@@ -433,3 +433,37 @@ fn count_tasks(text: &str) -> TaskStatus {
     }
     status
 }
+
+#[cfg(all(test, unix))]
+mod containment_tests {
+    use super::assert_contained;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn refuses_an_intermediate_directory_symlink() {
+        // `read_capped`'s final-only lstat misses an intermediate-directory
+        // symlink; `assert_contained` (which `read_contained` relies on) must
+        // refuse every symlinked component, including the change-dir one.
+        let base = std::env::temp_dir().join(format!(
+            "mpd-contain-int-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("changes")).unwrap();
+        let outside = base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("design.md"), "secret").unwrap();
+        symlink(&outside, base.join("changes/c")).unwrap(); // intermediate component
+        assert!(
+            assert_contained(&base, &base.join("changes/c/design.md")).is_err(),
+            "an intermediate-directory symlink escaping base must be refused"
+        );
+        // Control: a real in-base path passes every component check.
+        fs::create_dir_all(base.join("changes/real")).unwrap();
+        fs::write(base.join("changes/real/design.md"), "ok").unwrap();
+        assert!(assert_contained(&base, &base.join("changes/real/design.md")).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+}

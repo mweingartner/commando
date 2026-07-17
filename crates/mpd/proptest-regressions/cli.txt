@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8db24f7cd8a728500387c0a921173012743a2dd9b61ec35f531865d7b5cc17d0 # shrinks to body = "ࠀ0\tAA¡aA0 0Aࠀ¡𐀀ࠀࠀ𐀀𐀀\t0𐀀 𐀀 aA A𐀀𐀀a 𐀀𐀀ࠀࠀ𐀀𐀀0 𐀀 𐀀𐀀\t𐀀¡aa0A𐀀\t𐀀𐀀\taA𐀀𐀀𐀀 𐀀 0¡0𐀀𐀀0¡0", section = "a", max_len = 1
+cc 7eb29e23da08a6996d838fa7ea66084d01f7a1064410e277036acaadf24d3fea # shrinks to parts = ["proposal.md"], anchor = None

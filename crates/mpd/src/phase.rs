@@ -111,6 +111,76 @@ impl Phase {
         matches!(self, Documentation)
     }
 
+    /// The judgment artifact this phase must produce under the strict tier, as
+    /// `(filename, required "##" sections)`. A judgment phase whose adversarial
+    /// record would otherwise evaporate maps to its own durable artifact; every
+    /// non-judgment phase returns `None` (design.md D4/D6). Architecture is a
+    /// special case: it keeps the core `design.md` artifact, and the strict check
+    /// only requires the `Conditions for Builder` section be present. The
+    /// high-risk Security (code) additions (`Independent review`, `Refutation`)
+    /// are layered on at the gate, not here.
+    // Consumed by the strict gate + archive re-check (later stages); exercised
+    // now by the mapping unit test.
+    #[allow(dead_code)]
+    pub fn judgment_artifact(self) -> Option<(&'static str, &'static [&'static str])> {
+        match self {
+            SecurityPlan => Some((
+                "security-plan.md",
+                &["Threat model", "Conditions for Builder", "Verdict"],
+            )),
+            SecurityCode => Some((
+                "security-code.md",
+                &["Findings", "Conditions verified", "Verdict"],
+            )),
+            DesignReview => Some(("design-review.md", &["Intent check", "Verdict"])),
+            DesignSignoff => Some((
+                "design-signoff.md",
+                &["Implementation vs intent", "Verdict"],
+            )),
+            Test => Some(("test.md", &["Coverage", "Results", "Verdict"])),
+            DocValidation => Some((
+                "doc-validation.md",
+                &["Architect lens", "Designer lens", "Verdict"],
+            )),
+            // design.md is a core artifact; strict only demands the Conditions.
+            Architecture => Some(("design.md", &["Conditions for Builder"])),
+            _ => None,
+        }
+    }
+
+    /// The one or two upstream phases whose artifact this phase's persona needs,
+    /// for the strict-mode context pack (`mpd next --context`). Every entry
+    /// precedes `self` in the pipeline; the consumer resolves each to its
+    /// [`Phase::judgment_artifact`] and skips phases (or applicability-excluded
+    /// phases) that have none.
+    // Consumed by `mpd next --context` (a later stage); exercised now by the
+    // ordering unit test.
+    #[allow(dead_code)]
+    pub fn upstream_context(self) -> &'static [Phase] {
+        match self {
+            // The Architect builds against the design mock.
+            Architecture => &[DesignMock],
+            // The Designer reviews the plan against the mock.
+            DesignReview => &[DesignMock, Architecture],
+            // Security reviews the plan.
+            SecurityPlan => &[Architecture],
+            // The Builder implements the plan under the security conditions.
+            Build => &[Architecture, SecurityPlan],
+            // Security (code) verifies the plan's conditions against the code.
+            SecurityCode => &[SecurityPlan],
+            // The Designer verifies the build against the mock and the review.
+            DesignSignoff => &[DesignMock, DesignReview],
+            // The Tester tests against the plan and the code review.
+            Test => &[Architecture, SecurityCode],
+            // The Documenter synthesizes from the plan and the test results.
+            Documentation => &[Architecture, Test],
+            // The Architect + Designer validate the doc.
+            DocValidation => &[Documentation],
+            // No upstream artifact is needed.
+            DesignMock | Deploy | Done => &[],
+        }
+    }
+
     /// The persona responsible for this phase.
     pub fn persona(self) -> Persona {
         let name = match self {
@@ -285,6 +355,58 @@ mod tests {
         let applicable = Phase::applicable(FIX);
         assert!(!applicable.contains(&Documentation) && !applicable.contains(&DocValidation));
         assert_eq!(applicable.len(), 6);
+    }
+
+    #[test]
+    fn judgment_artifacts_map_judgment_phases_only() {
+        // Each judgment phase maps to its own durable artifact + required
+        // sections; non-judgment phases return None.
+        let (file, secs) = SecurityPlan.judgment_artifact().unwrap();
+        assert_eq!(file, "security-plan.md");
+        assert_eq!(
+            secs,
+            &["Threat model", "Conditions for Builder", "Verdict"][..]
+        );
+        let (file, secs) = SecurityCode.judgment_artifact().unwrap();
+        assert_eq!(file, "security-code.md");
+        assert_eq!(secs, &["Findings", "Conditions verified", "Verdict"][..]);
+        assert_eq!(
+            DesignReview.judgment_artifact().unwrap().0,
+            "design-review.md"
+        );
+        assert_eq!(
+            DesignSignoff.judgment_artifact().unwrap().0,
+            "design-signoff.md"
+        );
+        assert_eq!(Test.judgment_artifact().unwrap().0, "test.md");
+        assert_eq!(
+            DocValidation.judgment_artifact().unwrap().0,
+            "doc-validation.md"
+        );
+        // Architecture keeps the core design.md, with only Conditions required.
+        assert_eq!(
+            Architecture.judgment_artifact(),
+            Some(("design.md", &["Conditions for Builder"][..]))
+        );
+        // Non-judgment phases carry no artifact requirement.
+        for p in [DesignMock, Build, Documentation, Deploy, Done] {
+            assert!(p.judgment_artifact().is_none(), "{p:?} should be None");
+        }
+    }
+
+    #[test]
+    fn upstream_context_points_only_at_prior_phases() {
+        assert_eq!(SecurityPlan.upstream_context(), &[Architecture][..]);
+        assert_eq!(Build.upstream_context(), &[Architecture, SecurityPlan][..]);
+        assert_eq!(DocValidation.upstream_context(), &[Documentation][..]);
+        assert!(DesignMock.upstream_context().is_empty());
+        assert!(Deploy.upstream_context().is_empty());
+        // Every referenced upstream phase strictly precedes the phase itself.
+        for &p in PIPELINE.iter().chain(std::iter::once(&Done)) {
+            for &up in p.upstream_context() {
+                assert!(up < p, "{up:?} must precede {p:?}");
+            }
+        }
     }
 
     #[test]
