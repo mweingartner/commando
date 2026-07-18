@@ -1,0 +1,405 @@
+{
+  "change": "fix-reconcile-phase-skip",
+  "schema": "mpd",
+  "ui": false,
+  "kind": "fix",
+  "phase": "done",
+  "gates": {
+    "architecture": {
+      "verdict": "pass",
+      "by": "Architect",
+      "evidence": "design.md",
+      "at": "2026-07-18",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784343846,
+      "completed_at_epoch_secs": 1784343884,
+      "receipt": {
+        "id": "374c8a3a96c862107d275f25f7bf1a5ecb696981df6631c19adae13d03bd513c",
+        "schema": 1,
+        "phase": "architecture",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+            "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+            "design-artifacts": "ecc484366fcb0cbda2464eaaa42bc4199338eeac8311f6158b095adc416d84e7"
+          }
+        }
+      }
+    },
+    "security-plan": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "security-plan.md",
+      "at": "2026-07-18",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784343884,
+      "completed_at_epoch_secs": 1784343925,
+      "receipt": {
+        "id": "ecda88fd689b2426c2c37c6b6e7917605e2af1ca564f5365d65ae06260d0431f",
+        "schema": 1,
+        "phase": "security-plan",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+            "source": "5c2a20d087a7aa5769732604c72619702c3e4333793894d3feaf9ac5eb090eb0",
+            "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+            "design-artifacts": "ecc484366fcb0cbda2464eaaa42bc4199338eeac8311f6158b095adc416d84e7",
+            "persona-tuning": "47582b3f0b3e2260d8740a22971c303da9bc4ef13702422f75223c8618d0cb5e"
+          }
+        }
+      }
+    },
+    "build": {
+      "verdict": "pass",
+      "by": "Builder",
+      "evidence": "tasks.md",
+      "checks": {
+        "tests_passed": 438,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-18",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784343925,
+      "completed_at_epoch_secs": 1784344032,
+      "receipt": {
+        "id": "1fac15ad598682f448a1324b8e86ef5bbfc1b2e88483ba48ea72604280eec7bd",
+        "schema": 1,
+        "phase": "build",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+            "source": "c205575860f7ecead15b1ca5d73e2acc3d0be3e8d84741107da0973ccaf8d13a",
+            "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+            "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+            "produced-artifact": "c205575860f7ecead15b1ca5d73e2acc3d0be3e8d84741107da0973ccaf8d13a"
+          }
+        }
+      }
+    },
+    "security-code": {
+      "verdict": "pass",
+      "by": "Security",
+      "evidence": "security-code.md",
+      "checks": {
+        "secrets_clean": true,
+        "scanner": "builtin+gitleaks"
+      },
+      "at": "2026-07-18",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784344040,
+      "completed_at_epoch_secs": 1784344064,
+      "receipt": {
+        "id": "f69f8b2c88f948823755bf0e418a55c371395a9441998cb68a9586f75e4d2d5f",
+        "schema": 1,
+        "phase": "security-code",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+            "source": "e0554c3bdecb6e55ea7293312ed80ddf66a7f203bef22696197fd345da672aa6",
+            "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+            "design-artifacts": "be1c4ca41321ad990d6bafb31c2a23c068aeaf7e676cba9916267b15f2ad9130",
+            "scanner-identity": "668f4bbf5c7cc646f92c8ced8ea28ebd07ba00afe3b95d21a08449df199a7224",
+            "allowlist-digest": "dbed088396a9c2b3a8f9a66e8c0ae90e17a871a982494f6ed29765330b4dd3a1",
+            "persona-tuning": "47582b3f0b3e2260d8740a22971c303da9bc4ef13702422f75223c8618d0cb5e"
+          }
+        }
+      }
+    },
+    "test": {
+      "verdict": "pass",
+      "by": "Tester",
+      "evidence": "test.md",
+      "checks": {
+        "tests_passed": 438,
+        "command": "cargo test --workspace"
+      },
+      "at": "2026-07-18",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784344072,
+      "completed_at_epoch_secs": 1784344083,
+      "receipt": {
+        "id": "72c5901a72c1316328cf0eeea5e987faa766f61f8ae97473fdf87364a424f83b",
+        "schema": 1,
+        "phase": "test",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+            "source": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+            "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+            "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+            "produced-artifact": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+            "persona-tuning": "8281533ffd6d24f6c53f05223296d029e6454235c2b8656f6c5c9f7e379f59ec"
+          }
+        }
+      }
+    },
+    "deploy": {
+      "verdict": "pass",
+      "by": "main-session",
+      "at": "2026-07-18",
+      "attempt": 1,
+      "started_at_epoch_secs": 1784344091,
+      "completed_at_epoch_secs": 1784344145,
+      "receipt": {
+        "id": "e82ad0c27c947e3063d60f9a9f7335dec8251cafcb167b6b322005613b338c2d",
+        "schema": 1,
+        "phase": "deploy",
+        "disposition": {
+          "kind": "executed"
+        },
+        "dependencies": {
+          "schema": 1,
+          "values": {
+            "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+            "source": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+            "produced-artifact": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+            "deploy-command": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      }
+    }
+  },
+  "conditions": [],
+  "history": [
+    {
+      "phase": "architecture",
+      "record": {
+        "verdict": "pass",
+        "by": "Architect",
+        "evidence": "design.md",
+        "at": "2026-07-18",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784343846,
+        "completed_at_epoch_secs": 1784343884,
+        "receipt": {
+          "id": "374c8a3a96c862107d275f25f7bf1a5ecb696981df6631c19adae13d03bd513c",
+          "schema": 1,
+          "phase": "architecture",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+              "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+              "design-artifacts": "ecc484366fcb0cbda2464eaaa42bc4199338eeac8311f6158b095adc416d84e7"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "security-plan",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "security-plan.md",
+        "at": "2026-07-18",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784343884,
+        "completed_at_epoch_secs": 1784343925,
+        "receipt": {
+          "id": "ecda88fd689b2426c2c37c6b6e7917605e2af1ca564f5365d65ae06260d0431f",
+          "schema": 1,
+          "phase": "security-plan",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+              "source": "5c2a20d087a7aa5769732604c72619702c3e4333793894d3feaf9ac5eb090eb0",
+              "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+              "design-artifacts": "ecc484366fcb0cbda2464eaaa42bc4199338eeac8311f6158b095adc416d84e7",
+              "persona-tuning": "47582b3f0b3e2260d8740a22971c303da9bc4ef13702422f75223c8618d0cb5e"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "build",
+      "record": {
+        "verdict": "pass",
+        "by": "Builder",
+        "evidence": "tasks.md",
+        "checks": {
+          "tests_passed": 438,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-18",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784343925,
+        "completed_at_epoch_secs": 1784344032,
+        "receipt": {
+          "id": "1fac15ad598682f448a1324b8e86ef5bbfc1b2e88483ba48ea72604280eec7bd",
+          "schema": 1,
+          "phase": "build",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+              "source": "c205575860f7ecead15b1ca5d73e2acc3d0be3e8d84741107da0973ccaf8d13a",
+              "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+              "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+              "produced-artifact": "c205575860f7ecead15b1ca5d73e2acc3d0be3e8d84741107da0973ccaf8d13a"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "security-code",
+      "record": {
+        "verdict": "pass",
+        "by": "Security",
+        "evidence": "security-code.md",
+        "checks": {
+          "secrets_clean": true,
+          "scanner": "builtin+gitleaks"
+        },
+        "at": "2026-07-18",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784344040,
+        "completed_at_epoch_secs": 1784344064,
+        "receipt": {
+          "id": "f69f8b2c88f948823755bf0e418a55c371395a9441998cb68a9586f75e4d2d5f",
+          "schema": 1,
+          "phase": "security-code",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+              "source": "e0554c3bdecb6e55ea7293312ed80ddf66a7f203bef22696197fd345da672aa6",
+              "governance": "80fb6453bcae729297b0c53fb9c97e648c6446facc1e84057e499c5759cd626e",
+              "design-artifacts": "be1c4ca41321ad990d6bafb31c2a23c068aeaf7e676cba9916267b15f2ad9130",
+              "scanner-identity": "668f4bbf5c7cc646f92c8ced8ea28ebd07ba00afe3b95d21a08449df199a7224",
+              "allowlist-digest": "dbed088396a9c2b3a8f9a66e8c0ae90e17a871a982494f6ed29765330b4dd3a1",
+              "persona-tuning": "47582b3f0b3e2260d8740a22971c303da9bc4ef13702422f75223c8618d0cb5e"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "test",
+      "record": {
+        "verdict": "pass",
+        "by": "Tester",
+        "evidence": "test.md",
+        "checks": {
+          "tests_passed": 438,
+          "command": "cargo test --workspace"
+        },
+        "at": "2026-07-18",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784344072,
+        "completed_at_epoch_secs": 1784344083,
+        "receipt": {
+          "id": "72c5901a72c1316328cf0eeea5e987faa766f61f8ae97473fdf87364a424f83b",
+          "schema": 1,
+          "phase": "test",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+              "source": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+              "test-command": "ec4556a178527361344d876629bb9533c63fc8fcd216f423dd8bce76787fce86",
+              "toolchain": "f2677a9354a3a008ad0c4d6c5ba29792742721fe21c0a841bcf0f45966140212",
+              "produced-artifact": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+              "persona-tuning": "8281533ffd6d24f6c53f05223296d029e6454235c2b8656f6c5c9f7e379f59ec"
+            }
+          }
+        }
+      }
+    },
+    {
+      "phase": "deploy",
+      "record": {
+        "verdict": "pass",
+        "by": "main-session",
+        "at": "2026-07-18",
+        "attempt": 1,
+        "started_at_epoch_secs": 1784344091,
+        "completed_at_epoch_secs": 1784344145,
+        "receipt": {
+          "id": "e82ad0c27c947e3063d60f9a9f7335dec8251cafcb167b6b322005613b338c2d",
+          "schema": 1,
+          "phase": "deploy",
+          "disposition": {
+            "kind": "executed"
+          },
+          "dependencies": {
+            "schema": 1,
+            "values": {
+              "scope": "aa5b212c33a8e746ebe145b2a994e1c15ce262696dc33c5dc9edfb8f2b080402",
+              "source": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+              "produced-artifact": "a99b704e918dff45507f5b29fc06474e92ea4c3e98fe2bd4b335bfb8739b53f8",
+              "deploy-command": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "governance": {
+    "risk": "medium",
+    "threat_profile": "local-trusted-user",
+    "reconciliations": []
+  },
+  "strict": true,
+  "waivers": [],
+  "phase_started_at_epoch_secs": 1784344145,
+  "archive_closure": {
+    "base_commit": "8a2ccb53d4a5aa3ed2da18c0ff58c129e5e95d29",
+    "archive_path": "openspec/changes/archive/2026-07-18-fix-reconcile-phase-skip",
+    "transaction_id": "9d117abfbf14c07141db8a6406fda31c578c8df633af6a357f298dafb48d482b",
+    "allowed_paths": [
+      ".mpd/state/fix-reconcile-phase-skip.json",
+      "crates/mpd/src/ledger.rs",
+      "crates/mpd/tests/e2e.rs",
+      "openspec/changes/archive/2026-07-18-fix-reconcile-phase-skip",
+      "openspec/changes/fix-reconcile-phase-skip"
+    ],
+    "system_paths": [
+      ".mpd/state/fix-reconcile-phase-skip.json",
+      "crates/mpd/src/ledger.rs",
+      "crates/mpd/tests/e2e.rs",
+      "openspec/changes/archive/2026-07-18-fix-reconcile-phase-skip",
+      "openspec/changes/fix-reconcile-phase-skip"
+    ],
+    "post_archive_digest": "a526509436e80c0cf4adbcce4e331a6ad7e386b10ce3ed893e3bf1d22f37de7b",
+    "archived_at": 1784344194
+  }
+}

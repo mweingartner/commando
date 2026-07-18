@@ -3988,3 +3988,30 @@ fn conduct_nudges_toward_high_risk_below_high_but_stays_silent_at_high() {
         stdout(&high)
     );
 }
+
+#[test]
+fn reconcile_before_security_does_not_skip_architecture() {
+    // reconcile-phase-skip fix: raising risk (or threat-profile) while at Architecture
+    // — BEFORE the Security phase — must keep the phase at `architecture`, not jump
+    // forward to `security-plan` (which skipped the ungated Architecture gate).
+    let sb = Sandbox::new("reconcile-noskip");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["conduct", "thing", "--fix", "--risk", "low"]);
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "architecture"
+    );
+    let out = sb.mpd(&["reconcile", "--risk", "high", "novel surface"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(
+        after["phase"],
+        serde_json::json!("architecture"),
+        "reconcile at Architecture must not skip forward to security-plan"
+    );
+    assert_eq!(after["governance"]["risk"], "high");
+}

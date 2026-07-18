@@ -662,8 +662,14 @@ impl Ledger {
         // prior attempt must not silently suppress the artifact gate on the
         // re-run under the changed threat profile (design.md D7 / B1).
         self.waivers.retain(|w| w.phase < Phase::SecurityPlan);
-        self.phase = Phase::SecurityPlan;
-        self.phase_started_at_epoch_secs = now_epoch_secs();
+        // Rewind-only, never advance: a governance change while the change is still
+        // BEFORE Security (e.g. at Architecture) must stay put — jumping forward to
+        // SecurityPlan would skip the ungated intervening phase(s). Downstream
+        // (phase > SecurityPlan) still rewinds to force a fresh Security review.
+        if self.phase > Phase::SecurityPlan {
+            self.phase = Phase::SecurityPlan;
+            self.phase_started_at_epoch_secs = now_epoch_secs();
+        }
     }
 
     /// The change's phase applicability (which optional phase groups run).
@@ -1236,6 +1242,30 @@ mod tests {
         let out = serde_json::to_string(&l).unwrap();
         assert!(!out.contains("brief_tuning"));
         assert!(!out.contains("persona_tuning"));
+    }
+
+    #[test]
+    fn governance_change_before_security_stays_put_and_does_not_advance() {
+        // A reconcile (risk OR threat-profile) while the change is still BEFORE
+        // Security (at Architecture) must NOT jump forward to security-plan — that
+        // would skip the ungated Architecture phase (reconcile-phase-skip fix). The
+        // downstream rewind (current > SecurityPlan) is covered by
+        // `governance_change_retains_history_and_rewinds_only_security_and_downstream`.
+        for (kind, value) in [
+            (ReconciliationKind::Risk, "high"),
+            (ReconciliationKind::ThreatProfile, "network-server"),
+        ] {
+            let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+            assert_eq!(l.phase, Phase::Architecture);
+            l.reconcile(kind, "novel surface".into(), Some(value.into()))
+                .unwrap();
+            assert_eq!(
+                l.phase,
+                Phase::Architecture,
+                "a pre-Security {kind:?} reconcile must stay at Architecture, not advance to security-plan"
+            );
+            assert_eq!(l.governance.reconciliations.len(), 1);
+        }
     }
 
     #[test]

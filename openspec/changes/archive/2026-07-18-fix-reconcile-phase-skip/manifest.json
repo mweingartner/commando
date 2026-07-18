@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "paths": ["crates/mpd/src/ledger.rs", "crates/mpd/tests/e2e.rs"],
+  "shared_paths": [],
+  "publish": { "remote": "origin", "ref": "refs/heads/main" }
+}
