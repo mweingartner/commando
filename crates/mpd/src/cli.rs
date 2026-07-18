@@ -264,7 +264,7 @@ enum Command {
         command: ClosureCommand,
     },
     /// Point `.mpd/current` at an existing change — recovers a cleared pointer
-    /// (e.g. after `mpd closure abandon` or an archive that reset it).
+    /// (e.g. after `mpd archive --abandon` or an archive that reset it).
     Use {
         /// Change name to make current (must have a seeded ledger).
         change: String,
@@ -542,7 +542,7 @@ fn cmd_begin(
     if let Some(view) = openspec_core::inspect(&root).map_err(|e| e.to_string())? {
         return Err(format!(
             "cannot begin a new change — a closure for {:?} is still pending (stage: {}); \
-             run `mpd closure recover` or `mpd closure abandon` first",
+             run `mpd archive --recover` or `mpd archive --abandon` first",
             view.change,
             stage_label(view.stage)
         ));
@@ -1118,7 +1118,7 @@ fn print_release_closure_facts(facts: &serde_json::Value) {
             pending
                 .get("next")
                 .and_then(|v| v.as_str())
-                .unwrap_or("run `mpd closure recover`")
+                .unwrap_or("run `mpd archive --recover`")
         );
     }
 }
@@ -2752,7 +2752,7 @@ fn stepclass_label(class: openspec_core::StepClass) -> &'static str {
 }
 
 /// Render a [`openspec_core::TransactionView`] in the shared human/JSON form
-/// `mpd closure recover` and `mpd closure abandon` both use for their
+/// `mpd archive --recover` and `mpd archive --abandon` both use for their
 /// preview.
 fn render_transaction_view(view: &openspec_core::TransactionView, json: bool) {
     if json {
@@ -2862,7 +2862,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             view.change,
             stage_label(view.stage)
         );
-        eprintln!("Run `mpd closure recover` or `mpd closure abandon` first.");
+        eprintln!("Run `mpd archive --recover` or `mpd archive --abandon` first.");
         return Ok(1);
     }
 
@@ -3111,7 +3111,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         openspec_core::DriveOutcome::ManualRecoveryRequired { path, detail } => {
             eprintln!(
                 "Archive stopped: {path} is in an unexpected state ({detail}). \
-                 No further write was performed. Run `mpd closure recover` to inspect it."
+                 No further write was performed. Run `mpd archive --recover` to inspect it."
             );
             return Ok(1);
         }
@@ -3130,7 +3130,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
          atomic beyond what the filesystem actually provided."
     );
     println!(
-        "→ next: commit the archived result, then run `mpd closure abandon --yes` \
+        "→ next: commit the archived result, then run `mpd archive --abandon --yes` \
          once the commit is in (or `mpd publish --verify` once available)."
     );
     Ok(0)

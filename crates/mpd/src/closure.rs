@@ -438,7 +438,7 @@ impl fmt::Display for ManifestIssue {
 impl std::error::Error for ManifestIssue {}
 
 impl ChangeManifest {
-    /// The manifest `mpd manifest init` seeds: current schema, `paths`
+    /// The manifest `mpd manifest` seeds: current schema, `paths`
     /// deliberately empty (declaring scope is a human act — design.md "no
     /// automatic scope guess is accepted"), no publish target.
     pub fn seed() -> ChangeManifest {
@@ -450,7 +450,7 @@ impl ChangeManifest {
         }
     }
 
-    /// The exact pretty-JSON text `mpd manifest init` writes (trailing
+    /// The exact pretty-JSON text `mpd manifest` writes (trailing
     /// newline, matching every other durable JSON file `mpd` writes).
     pub fn seed_json() -> String {
         let mut json =
