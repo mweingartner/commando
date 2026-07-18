@@ -558,42 +558,62 @@ fn fail_class_and_security_exploitability_are_strict_and_persisted() {
     let state = json(&sb.mpd(&["status", "--json"]));
     assert_eq!(state["history"][0]["record"]["failure_class"], "policy");
 
-    // A fresh change reaches Security, where all five exploitability fields are required.
+    // A fresh change reaches Security, where `--exploit` (5 `|`-delimited fields) is
+    // REQUIRED on every FAIL — absence and malformed values are both refused
+    // (Security-plan Finding 1 / Cond 2).
     sb.mpd(&["begin", "security-case", "--risk", "medium"]);
     sb.mpd(&["gate", "architecture", "--pass"]);
+    // (a) a Security FAIL with NO --exploit at all is refused (mandatory presence).
+    let absent = sb.mpd(&["gate", "security-plan", "--fail", "--class", "product"]);
+    assert!(
+        !absent.status.success(),
+        "a Security FAIL must require --exploit"
+    );
+    // (b) a malformed --exploit (too few fields) is refused.
     let incomplete = sb.mpd(&[
         "gate",
         "security-plan",
         "--fail",
         "--class",
         "product",
-        "--attacker",
-        "contributor",
+        "--exploit",
+        "contributor|modify repository",
     ]);
-    assert!(!incomplete.status.success());
+    assert!(
+        !incomplete.status.success(),
+        "a 2-field --exploit must be refused"
+    );
+    // (c) a blank field is refused.
+    let blank = sb.mpd(&[
+        "gate",
+        "security-plan",
+        "--fail",
+        "--class",
+        "product",
+        "--exploit",
+        "contributor|modify repository|terminal renderer||strip controls",
+    ]);
+    assert!(
+        !blank.status.success(),
+        "a blank --exploit field must be refused"
+    );
     assert_eq!(
         json(&sb.mpd(&["status", "--json"]))["history"]
             .as_array()
             .unwrap()
             .len(),
-        1
+        1,
+        "none of the refused FAILs recorded a gate event"
     );
+    // (d) a well-formed --exploit records all five fields.
     let complete = sb.mpd(&[
         "gate",
         "security-plan",
         "--fail",
         "--class",
         "product",
-        "--attacker",
-        "contributor",
-        "--capability",
-        "modify repository",
-        "--boundary",
-        "terminal renderer",
-        "--harm",
-        "misleading output",
-        "--fix",
-        "strip controls",
+        "--exploit",
+        "contributor|modify repository|terminal renderer|misleading output|strip controls",
     ]);
     assert!(
         complete.status.success(),
@@ -602,14 +622,16 @@ fn fail_class_and_security_exploitability_are_strict_and_persisted() {
     );
     let state = json(&sb.mpd(&["status", "--json"]));
     assert_eq!(state["history"][1]["record"]["attempt"], 1);
-    assert_eq!(
-        state["history"][1]["record"]["exploitability"]["harm"],
-        "misleading output"
-    );
+    let ex = &state["history"][1]["record"]["exploitability"];
+    assert_eq!(ex["attacker"], "contributor");
+    assert_eq!(ex["harm"], "misleading output");
+    assert_eq!(ex["fix"], "strip controls");
+    // A PASS with --class is refused (unchanged).
     assert!(!sb
         .mpd(&["gate", "security-plan", "--pass", "--class", "test"])
         .status
         .success());
+    // (e) --exploit outside a Security FAIL (a non-Security phase) is refused.
     assert!(!sb
         .mpd(&[
             "gate",
@@ -617,8 +639,8 @@ fn fail_class_and_security_exploitability_are_strict_and_persisted() {
             "--fail",
             "--class",
             "product",
-            "--attacker",
-            "someone",
+            "--exploit",
+            "someone|cap|bound|harm|fix",
         ])
         .status
         .success());
@@ -1658,16 +1680,8 @@ fn status_preserves_gate_history_across_fail_then_pass() {
             "--fail",
             "--class",
             "product",
-            "--attacker",
-            "contributor",
-            "--capability",
-            "modify source",
-            "--boundary",
-            "secret handling",
-            "--harm",
-            "credential exposure",
-            "--fix",
-            "remove credential"
+            "--exploit",
+            "contributor|modify source|secret handling|credential exposure|remove credential",
         ])
         .status
         .success());
@@ -3785,4 +3799,165 @@ fn persona_conditional_write_no_erase_survives_clean_rebrief_before_gate() {
          the already-recorded weakening: {pt}"
     );
     assert_eq!(pt["had_append"], serde_json::json!(true));
+}
+
+// ===================================================================
+// simplify-command-surface: the merged/folded verbs (archive --recover/
+// --abandon routed before the pending-closure refusal), hidden-but-
+// functional `begin`, and the flattened `manifest`.
+// ===================================================================
+
+/// Drive a change to the AwaitingCommit pending-closure state (mirrors
+/// `closure_recover_and_abandon_via_binary`'s setup).
+fn reach_pending_closure(sb: &Sandbox, change: &str) {
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", change, "--fix"]);
+    let mpath = sb
+        .dir
+        .join(format!("openspec/changes/{change}/manifest.json"));
+    let mut m: Value = serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+    m["paths"] = serde_json::json!(["crates/**"]);
+    std::fs::write(&mpath, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+    fill_artifacts(sb, change);
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let archived = sb.mpd(&["archive", "--yes", "--skip-specs"]);
+    assert!(
+        archived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&archived.stderr)
+    );
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+}
+
+#[test]
+fn archive_recover_and_abandon_reach_the_closure_logic_not_the_pending_refusal() {
+    // Finding 2 (load-bearing): `mpd archive --recover`/`--abandon` must route to the
+    // recovery logic BEFORE cmd_archive's "already pending" early-return — a pending
+    // closure is exactly the state they exist for. If the routing sat inside
+    // cmd_archive after that refusal, this test would fail with "pending".
+    let sb = Sandbox::new("archive-recover");
+    reach_pending_closure(&sb, "recover-thing");
+
+    // `archive --recover` (preview) reaches the SAME facts as `closure recover`,
+    // NOT the pending refusal.
+    let preview = sb.mpd(&["archive", "--recover"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let text = stdout(&preview);
+    assert!(
+        text.contains("recover-thing") && text.contains("awaiting-commit"),
+        "archive --recover must reach the closure preview, not the pending refusal: {text}"
+    );
+    let pj = json(&sb.mpd(&["archive", "--recover", "--json"]));
+    assert_eq!(pj["change"], "recover-thing");
+    assert_eq!(pj["stage"], "awaiting-commit");
+
+    // `archive --abandon --yes` clears the pointer (same as `closure abandon --yes`).
+    let abandoned = sb.mpd(&["archive", "--abandon", "--yes"]);
+    assert!(
+        abandoned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&abandoned.stderr)
+    );
+    assert!(!sb.dir.join(".mpd/pending-closure").exists());
+}
+
+#[test]
+fn archive_recovery_flags_are_mutually_exclusive_and_scoped() {
+    // Cond 3 guards: recover XOR abandon; neither with --skip-specs or --change;
+    // --json only with recover/abandon.
+    let sb = Sandbox::new("archive-guards");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    for (args, why) in [
+        (vec!["archive", "--recover", "--abandon"], "recover+abandon"),
+        (
+            vec!["archive", "--recover", "--skip-specs"],
+            "recover+skip-specs",
+        ),
+        (
+            vec!["archive", "--abandon", "--change", "x"],
+            "abandon+change",
+        ),
+        (vec!["archive", "--json"], "json without recover/abandon"),
+    ] {
+        let out = sb.mpd(&args);
+        assert!(!out.status.success(), "{why} must be refused");
+    }
+}
+
+#[test]
+fn begin_is_hidden_but_still_starts_a_manual_change() {
+    // D5/Cond 1: `begin` is hidden from --help but fully functional (the manual tier).
+    let sb = Sandbox::new("begin-hidden");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    // Hidden = not listed as a command (its name never starts a command-list line);
+    // "begin" still appears inside conduct's DESCRIPTION, which is fine.
+    let help = stdout(&sb.mpd(&["--help"]));
+    assert!(
+        !help.lines().any(|l| l.trim_start().starts_with("begin ")),
+        "begin must not be listed as a command: {help}"
+    );
+    assert!(
+        sb.mpd(&["begin", "manual-thing"]).status.success(),
+        "begin must still work"
+    );
+    let state = std::fs::read_to_string(sb.dir.join(".mpd/state/manual-thing.json")).unwrap();
+    let v: Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(
+        v["strict"],
+        serde_json::json!(false),
+        "plain begin is the manual (non-strict) tier"
+    );
+}
+
+#[test]
+fn manifest_is_flattened_and_seeds_the_stub() {
+    // D2/Cond 1: `mpd manifest` (no `init` subcommand) seeds the stub — byte-for-byte
+    // the old `manifest init`.
+    let sb = Sandbox::new("manifest-flat");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    sb.mpd(&["begin", "scoped"]);
+    let mpath = sb.dir.join("openspec/changes/scoped/manifest.json");
+    std::fs::remove_file(&mpath).unwrap();
+    let out = sb.mpd(&["manifest", "--change", "scoped"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(mpath.is_file(), "manifest must seed manifest.json");
+    // The old grouped form no longer exists.
+    assert!(!sb
+        .mpd(&["manifest", "init", "--change", "scoped"])
+        .status
+        .success());
+}
+
+#[test]
+fn help_leads_with_the_core_loop() {
+    // D1/Cond 4: `mpd --help` surfaces the tiered command guide, core loop first.
+    let sb = Sandbox::new("help-tier");
+    let help = stdout(&sb.mpd(&["--help"]));
+    assert!(
+        help.contains("Core loop") && help.contains("conduct"),
+        "help must show the Core loop group: {help}"
+    );
+    assert!(help.contains("Author/govern") && help.contains("Setup/recovery"));
 }

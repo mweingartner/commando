@@ -17,11 +17,23 @@ use std::path::{Component, Path, PathBuf};
 
 /// mpd — an adversarial-gate overlay over the OpenSpec format.
 #[derive(Debug, Parser)]
-#[command(name = "mpd", version, about)]
+#[command(name = "mpd", version, about, after_help = COMMAND_GUIDE)]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+/// Grouped command guide shown under `mpd --help` — tiers the verbs by role so the
+/// everyday loop leads (clap lists subcommands flat; this is the map).
+const COMMAND_GUIDE: &str = "\
+Command groups:
+  Core loop      conduct · next · gate · status · archive · publish   (the everyday motion)
+  Author/govern  brief · resolve · reconcile · persona · manifest · use
+  Setup/recovery init · strict · check · doctor
+                 (archive --recover/--abandon recovers an interrupted archive)
+
+Drive a change: mpd conduct <name> → loop (mpd next → do the work → mpd gate <phase>)
+→ mpd archive --yes → commit + push → mpd publish --verify.";
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -31,7 +43,10 @@ enum Command {
         #[arg(long)]
         test: Option<String>,
     },
-    /// Create a new change and seed its pipeline ledger.
+    /// Create a new change in the MANUAL tier (hidden alias — most callers should
+    /// use `conduct` for the strict, self-enforcing tier). Still fully functional;
+    /// `begin --strict` is equivalent to the strict start.
+    #[command(hide = true)]
     Begin {
         /// Change name (lowercase kebab-case).
         name: String,
@@ -149,16 +164,10 @@ enum Command {
         /// Required classification for FAIL.
         #[arg(long = "class")]
         failure_class: Option<String>,
+        /// Required on a Security FAIL: the credible exploit path as five
+        /// `|`-delimited fields — `"attacker|capability|boundary|harm|fix"`.
         #[arg(long)]
-        attacker: Option<String>,
-        #[arg(long)]
-        capability: Option<String>,
-        #[arg(long)]
-        boundary: Option<String>,
-        #[arg(long)]
-        harm: Option<String>,
-        #[arg(long = "fix")]
-        exact_fix: Option<String>,
+        exploit: Option<String>,
         /// Explicitly reuse an exact, valid executed evidence receipt.
         #[arg(long)]
         reuse: Option<String>,
@@ -211,7 +220,8 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
-    /// Fold a completed change's specs into the record and archive it.
+    /// Fold a completed change's specs into the record and archive it. Also
+    /// recovers/abandons an interrupted archive closure (`--recover`/`--abandon`).
     Archive {
         /// Change (defaults to the current change).
         #[arg(long)]
@@ -222,11 +232,22 @@ enum Command {
         /// Apply the archive (default is a dry-run preview).
         #[arg(long)]
         yes: bool,
+        /// Recover an interrupted archive closure transaction (completion-only).
+        #[arg(long)]
+        recover: bool,
+        /// Abandon owned closure transaction metadata after AwaitingCommit.
+        #[arg(long)]
+        abandon: bool,
+        /// Emit machine-readable JSON (only with --recover/--abandon).
+        #[arg(long)]
+        json: bool,
     },
-    /// Create or inspect the active change manifest.
+    /// Seed the active change's manifest.json (declare its path scope) without
+    /// guessing project scope.
     Manifest {
-        #[command(subcommand)]
-        command: ManifestCommand,
+        /// Change (defaults to the current change).
+        #[arg(long)]
+        change: Option<String>,
     },
     /// Inspect or freshly verify closure commit parity with its configured remote ref.
     Publish {
@@ -235,7 +256,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect or recover an interrupted archive closure transaction.
+    /// Inspect or recover an interrupted archive closure transaction (hidden alias
+    /// — prefer `archive --recover` / `archive --abandon`).
+    #[command(hide = true)]
     Closure {
         #[command(subcommand)]
         command: ClosureCommand,
@@ -306,15 +329,6 @@ enum PersonaCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum ManifestCommand {
-    /// Seed manifest.json without guessing project scope.
-    Init {
-        #[arg(long)]
-        change: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
 enum ClosureCommand {
     Recover {
         #[arg(long)]
@@ -375,11 +389,7 @@ pub fn run() -> i32 {
             by,
             conditions,
             failure_class,
-            attacker,
-            capability,
-            boundary,
-            harm,
-            exact_fix,
+            exploit,
             reuse,
             waive_artifact,
             autonomous,
@@ -393,11 +403,7 @@ pub fn run() -> i32 {
             by,
             conditions,
             failure_class,
-            attacker,
-            capability,
-            boundary,
-            harm,
-            exact_fix,
+            exploit,
             reuse,
             waive_artifact,
             autonomous,
@@ -419,12 +425,34 @@ pub fn run() -> i32 {
         ),
         Command::Resolve { index, all, change } => cmd_resolve(index, all, change),
         Command::Check { staged, quiet } => cmd_check(staged, quiet),
+        // `--recover`/`--abandon` route to the closure logic HERE, ahead of
+        // `cmd_archive` — whose first check refuses on a pending closure, exactly the
+        // state recovery exists for (Security-plan Finding 2). `--json`/`--change`
+        // are scoped to the recovery branch.
         Command::Archive {
             change,
             skip_specs,
             yes,
-        } => cmd_archive(change, skip_specs, yes),
-        Command::Manifest { command } => cmd_manifest(command),
+            recover,
+            abandon,
+            json,
+        } => match (recover, abandon) {
+            (true, true) => Err("--recover and --abandon are mutually exclusive".into()),
+            (true, false) | (false, true) if skip_specs => {
+                Err("--recover/--abandon are mutually exclusive with --skip-specs".into())
+            }
+            (true, false) | (false, true) if change.is_some() => Err(
+                "--change is not valid with --recover/--abandon (they act on the single pending closure)"
+                    .into(),
+            ),
+            (true, false) => find_root().and_then(|root| cmd_closure_recover(&root, yes, json)),
+            (false, true) => find_root().and_then(|root| cmd_closure_abandon(&root, yes, json)),
+            (false, false) if json => {
+                Err("--json is valid only with --recover/--abandon".into())
+            }
+            (false, false) => cmd_archive(change, skip_specs, yes),
+        },
+        Command::Manifest { change } => cmd_manifest(change),
         Command::Publish { verify, json } => cmd_publish(verify, json),
         Command::Closure { command } => cmd_closure(command),
         Command::Use { change } => cmd_use(change),
@@ -1348,6 +1376,30 @@ fn persona_tuning_stamp(
     (!record.is_baseline()).then_some(record)
 }
 
+/// Parse the `--exploit` value into a structured [`Exploitability`]: exactly five
+/// `|`-delimited fields (attacker|capability|boundary|harm|fix), each
+/// `bounded_text`-validated (non-blank, trimmed, ≤500). A wrong field count or a
+/// blank field ERRORS — a Security FAIL never records with partial/empty exploit
+/// evidence (design.md D4 / Security-plan Finding 1). A literal `|` inside a field
+/// is unsupported; the fields are short structured phrases, not prose.
+fn parse_exploit(raw: &str) -> Result<Exploitability, String> {
+    let parts: Vec<&str> = raw.split('|').collect();
+    if parts.len() != 5 {
+        return Err(format!(
+            "--exploit must be exactly five `|`-delimited fields \
+             (attacker|capability|boundary|harm|fix); got {}",
+            parts.len()
+        ));
+    }
+    Ok(Exploitability {
+        attacker: bounded_text(parts[0], "attacker")?,
+        capability: bounded_text(parts[1], "capability")?,
+        boundary: bounded_text(parts[2], "boundary")?,
+        harm: bounded_text(parts[3], "harm")?,
+        fix: bounded_text(parts[4], "fix")?,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_gate(
     phase_slug: String,
@@ -1359,11 +1411,7 @@ fn cmd_gate(
     by: Option<String>,
     conditions: Vec<String>,
     failure_class: Option<String>,
-    attacker: Option<String>,
-    capability: Option<String>,
-    boundary: Option<String>,
-    harm: Option<String>,
-    exact_fix: Option<String>,
+    exploit: Option<String>,
     reuse: Option<String>,
     waive_artifact: Option<String>,
     autonomous: bool,
@@ -1422,9 +1470,6 @@ fn cmd_gate(
         None => None,
     };
 
-    let exploit_fields_present = [&attacker, &capability, &boundary, &harm, &exact_fix]
-        .iter()
-        .any(|v| v.is_some());
     let failure_class = match (verdict, failure_class) {
         (Verdict::Fail, Some(v)) => Some(v.parse::<FailureClass>()?),
         (Verdict::Fail, None) => return Err(
@@ -1435,19 +1480,22 @@ fn cmd_gate(
         (_, None) => None,
     };
     let security = matches!(phase, Phase::SecurityPlan | Phase::SecurityCode);
-    let exploitability = if verdict == Verdict::Fail && security {
-        Some(Exploitability {
-            attacker: bounded_text(attacker.as_deref().unwrap_or(""), "attacker")?,
-            capability: bounded_text(capability.as_deref().unwrap_or(""), "capability")?,
-            boundary: bounded_text(boundary.as_deref().unwrap_or(""), "boundary")?,
-            harm: bounded_text(harm.as_deref().unwrap_or(""), "harm")?,
-            fix: bounded_text(exact_fix.as_deref().unwrap_or(""), "fix")?,
-        })
-    } else if exploit_fields_present {
-        return Err("exploitability flags are valid only with a Security --fail".into());
-    } else {
-        None
-    };
+    // `--exploit` is MANDATORY on a Security FAIL — not merely validated-when-present
+    // (Security-plan Finding 1): a Security FAIL must always carry a credible exploit
+    // path. An exhaustive match (never `exploit.map(parse).transpose()?`, which would
+    // let `None` record a FAIL with no exploitability) makes absence error identically
+    // to a malformed value. `--reuse` forces Verdict::Pass, so `--exploit --reuse`
+    // falls out of the third arm (refused).
+    let exploitability =
+        match (verdict, security, exploit) {
+            (Verdict::Fail, true, Some(raw)) => Some(parse_exploit(&raw)?),
+            (Verdict::Fail, true, None) => return Err(
+                "a Security --fail requires --exploit \"attacker|capability|boundary|harm|fix\""
+                    .into(),
+            ),
+            (_, _, Some(_)) => return Err("--exploit is valid only with a Security --fail".into()),
+            (_, _, None) => None,
+        };
 
     let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
     // A waiver only means something in the strict tier — it waives the strict
@@ -2451,27 +2499,23 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
     }
 }
 
-fn cmd_manifest(command: ManifestCommand) -> CmdResult {
+fn cmd_manifest(change: Option<String>) -> CmdResult {
     let root = find_root()?;
-    match command {
-        ManifestCommand::Init { change } => {
-            let change = resolve_change(&root, change)?;
-            let path = closure::manifest_path(&root, &change)?;
-            if path.exists() {
-                return Err(format!(
-                    "{} already exists; refusing to overwrite declared scope",
-                    path.display()
-                ));
-            }
-            closure::save_manifest(&root, &change, &closure::ChangeManifest::seed())
-                .map_err(|e| e.to_string())?;
-            println!(
-                "Seeded {}. Declare paths before Architecture PASS.",
-                path.display()
-            );
-            Ok(0)
-        }
+    let change = resolve_change(&root, change)?;
+    let path = closure::manifest_path(&root, &change)?;
+    if path.exists() {
+        return Err(format!(
+            "{} already exists; refusing to overwrite declared scope",
+            path.display()
+        ));
     }
+    closure::save_manifest(&root, &change, &closure::ChangeManifest::seed())
+        .map_err(|e| e.to_string())?;
+    println!(
+        "Seeded {}. Declare paths before Architecture PASS.",
+        path.display()
+    );
+    Ok(0)
 }
 
 fn archived_manifest(
@@ -3647,7 +3691,8 @@ fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
 mod tests {
     use super::{
         check_documentation, check_sections, extract_section, has_unfilled_placeholder,
-        strict_gate_command, upstream_artifact_pointers, validate_evidence, REQUIRED_DOC_SECTIONS,
+        parse_exploit, strict_gate_command, upstream_artifact_pointers, validate_evidence,
+        REQUIRED_DOC_SECTIONS,
     };
     use crate::phase::{Applicability, Phase};
     use proptest::prelude::*;
@@ -3863,6 +3908,32 @@ mod tests {
             "security-code.md#Findings",
             "the own artifact (anchor stripped for resolution) is recorded verbatim"
         );
+    }
+
+    proptest! {
+        /// `parse_exploit` never panics on arbitrary input, and a value with a
+        /// field count ≠ 5 ALWAYS errors — the mandatory-5-field guard (D4) that
+        /// keeps a Security FAIL from recording with partial exploit evidence.
+        #[test]
+        fn parse_exploit_rejects_any_wrong_field_count(s in ".*") {
+            if s.split('|').count() != 5 {
+                prop_assert!(parse_exploit(&s).is_err());
+            }
+        }
+
+        /// Five non-blank fields always parse and round-trip verbatim through the
+        /// structured `Exploitability` (bounded_text no-ops on a non-blank ≤500 value).
+        #[test]
+        fn parse_exploit_accepts_five_nonblank_fields(
+            f in prop::collection::vec("[a-z]{1,30}", 5..=5),
+        ) {
+            let ex = parse_exploit(&f.join("|")).unwrap();
+            prop_assert_eq!(&ex.attacker, &f[0]);
+            prop_assert_eq!(&ex.capability, &f[1]);
+            prop_assert_eq!(&ex.boundary, &f[2]);
+            prop_assert_eq!(&ex.harm, &f[3]);
+            prop_assert_eq!(&ex.fix, &f[4]);
+        }
     }
 
     proptest! {
