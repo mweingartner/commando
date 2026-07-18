@@ -50,28 +50,35 @@ self-enforcing gates and the persona-tuning interview:
 >
 > **Start:** `mpd conduct <name> [--ui] [--fix|--chore] [--risk low|medium|high]
 > [--threat-profile <p>]` — this begins the change under the strict, self-enforcing
-> tier. (`--ui` adds the Design phases; `--fix`/`--chore` skip Documentation.) Then
+> tier. (`--ui` adds the Design phases; `--fix`/`--chore` skip Documentation.)
+> **Choose the risk here, deliberately: pick `--risk high` for novel or risky
+> surface** — auth, credentials, network egress, file I/O on untrusted input,
+> crypto, or a feature with no analog already shipped. High risk floors the
+> Security/Tester personas to the deep model + max reasoning effort and grants a
+> third attempt, so the brief *itself* then tells you to review at full depth. Then
 > edit `openspec/changes/<name>/manifest.json` to declare the change's path scope.
 >
 > **Loop, every phase:** run `mpd next --harness <your-harness> --context`. It names
 > the persona, the model to run it on, the task, the required judgment-artifact path,
-> and the exact gate command. Do EXACTLY what the brief says as that persona (Claude
-> Code: spawn a subagent on the named model; Codex: adopt the persona, or a fresh
-> `codex --model <tier>`). Author the artifact it names under
-> `openspec/changes/<name>/` (use `mpd brief <phase>` to scaffold a template). Then
-> record the verdict: `mpd gate <phase> --pass --evidence <artifact>` (or
-> `--conditional --condition "…"`, or `--fail --class <c>` — a Security FAIL also
-> needs `--exploit "attacker|capability|boundary|harm|fix"`). Repeat until
-> `mpd status` shows ready-to-archive.
+> and the exact gate command. **The brief's `model`, `effort`, and `reviewers` are
+> already resolved for you** — mpd has composed the tier table, the risk floor, this
+> project's config, and any persona tuning. **Spawn the persona subagent on the
+> brief's `model` at its `effort` with that many `reviewers`, and apply its
+> `directive_append` — do NOT substitute a model or effort of your own** (e.g. from a
+> generic model table you carry; the brief is the authority for this project). If a
+> brief comes back `weakened: true`, treat that gate as a human-review point. Author
+> the artifact it names under `openspec/changes/<name>/` (use `mpd brief <phase>` to
+> scaffold a template). Then record the verdict: `mpd gate <phase> --pass --evidence
+> <artifact>` (or `--conditional --condition "…"`, or `--fail --class <c>` — a
+> Security FAIL also needs `--exploit "attacker|capability|boundary|harm|fix"`).
+> Repeat until `mpd status` shows ready-to-archive.
 >
 > **Rules:** Never bypass a FAIL gate, never commit around the pre-commit hook,
 > never edit a gate ledger by hand. A material change re-enters at the earliest
-> affected phase. **Novel/risky surface** (auth, credentials, network egress, file
-> I/O on untrusted input, crypto, a feature with no analog shipped): raise
-> `--risk high`, run the Security phases at full depth, and do NOT fix Security
-> findings inline — re-run the Security gate after each fix. Apply the brief's
-> persona-tuning fields (`effort`, `reviewers`, `directive_append`) as emitted;
-> never re-read `.mpd/config.json` yourself.
+> affected phase. On a Security FAIL, do NOT fix findings inline — re-run the
+> Security gate after each fix. And never re-read `.mpd/config.json` to pick a model
+> or effort yourself: the brief (see the loop above) is the only authority for this
+> project — a raw re-read also bypasses mpd's sanitization and risk floor.
 >
 > **Finish:** `mpd resolve --all` (close CONDITIONAL conditions) → `mpd archive
 > --yes` → commit + push with normal Git → `mpd publish --verify` (confirms exact
