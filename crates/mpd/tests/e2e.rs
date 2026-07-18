@@ -3961,3 +3961,30 @@ fn help_leads_with_the_core_loop() {
     );
     assert!(help.contains("Author/govern") && help.contains("Setup/recovery"));
 }
+
+#[test]
+fn conduct_nudges_toward_high_risk_below_high_but_stays_silent_at_high() {
+    // B (sharpen-harness-guidance): `mpd conduct` prints a once-per-change risk-high
+    // tip when the conducted change is below high risk, and stays silent at
+    // --risk high. Load-bearing: dropping the `rank() < High` guard makes the
+    // high-risk case ALSO print the tip, reddening the negative assertion.
+    let sb = Sandbox::new("conduct-nudge");
+    sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    let low = sb.mpd(&["conduct", "lowrisk", "--chore", "--risk", "low"]);
+    assert!(
+        stdout(&low).contains("Tip: risk=low") && stdout(&low).contains("full-depth review"),
+        "conduct below high must nudge toward --risk high: {}",
+        stdout(&low)
+    );
+    // The nudge must NOT prescribe the (buggy pre-Security) reconcile remedy.
+    assert!(
+        !stdout(&low).contains("reconcile"),
+        "the nudge must not recommend reconcile"
+    );
+    let high = sb.mpd(&["conduct", "highrisk", "--chore", "--risk", "high"]);
+    assert!(
+        !stdout(&high).contains("Tip: risk="),
+        "conduct at --risk high must NOT print the risk nudge: {}",
+        stdout(&high)
+    );
+}

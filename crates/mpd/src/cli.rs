@@ -629,6 +629,27 @@ fn cmd_conduct(
     let name_for_contract = name.clone();
     let code = cmd_begin(name, ui, fix, chore, risk, threat_profile, true)?;
     print_conduct_contract(&name_for_contract);
+    // Risk nudge (once per change; conduct is a once-per-change command): if the
+    // conducted change resolved below high risk, remind that novel/risky surface
+    // warrants `--risk high` — which floors Security/Tester to the deep model + max
+    // effort so the brief directs a full-depth review. Read from the ledger (the raw
+    // `--risk` arg is None on a defaulted change), best-effort so it never fails the
+    // command. Deliberately does NOT recommend `mpd reconcile --risk high`: that verb
+    // advances a pre-Security change to security-plan, skipping Architecture
+    // (a separate latent bug, filed as a follow-up).
+    if let Ok(root) = find_root() {
+        if let Ok(ledger) = ledger::load(&root, &name_for_contract) {
+            if ledger.governance.risk.rank() < RiskLevel::High.rank() {
+                println!(
+                    "\nTip: risk={}. For novel or risky surface (auth, credentials, untrusted \
+                     input, crypto, or a feature with no analog already shipped), start at \
+                     `--risk high` — it floors Security and Tester to the deep model + max \
+                     reasoning effort, so the brief directs a full-depth review.",
+                    ledger.governance.risk
+                );
+            }
+        }
+    }
     Ok(code)
 }
 

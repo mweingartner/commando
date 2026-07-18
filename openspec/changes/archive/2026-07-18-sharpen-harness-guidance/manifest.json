@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "paths": ["crates/mpd/src/cli.rs", "crates/mpd/assets/directives/protocol.md", "crates/mpd/tests/e2e.rs"],
+  "shared_paths": [],
+  "publish": { "remote": "origin", "ref": "refs/heads/main" }
+}

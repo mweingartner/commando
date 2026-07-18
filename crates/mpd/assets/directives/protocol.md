@@ -178,6 +178,16 @@ directive (never replacing it). At `risk=high` the adversarial set
 (Security/Tester/Doc-Validation) is floored to deep effort regardless of any pin.
 
 **Harness contract (apply the BRIEF, never re-read config):**
+- The brief's `model` is resolved FOR you — mpd has already composed the tier
+  table, the high-risk floor, this project's config, and any persona tuning. Spawn
+  each persona subagent on the brief's `model` at its `effort` with that many
+  `reviewers`; do NOT substitute a model or effort of your own (e.g. from a generic
+  model table you carry). The brief is the authority for this project.
+- For **novel or risky surface** — auth, credentials, network egress, file I/O on
+  untrusted input, crypto, or a feature with no analog already shipped — start the
+  change at `--risk high`. It floors Security and Tester to the deep model + max
+  reasoning effort (and grants a third attempt), so the brief itself directs a
+  full-depth review rather than you escalating by hand.
 - Apply the brief's `effort`, `reviewers`, and `directive_append` fields as
   emitted by `mpd next`. Do NOT re-read `.mpd/config.json` yourself — mpd has
   already sanitized (`terminal_safe` + length cap) and floored the values; a raw
