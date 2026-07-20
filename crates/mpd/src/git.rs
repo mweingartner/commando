@@ -215,6 +215,53 @@ fn run_with_env(
     })
 }
 
+/// Run local-only Git plumbing with a closed environment. This is reserved for
+/// security-sensitive control-plane checks where ambient Git configuration,
+/// object-directory overrides, credential helpers, and hooks must not affect
+/// the observation. The argv is still fixed and caller-validated.
+#[cfg(test)]
+fn run_sanitized_local(
+    repo: &Path,
+    args: &[&str],
+    stdout_cap: usize,
+) -> Result<RawOutput, GitError> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(repo)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/nonexistent")
+        // /usr/bin/git is a developer-tool shim on macOS; without a pinned
+        // DEVELOPER_DIR it resolves through xcode-select, whose target may be
+        // outside any sandbox read root (e.g. an Xcode beta).
+        .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| GitError::Spawn(e.to_string()))?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let out_thread = std::thread::spawn(move || read_capped(&mut stdout, stdout_cap));
+    let err_thread = std::thread::spawn(move || read_capped(&mut stderr, STDERR_CAP));
+    let (out_bytes, out_truncated) = out_thread.join().unwrap_or_else(|_| (Vec::new(), false));
+    let _ = err_thread.join();
+    if out_truncated {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(GitError::OutputTooLarge);
+    }
+    let status = child.wait().map_err(|e| GitError::Spawn(e.to_string()))?;
+    Ok(RawOutput {
+        stdout: out_bytes,
+        status,
+    })
+}
+
 /// Remote-only bounded runner. It drains both pipes concurrently while polling
 /// the child, kills on deadline, and never returns raw output in an error.
 fn run_with_timeout(
@@ -397,6 +444,47 @@ pub fn diff_cached_name_status(repo: &Path) -> Result<Vec<DiffEntry>, GitError> 
         DEFAULT_STDOUT_CAP,
     )?;
     parse_name_status_z(&require_success(out, "diff --cached")?)
+}
+
+/// Read one exact postimage from the staged index. The path is validated before
+/// it becomes part of Git's `:<path>` object expression, and the shared bounded
+/// runner makes an oversized or malformed index fail closed for hook callers.
+/// This is deliberately read-only: it never refreshes, writes, or otherwise
+/// changes the index.
+pub fn staged_blob(repo: &Path, path: &str) -> Result<Vec<u8>, GitError> {
+    crate::digest::validate_canonical_path(path)
+        .map_err(|_| GitError::UnsafeArgument("staged path"))?;
+    let spec = format!(":{path}");
+    let out = run(repo, &["show", "--no-textconv", &spec], DEFAULT_STDOUT_CAP)?;
+    require_success(out, "show staged postimage")
+}
+
+/// Return the canonical mode of one stage-0 index entry. An absent entry is a
+/// staged deletion. Multiple stages (an unresolved collision), malformed
+/// paths, and non-canonical records fail closed. Reading this does not refresh
+/// or otherwise mutate the index.
+pub fn staged_mode(repo: &Path, path: &str) -> Result<Option<u32>, GitError> {
+    crate::digest::validate_canonical_path(path)
+        .map_err(|_| GitError::UnsafeArgument("staged path"))?;
+    let out = run(repo, &["ls-files", "--stage", "-z", "--", path], 4096)?;
+    let bytes = require_success(out, "ls-files --stage")?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let records = nul_tokens(&bytes)?;
+    if records.len() != 1 {
+        return Err(GitError::Malformed("ls-files --stage entry count"));
+    }
+    let (header, observed) = records[0]
+        .split_once('\t')
+        .ok_or(GitError::Malformed("ls-files --stage entry"))?;
+    let fields: Vec<&str> = header.split(' ').collect();
+    if fields.len() != 3 || fields[2] != "0" || observed != path || !valid_oid_hex(fields[1]) {
+        return Err(GitError::Malformed("ls-files --stage entry"));
+    }
+    u32::from_str_radix(fields[0], 8)
+        .map(Some)
+        .map_err(|_| GitError::Malformed("ls-files --stage mode"))
 }
 
 /// `git diff --name-status -z -M -C`: unstaged worktree changes vs the index.
@@ -675,6 +763,76 @@ pub fn is_ancestor(
         Some(128) => Ok(None),
         _ => Err(GitError::Failed("merge-base --is-ancestor")),
     }
+}
+
+/// Exact commit-object existence under the closed local Git environment used
+/// by first-adoption restart. Tags and other peelable objects are rejected:
+/// the supplied OID itself must name a commit.
+#[cfg(test)]
+pub fn sanitized_commit_exists(repo: &Path, oid: &str) -> Result<bool, GitError> {
+    if !valid_oid_hex(oid) {
+        return Err(GitError::UnsafeArgument("commit object id"));
+    }
+    let out = run_sanitized_local(repo, &["cat-file", "-t", "--", oid], 64)?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    Ok(out.stdout == b"commit\n" || out.stdout == b"commit")
+}
+
+/// Sanitized local-only ancestry check. Missing objects remain distinct from
+/// divergence and no fetch, hook, credential helper, or ref mutation occurs.
+#[cfg(test)]
+pub fn sanitized_is_ancestor(
+    repo: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<Option<bool>, GitError> {
+    if !valid_oid_hex(ancestor) || !valid_oid_hex(descendant) {
+        return Err(GitError::UnsafeArgument("merge-base object id"));
+    }
+    let out = run_sanitized_local(
+        repo,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        64,
+    )?;
+    match out.status.code() {
+        Some(0) => Ok(Some(true)),
+        Some(1) => Ok(Some(false)),
+        Some(128) => Ok(None),
+        _ => Err(GitError::Failed("sanitized merge-base --is-ancestor")),
+    }
+}
+
+/// Resolve one literal direct local ref under the sanitized environment.
+/// Symbolic refs fail closed; absence is returned as `None`.
+#[cfg(test)]
+pub fn sanitized_direct_ref_oid(repo: &Path, reference: &str) -> Result<Option<String>, GitError> {
+    if !reference.starts_with("refs/")
+        || reference.len() > 256
+        || reference.starts_with('-')
+        || reference.contains("..")
+        || !reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+    {
+        return Err(GitError::UnsafeArgument("direct ref"));
+    }
+    let symbolic = run_sanitized_local(repo, &["symbolic-ref", "-q", reference], 512)?;
+    if symbolic.status.success() {
+        return Err(GitError::Malformed("direct ref is symbolic"));
+    }
+    let out = run_sanitized_local(repo, &["rev-parse", "--verify", "--quiet", reference], 128)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let value = std::str::from_utf8(&out.stdout)
+        .map_err(|_| GitError::NonUtf8)?
+        .trim();
+    if !valid_oid_hex(value) {
+        return Err(GitError::Malformed("direct ref object id"));
+    }
+    Ok(Some(value.to_string()))
 }
 
 /// Current index tree OID. This is read-only: `write-tree` writes an object to

@@ -5,14 +5,16 @@ use crate::checks::{self, tests_runner};
 use crate::config::Config;
 use crate::ledger::{
     self, bounded_text, ChangeKind, CheckSummary, Condition, Exploitability, FailureClass,
-    GateRecord, Governance, ReconciliationKind, RiskLevel, ThreatProfile, Verdict, Waiver,
+    GateRecord, Governance, ReconciliationKind, RiskLevel, ThreatProfile, Verdict,
 };
 use crate::phase::Phase;
 use crate::{closure, digest, git, githooks, harness, scaffold};
 use clap::{Parser, Subcommand};
 use closure::ArchiveClosure;
 use openspec_core::{date, Project};
+use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// mpd — an adversarial-gate overlay over the OpenSpec format.
@@ -29,7 +31,7 @@ const COMMAND_GUIDE: &str = "\
 Command groups:
   Core loop      conduct · next · gate · status · archive · publish   (the everyday motion)
   Author/govern  brief · resolve · reconcile · persona · manifest · use
-  Setup/recovery init · strict · check · doctor
+  Setup/recovery init · strict · check · validate · policy activate · doctor
                  (archive --recover/--abandon recovers an interrupted archive)
 
 Drive a change: mpd conduct <name> → loop (mpd next → do the work → mpd gate <phase>)
@@ -53,10 +55,10 @@ enum Command {
         /// Mark the change as having a UI/UX surface (enables design phases).
         #[arg(long)]
         ui: bool,
-        /// A defect fix — skips the Documentation phases.
+        /// A defect fix (all mandatory phases still run).
         #[arg(long)]
         fix: bool,
-        /// A non-functional chore (refactor/tooling/perf) — skips Documentation.
+        /// A non-functional chore (refactor/tooling/perf); all mandatory phases run.
         #[arg(long)]
         chore: bool,
         /// Review rigor (`low`, `medium`, or `high`).
@@ -78,10 +80,10 @@ enum Command {
         /// Mark the change as having a UI/UX surface (enables design phases).
         #[arg(long)]
         ui: bool,
-        /// A defect fix — skips the Documentation phases.
+        /// A defect fix (all mandatory phases still run).
         #[arg(long)]
         fix: bool,
-        /// A non-functional chore (refactor/tooling/perf) — skips Documentation.
+        /// A non-functional chore (refactor/tooling/perf); all mandatory phases run.
         #[arg(long)]
         chore: bool,
         /// Review rigor (`low`, `medium`, or `high`).
@@ -171,15 +173,6 @@ enum Command {
         /// Explicitly reuse an exact, valid executed evidence receipt.
         #[arg(long)]
         reuse: Option<String>,
-        /// Strict tier only: waive this phase's judgment-artifact check with a
-        /// bounded reason (audited; never bypasses an objective gate or a FAIL).
-        #[arg(long = "waive-artifact")]
-        waive_artifact: Option<String>,
-        /// Autonomous mode: a `--waive-artifact` on a Security phase is a judgment
-        /// call reserved for a human — refuse it (halt-and-report) rather than
-        /// self-authorize it (design.md D7 / Cond 12).
-        #[arg(long)]
-        autonomous: bool,
     },
     /// Record a bounded human decision before an excess review attempt.
     Reconcile {
@@ -199,6 +192,18 @@ enum Command {
         #[arg(long)]
         autonomous: bool,
     },
+    /// Preview or append a deterministic legacy-ledger rewind. Never creates a PASS.
+    RepairState {
+        /// Earlier phase to rewind to.
+        #[arg(long, value_name = "PHASE")]
+        to: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        change: Option<String>,
+    },
     /// Close open conditions from a CONDITIONAL PASS (they block archive).
     Resolve {
         /// Condition number (1-based, as shown by `mpd status`). Omit with --all.
@@ -206,9 +211,20 @@ enum Command {
         /// Close every open condition.
         #[arg(long)]
         all: bool,
+        /// Actor closing the condition. Required so a resolution has durable provenance.
+        #[arg(long)]
+        by: String,
+        /// Contained evidence pointer or receipt identifier for the resolution.
+        #[arg(long)]
+        evidence: String,
         /// Change (defaults to the current change).
         #[arg(long)]
         change: Option<String>,
+    },
+    /// Record or revoke an evidence-backed deferral for one stable Builder task.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
     },
     /// Run deterministic checks now (secret scan + optional test run).
     Check {
@@ -220,6 +236,70 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// Validate an exact local Git subject under the approved structured policy.
+    /// Missing or changed trust blocks before any candidate-defined check runs.
+    Validate {
+        /// Local commit or tag subject (defaults to HEAD; peeled to a commit).
+        #[arg(long)]
+        commit: Option<String>,
+        /// Approved local-validation profile (defaults to the configured test profile).
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hash one installed file. This is deliberately a leaf probe: it never
+    /// runs doctor, validation, installation, or Deploy.
+    Identity {
+        /// Contained repository-relative installed file to inspect.
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Git-hook entry points.  Tracked wrappers only forward here; all parsing
+    /// and authorization remains in Rust so shell cannot reinterpret refs.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
+    },
+    /// Activate one explicitly reviewed immutable validation policy locally.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    /// One-time first trusted-policy adoption helpers. These commands never
+    /// run configured validation profiles; they only inventory or reconcile
+    /// explicitly reviewed checkpoint state.
+    #[cfg(test)]
+    FirstAdoption {
+        #[command(subcommand)]
+        command: FirstAdoptionCommand,
+    },
+    /// Internal sandbox entry point. It is intentionally hidden: only the
+    /// reviewed supervisor constructs this separated argv before sandboxing.
+    #[command(name = "__mpd-limited-exec", hide = true)]
+    InternalLimitedExec {
+        #[arg(long)]
+        cpu_secs: u64,
+        #[arg(long)]
+        processes: u64,
+        #[arg(long)]
+        open_files: u64,
+        #[arg(long)]
+        file_bytes: u64,
+        #[arg(last = true, required = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
+    /// Internal exact-host macOS sandbox entry. All authority, limits, and the
+    /// typed checked invocation arrive in one private canonical request.
+    #[cfg(target_os = "macos")]
+    #[command(name = "__mpd-sandbox-exec", hide = true)]
+    InternalSandboxExec,
+    /// Internal, non-recursive static validation-policy check. It parses only
+    /// the exact materialized subject and executes no Git, profile, or tool.
+    #[command(name = "__mpd-static-policy-check", hide = true)]
+    InternalStaticPolicyCheck,
     /// Fold a completed change's specs into the record and archive it. Also
     /// recovers/abandons an interrupted archive closure (`--recover`/`--abandon`).
     Archive {
@@ -284,12 +364,195 @@ enum Command {
         /// on a symlinked/oversized file; never touches config.json).
         #[arg(long)]
         fix: bool,
+        /// Read-only diagnostic scope: `validator-policy` or `runtime-health`.
+        /// Scoped doctor never executes validation, installation, or Deploy.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Exit non-zero when the selected scoped diagnostic reports a blocker.
+        /// This is valid only with --scope; it never makes bare doctor a gate.
+        #[arg(long)]
+        enforce: bool,
     },
     /// Inspect or tune per-persona behavior — the interview primitives a harness
     /// drives (show current/range, warn on the un-rankable change, record).
     Persona {
         #[command(subcommand)]
         command: PersonaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Print the non-executing exact-subject policy preflight.
+    #[cfg(test)]
+    Status {
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create the first trusted-policy commit/ref with an all-zero CAS. This is
+    /// an explicit owner trust decision, never an ordinary validation action.
+    #[cfg(test)]
+    Bootstrap {
+        /// Immutable checkpoint commit reviewed before the pretrust proof.
+        #[arg(long)]
+        commit: String,
+        /// Exact SHA-256 digest of the policy reviewed by the operator.
+        #[arg(long = "confirm-digest")]
+        confirm_digest: String,
+        /// Digest of the exclusive clone-private pretrust proof.
+        #[arg(long = "pretrust-proof")]
+        pretrust_proof: String,
+        /// Public nonce preimage from that proof. This interface consumes it
+        /// only to recompute the domain-separated digest.
+        #[arg(long)]
+        nonce: String,
+        /// Required acknowledgement that this creates a clone-local trust root.
+        #[arg(long = "i-reviewed-this-policy")]
+        reviewed: bool,
+    },
+    /// Explicitly review and promote an immutable candidate commit against the
+    /// already-established clone-local trusted floor.  This never activates
+    /// candidate coordinator/hooks and never creates a validation receipt.
+    #[cfg(test)]
+    Promote {
+        /// Full immutable commit object id containing the proposed policy.
+        #[arg(long)]
+        commit: String,
+        /// Exact SHA-256 digest of the candidate local-validation policy that
+        /// the owner reviewed before either candidate command can run.
+        #[arg(long = "confirm-digest")]
+        confirm_digest: String,
+    },
+    /// Bind and activate an immutable reviewed policy, coordinator, and hooks.
+    Activate {
+        #[arg(long)]
+        commit: String,
+        #[arg(long = "confirm-policy-digest")]
+        confirm_policy_digest: String,
+        #[arg(long)]
+        coordinator: PathBuf,
+        #[arg(long = "confirm-executable-digest")]
+        confirm_executable_digest: String,
+        #[arg(long)]
+        hooks: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug, Subcommand)]
+enum FirstAdoptionCommand {
+    /// Read-only exact checkpoint scope preparation.
+    Prepare {
+        #[arg(long)]
+        change: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        branch: String,
+        #[arg(long)]
+        upstream: Option<String>,
+        #[arg(long)]
+        security_evidence: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify the committed checkpoint in the restricted pretrust control
+    /// plane and exclusively write the nonce-bound proof.
+    VerifyCheckpoint {
+        #[arg(long)]
+        change: String,
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        security_evidence: String,
+        #[arg(long = "confirm-policy-digest")]
+        confirm_policy_digest: String,
+        #[arg(long = "confirm-coordinator-digest")]
+        confirm_coordinator_digest: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview or append one bounded checkpoint correction. This records
+    /// eligibility only; it never stages, commits, rewrites, advances a ref,
+    /// installs bytes, executes policy, or synthesizes a gate PASS.
+    Restart {
+        #[arg(long)]
+        change: String,
+        /// `pretrust` before the one trust CAS, or `posttrust` afterwards.
+        #[arg(long)]
+        stage: String,
+        #[arg(long)]
+        superseded_checkpoint: String,
+        #[arg(long)]
+        superseded_proof: Option<String>,
+        #[arg(long)]
+        replacement_tip: Option<String>,
+        #[arg(long)]
+        security_evidence: String,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        /// Atomically append to the contained ledger (preview is the default).
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append the sole posttrust reconciliation and rewind Build. Preview is
+    /// the default; `--yes` is required for ledger mutation.
+    Reconcile {
+        #[arg(long)]
+        change: String,
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        policy_object: String,
+        #[arg(long)]
+        pretrust_proof: String,
+        #[arg(long)]
+        security_evidence: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Fast, read-only staged gate used by pre-commit.
+    PreCommit {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read Git's exact pre-push protocol from stdin and issue only an
+    /// invocation-local authorization; it never pushes, fetches, or writes refs.
+    PrePush {
+        remote_name: String,
+        remote_location: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create one exact, clone-private, one-use approval for deleting a
+    /// non-main branch on the next matching pre-push invocation.
+    ApproveDeletion {
+        remote_name: String,
+        remote_location: String,
+        #[arg(long)]
+        remote_ref: String,
+        #[arg(long)]
+        old_oid: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -344,6 +607,28 @@ enum ClosureCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    Defer {
+        id: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        change: Option<String>,
+    },
+    Revoke {
+        id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        change: Option<String>,
+    },
+}
+
 /// Run the CLI, returning a process exit code.
 pub fn run() -> i32 {
     let cli = Cli::parse();
@@ -391,8 +676,6 @@ pub fn run() -> i32 {
             failure_class,
             exploit,
             reuse,
-            waive_artifact,
-            autonomous,
         } => cmd_gate(
             phase,
             change,
@@ -405,8 +688,6 @@ pub fn run() -> i32 {
             failure_class,
             exploit,
             reuse,
-            waive_artifact,
-            autonomous,
         ),
         Command::Reconcile {
             continue_reason,
@@ -423,8 +704,63 @@ pub fn run() -> i32 {
             change,
             autonomous,
         ),
-        Command::Resolve { index, all, change } => cmd_resolve(index, all, change),
+        Command::RepairState {
+            to,
+            reason,
+            yes,
+            change,
+        } => cmd_repair_state(to, reason, yes, change),
+        Command::Resolve { index, all, by, evidence, change } => {
+            cmd_resolve(index, all, by, evidence, change)
+        }
+        Command::Task { command } => cmd_task(command),
         Command::Check { staged, quiet } => cmd_check(staged, quiet),
+        Command::Validate { commit, profile, json } => cmd_validate(commit, profile, json),
+        Command::Identity { path, json } => cmd_identity(path, json),
+        Command::Hook { command } => cmd_hook(command),
+        Command::Policy { command } => cmd_policy(command),
+        #[cfg(test)]
+        Command::FirstAdoption { command } => cmd_first_adoption(command),
+        Command::InternalLimitedExec {
+            cpu_secs,
+            processes,
+            open_files,
+            file_bytes,
+            argv,
+        } => {
+            // Clap versions differ on whether `last = true` retains the `--`
+            // delimiter. The supervisor always emits one; accept either parsed
+            // representation while preserving the individual argv boundaries.
+            let argv = argv.strip_prefix(&["--".to_string()]).unwrap_or(&argv);
+            match crate::sandbox::limited_exec(cpu_secs, processes, open_files, file_bytes, argv)
+            {
+                Ok(()) => Ok(0),
+                Err(error) => {
+                    // 125 is reserved for the supervisor wrapper. A checked
+                    // program's ordinary non-zero exit is still a check failure;
+                    // this code means no approved argv began because resource
+                    // setup or the exact exec handoff failed.
+                    eprintln!("resource-limit-setup: {error}");
+                    Ok(125)
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        Command::InternalSandboxExec => {
+            match crate::sandbox_macos::hidden_entry() {
+                Ok(()) => Ok(0),
+                Err(error) => {
+                    eprintln!("sandbox-entry-blocked: {error}");
+                    Ok(125)
+                }
+            }
+        }
+        Command::InternalStaticPolicyCheck => (|| -> CmdResult {
+            let root = find_root()?;
+            crate::local_validation::static_policy_check(&root)?;
+            println!("static validation policy: PASS");
+            Ok(0)
+        })(),
         // `--recover`/`--abandon` route to the closure logic HERE, ahead of
         // `cmd_archive` — whose first check refuses on a pending closure, exactly the
         // state recovery exists for (Security-plan Finding 2). `--json`/`--change`
@@ -457,7 +793,12 @@ pub fn run() -> i32 {
         Command::Closure { command } => cmd_closure(command),
         Command::Use { change } => cmd_use(change),
         Command::Strict { change } => cmd_strict(change),
-        Command::Doctor { json, fix } => cmd_doctor(json, fix),
+        Command::Doctor {
+            json,
+            fix,
+            scope,
+            enforce,
+        } => cmd_doctor(json, fix, scope, enforce),
         Command::Persona { command } => cmd_persona(command),
     };
     match result {
@@ -586,12 +927,6 @@ fn cmd_begin(
         "Governance: risk {}, threat profile {}.",
         risk, threat_profile
     );
-    if !kind.documents() {
-        println!(
-            "  (Documentation phases skipped for a {} change.)",
-            kind.label()
-        );
-    }
     // The strict tier is a durable, per-change bit (`conduct` and `begin --strict`
     // are the only setters). Turn it on, persist it, and seed the current phase's
     // judgment stub so the very first gate has an artifact to author.
@@ -607,9 +942,8 @@ fn cmd_begin(
             );
         }
         println!(
-            "Strict tier ON: judgment artifacts are gate-enforced. \
-             Escape: `mpd brief <phase>` scaffolds a stub; \
-             `mpd gate <phase> --pass --waive-artifact \"reason\"` waives (audited)."
+            "Strict tier ON: canonical judgment artifacts are gate-enforced and cannot be waived. \
+             `mpd brief <phase>` scaffolds the required artifact."
         );
     }
     println!("Next: mpd next");
@@ -703,6 +1037,625 @@ struct ManifestView {
     included_staged: Vec<String>,
     unrelated_staged: Vec<String>,
     blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+enum WorkflowOutcome {
+    #[serde(rename = "PASS")]
+    Pass,
+    #[serde(rename = "FAIL")]
+    Fail,
+    #[serde(rename = "BLOCKED")]
+    Blocked,
+    #[serde(rename = "CONDITIONAL")]
+    Conditional,
+    #[serde(rename = "STALE")]
+    Stale,
+    #[serde(rename = "IN PROGRESS")]
+    InProgress,
+    #[serde(rename = "NOT RUN")]
+    NotRun,
+}
+
+impl WorkflowOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Fail => "FAIL",
+            Self::Blocked => "BLOCKED",
+            Self::Conditional => "CONDITIONAL",
+            Self::Stale => "STALE",
+            Self::InProgress => "IN PROGRESS",
+            Self::NotRun => "NOT RUN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct WorkflowFact {
+    outcome: WorkflowOutcome,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<String>,
+}
+
+impl WorkflowFact {
+    fn new(outcome: WorkflowOutcome, state: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            state: state.into(),
+            evidence: None,
+        }
+    }
+
+    fn with_evidence(mut self, evidence: impl Into<String>) -> Self {
+        self.evidence = Some(evidence.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ContainmentStatus {
+    adapter: String,
+    host: Option<String>,
+    spi_abi_digest: Option<String>,
+    fixed_profile_digest: Option<String>,
+    root_inventory_digests: Vec<String>,
+    canaries: WorkflowFact,
+    compiler_process_tree: WorkflowFact,
+    full_local_profile: String,
+    certified_claim: String,
+    residual_limitations: Vec<String>,
+    blocker_code: Option<String>,
+    blocker_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct WorkflowStatus {
+    worktree: WorkflowFact,
+    candidate: WorkflowFact,
+    gates: WorkflowFact,
+    local_validation: WorkflowFact,
+    archive: WorkflowFact,
+    commit: WorkflowFact,
+    push_authorization: WorkflowFact,
+    transfer: WorkflowFact,
+    remote_parity: WorkflowFact,
+    install: WorkflowFact,
+    containment: ContainmentStatus,
+    next_action: String,
+}
+
+fn sandbox_blocker(error: &str) -> (&'static str, &'static str) {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("host") || lower.contains("platform") || lower.contains("architecture") {
+        (
+            "sandbox.host-drift",
+            "run the unchanged candidate/policy on the exact certified host",
+        )
+    } else if lower.contains("profile") || lower.contains("policy") || lower.contains("activation")
+    {
+        (
+            "sandbox.profile-drift",
+            "run the printed digest-confirmed policy activation",
+        )
+    } else if lower.contains("root") || lower.contains("candidate") {
+        (
+            "sandbox.root-drift",
+            "return to Build and recapture candidate/root inventory",
+        )
+    } else if lower.contains("canary") {
+        (
+            "sandbox.canary-failed",
+            "return to Security(code) with the named failure/log",
+        )
+    } else if lower.contains("receipt")
+        || lower.contains("not run")
+        || lower.contains("missing")
+        || lower.contains("absent")
+        || lower.contains("incomplete")
+    {
+        (
+            "sandbox.full-profile-incomplete",
+            "run `scripts/ci-local.sh` for the current candidate on the exact certified host",
+        )
+    } else {
+        (
+            "sandbox.spi-abi-drift",
+            "return to Architecture for adapter revision",
+        )
+    }
+}
+
+fn receipt_failure_fact(error: &str) -> WorkflowFact {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("stale") || lower.contains("changed-dependency") {
+        WorkflowFact::new(WorkflowOutcome::Stale, "STALE").with_evidence(error)
+    } else if lower.contains("failed") {
+        WorkflowFact::new(WorkflowOutcome::Fail, "FAILED").with_evidence(error)
+    } else if lower.contains("missing") || lower.contains("no receipt") {
+        WorkflowFact::new(WorkflowOutcome::NotRun, "MISSING").with_evidence(error)
+    } else {
+        WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED").with_evidence(error)
+    }
+}
+
+fn blocked_containment(error: &str) -> ContainmentStatus {
+    let (code, action) = sandbox_blocker(error);
+    ContainmentStatus {
+        adapter: "NOT CERTIFIED".into(),
+        host: None,
+        spi_abi_digest: None,
+        fixed_profile_digest: None,
+        root_inventory_digests: Vec::new(),
+        canaries: WorkflowFact::new(WorkflowOutcome::NotRun, "NOT RUN"),
+        compiler_process_tree: WorkflowFact::new(
+            WorkflowOutcome::NotRun,
+            "FEASIBILITY EVIDENCE ONLY; NOT A FULL-PROFILE SUBSTITUTE",
+        ),
+        full_local_profile: "NOT CERTIFIED".into(),
+        certified_claim: "NOT CERTIFIED".into(),
+        residual_limitations: vec![
+            "global path metadata and literal-root entries are not confidential".into(),
+            "same-user process isolation is not claimed".into(),
+        ],
+        blocker_code: Some(code.into()),
+        blocker_action: Some(action.into()),
+    }
+}
+
+fn current_receipt_status(
+    receipt: &crate::local_validation::ValidationReceiptV1,
+    full_profile: bool,
+) -> (WorkflowFact, ContainmentStatus) {
+    current_validation_status(
+        &receipt.profile,
+        &receipt.id,
+        &receipt.sandbox,
+        &receipt.results,
+        &receipt.outcome,
+        full_profile,
+    )
+}
+
+fn current_validation_status(
+    profile: &str,
+    receipt_id: &str,
+    sandbox: &crate::local_validation::SandboxReceiptBindingV1,
+    results: &[crate::local_validation::ValidationCheckResult],
+    receipt_outcome: &str,
+    full_profile: bool,
+) -> (WorkflowFact, ContainmentStatus) {
+    let all_passed = receipt_outcome == "passed"
+        && !results.is_empty()
+        && results.iter().all(|result| result.outcome == "passed");
+    let canaries_current = !sandbox.run_canary_digests.is_empty()
+        && sandbox.run_canary_digests.len() >= results.len()
+        && sandbox
+            .run_canary_digests
+            .iter()
+            .all(|digest| digest == &sandbox.canary_contract_digest);
+    let validation_current = all_passed && canaries_current;
+    let certified = validation_current && full_profile;
+    (
+        WorkflowFact::new(
+            if validation_current {
+                WorkflowOutcome::Pass
+            } else {
+                WorkflowOutcome::Blocked
+            },
+            if validation_current {
+                "CURRENT"
+            } else {
+                "BLOCKED"
+            },
+        )
+        .with_evidence(format!(
+            "profile={} receipt={} checks={}",
+            profile,
+            receipt_id,
+            results.len()
+        )),
+        ContainmentStatus {
+            adapter: if canaries_current {
+                "CERTIFIED".into()
+            } else {
+                "NOT CERTIFIED".into()
+            },
+            host: Some(sandbox.certified_host.clone()),
+            spi_abi_digest: Some(sandbox.adapter_abi_digest.clone()),
+            fixed_profile_digest: Some(sandbox.profile_digest.clone()),
+            root_inventory_digests: sandbox.run_root_inventory_digests.clone(),
+            canaries: WorkflowFact::new(
+                if canaries_current {
+                    WorkflowOutcome::Pass
+                } else {
+                    WorkflowOutcome::Blocked
+                },
+                if canaries_current {
+                    "CURRENT"
+                } else {
+                    "BLOCKED"
+                },
+            ),
+            compiler_process_tree: WorkflowFact::new(
+                WorkflowOutcome::NotRun,
+                "FEASIBILITY EVIDENCE ONLY; NOT A FULL-PROFILE SUBSTITUTE",
+            ),
+            full_local_profile: if certified {
+                "CERTIFIED".into()
+            } else {
+                "NOT CERTIFIED".into()
+            },
+            certified_claim: if certified {
+                "CERTIFIED".into()
+            } else {
+                "NOT CERTIFIED".into()
+            },
+            residual_limitations: sandbox.residual_limitations.clone(),
+            blocker_code: (!certified).then_some("sandbox.full-profile-incomplete".into()),
+            blocker_action: (!certified).then_some(
+                "run `scripts/ci-local.sh` for the current candidate on the exact certified host"
+                    .into(),
+            ),
+        },
+    )
+}
+
+fn workflow_status(
+    root: &Path,
+    ledger: &ledger::Ledger,
+    config: &Config,
+    freshness: &closure::FreshnessProjection,
+    coherence: Option<&closure::CommitCoherence>,
+    parity: Option<&closure::ParityObservation>,
+) -> WorkflowStatus {
+    let status_entries = git::status_v2(root);
+    let worktree = match status_entries {
+        Err(error) => WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED")
+            .with_evidence(format!("cannot inspect worktree: {error}")),
+        Ok(entries)
+            if entries
+                .iter()
+                .any(|entry| matches!(entry, git::StatusEntry::Unmerged { .. })) =>
+        {
+            WorkflowFact::new(WorkflowOutcome::Blocked, "CONFLICTED")
+        }
+        Ok(entries) => {
+            let dirty = entries
+                .iter()
+                .filter(|entry| !matches!(entry, git::StatusEntry::Ignored { .. }))
+                .count();
+            if dirty == 0 {
+                WorkflowFact::new(WorkflowOutcome::Pass, "CLEAN")
+            } else {
+                WorkflowFact::new(WorkflowOutcome::InProgress, "DIRTY")
+                    .with_evidence(format!("{dirty} changed path(s)"))
+            }
+        }
+    };
+
+    let candidate_record = [Phase::Test, Phase::SecurityCode, Phase::Build]
+        .into_iter()
+        .find_map(|phase| {
+            ledger
+                .gates
+                .get(&phase)
+                .and_then(|record| record.candidate.as_ref().map(|capture| (phase, capture)))
+        });
+    let candidate_is_stale = freshness
+        .stale
+        .iter()
+        .any(|item| item.phase <= Phase::Build);
+    let candidate = match candidate_record {
+        None => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT CAPTURED").with_evidence(format!(
+            "planning subject: HEAD at {}",
+            ledger.phase.label()
+        )),
+        Some((phase, capture)) if candidate_is_stale => {
+            WorkflowFact::new(WorkflowOutcome::Stale, "STALE").with_evidence(format!(
+                "{} candidate {}",
+                phase.label(),
+                capture.subject.id
+            ))
+        }
+        Some((phase, capture)) => WorkflowFact::new(WorkflowOutcome::Pass, "CURRENT")
+            .with_evidence(format!(
+                "{} candidate {}",
+                phase.label(),
+                capture.subject.id
+            )),
+    };
+
+    let gate_fact = if freshness.effective_phase < freshness.stored_phase {
+        WorkflowFact::new(WorkflowOutcome::Stale, "STALE").with_evidence(format!(
+            "rewind {} -> {}",
+            freshness.stored_phase.label(),
+            freshness.effective_phase.label()
+        ))
+    } else if let Some(record) = ledger.gates.get(&ledger.phase) {
+        match record.verdict {
+            Verdict::Pass => WorkflowFact::new(WorkflowOutcome::InProgress, ledger.phase.label()),
+            Verdict::ConditionalPass => {
+                WorkflowFact::new(WorkflowOutcome::Conditional, ledger.phase.label())
+            }
+            Verdict::Fail => WorkflowFact::new(WorkflowOutcome::Fail, ledger.phase.label()),
+        }
+    } else if ledger.phase == Phase::Done {
+        WorkflowFact::new(WorkflowOutcome::Pass, "ALL CURRENT")
+    } else {
+        WorkflowFact::new(WorkflowOutcome::InProgress, ledger.phase.label())
+    };
+
+    let stored_validation = [Phase::Test, Phase::SecurityCode, Phase::Build]
+        .into_iter()
+        .find_map(|phase| {
+            ledger.gates.get(&phase).and_then(|record| {
+                record
+                    .validation_receipt
+                    .as_ref()
+                    .map(|receipt| (phase, receipt))
+            })
+        });
+    let (local_validation, containment) = if candidate_is_stale && stored_validation.is_some() {
+        let error = "candidate validation receipt is stale";
+        (receipt_failure_fact(error), blocked_containment(error))
+    } else if let Some((phase, receipt)) = stored_validation {
+        match crate::local_validation::validate_receipt_for_status(receipt) {
+            Ok(()) => {
+                let full_profile = phase == Phase::Test
+                    && config.local_validation.as_ref().is_some_and(|local| {
+                        receipt.profile == local.gates.test
+                            || receipt.profile == local.gates.high_risk_test
+                    });
+                current_receipt_status(receipt, full_profile)
+            }
+            Err(error) => (
+                WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED").with_evidence(error.clone()),
+                blocked_containment(&error),
+            ),
+        }
+    } else if ledger.archive_closure.is_some() && coherence.is_some_and(|value| value.coherent) {
+        match config.local_validation.as_ref() {
+            None => {
+                let error = "structured local_validation is absent";
+                (
+                    WorkflowFact::new(WorkflowOutcome::Blocked, "MISSING"),
+                    blocked_containment(error),
+                )
+            }
+            Some(local) => {
+                let profile = if ledger.effective_risk() == RiskLevel::High {
+                    &local.gates.high_risk_test
+                } else {
+                    &local.gates.test
+                };
+                match crate::local_validation::doctor_runtime_receipt_health(root, local, profile) {
+                    Ok(health) => current_validation_status(
+                        &health.profile,
+                        &health.receipt_id,
+                        &health.sandbox,
+                        &health.results,
+                        "passed",
+                        true,
+                    ),
+                    Err(error) => (receipt_failure_fact(&error), blocked_containment(&error)),
+                }
+            }
+        }
+    } else {
+        let error = "required full local profile receipt is missing";
+        (
+            WorkflowFact::new(WorkflowOutcome::NotRun, "MISSING"),
+            blocked_containment(error),
+        )
+    };
+
+    let archive = match ledger.archive_closure.as_ref() {
+        Some(record) => WorkflowFact::new(WorkflowOutcome::Pass, "ARCHIVED")
+            .with_evidence(record.post_archive_digest.to_string()),
+        None if ledger.phase == Phase::Done => {
+            WorkflowFact::new(WorkflowOutcome::InProgress, "READY")
+        }
+        None => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT RUN"),
+    };
+    let commit = match (ledger.archive_closure.as_ref(), coherence) {
+        (None, _) => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT RUN"),
+        (Some(_), Some(value)) if value.coherent => {
+            WorkflowFact::new(WorkflowOutcome::Pass, "COHERENT")
+                .with_evidence(value.head.clone().unwrap_or_default())
+        }
+        (Some(_), Some(value)) => WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED")
+            .with_evidence(value.blockers.join("; ")),
+        (Some(_), None) => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT OBSERVED"),
+    };
+
+    let head = git::head_commit(root).ok().flatten();
+    let authorization = crate::local_validation::load_push_authorization_audit(root);
+    let matching_authorization = authorization.as_ref().ok().and_then(|authorization| {
+        authorization.as_ref().and_then(|authorization| {
+            let update = authorization.updates.iter().find(|update| {
+                head.as_deref() == Some(update.local_oid.as_str())
+                    && parity.is_none_or(|observation| {
+                        authorization.remote_name == observation.remote
+                            && update.remote_ref == observation.reference
+                    })
+            })?;
+            Some((authorization, update))
+        })
+    });
+    let parity_current = parity.is_some_and(|observation| {
+        observation.state == closure::ParityState::Verified
+            && head.as_deref() == Some(observation.local_oid.as_str())
+            && observation.remote_oid.as_deref() == head.as_deref()
+    });
+    let push_authorization = match (&authorization, matching_authorization) {
+        (Err(error), _) => {
+            WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED").with_evidence(error.clone())
+        }
+        (_, Some((authorization, _))) => WorkflowFact::new(WorkflowOutcome::Pass, "CURRENT")
+            .with_evidence(authorization.authorization_id.clone()),
+        (Ok(Some(authorization)), None) => WorkflowFact::new(WorkflowOutcome::Stale, "STALE")
+            .with_evidence(authorization.authorization_id.clone()),
+        (Ok(None), None) if parity_current => {
+            WorkflowFact::new(WorkflowOutcome::Blocked, "BYPASSED")
+        }
+        (Ok(None), None) => WorkflowFact::new(WorkflowOutcome::NotRun, "MISSING"),
+    };
+    let remote_parity = match parity {
+        Some(observation) if parity_current => WorkflowFact::new(WorkflowOutcome::Pass, "VERIFIED")
+            .with_evidence(observation.local_oid.clone()),
+        Some(observation) if head.as_deref() != Some(observation.local_oid.as_str()) => {
+            WorkflowFact::new(WorkflowOutcome::Stale, "STALE")
+                .with_evidence(observation.local_oid.clone())
+        }
+        Some(observation) => WorkflowFact::new(WorkflowOutcome::Blocked, observation.state.label()),
+        None => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT VERIFIED"),
+    };
+    let transfer = match (matching_authorization, parity_current) {
+        (Some((_, update)), true) if update.remote_oid != update.local_oid => {
+            WorkflowFact::new(WorkflowOutcome::Pass, "OBSERVED")
+                .with_evidence(format!("{} -> {}", update.remote_oid, update.local_oid))
+        }
+        (None, true) => WorkflowFact::new(WorkflowOutcome::Blocked, "UNAUTHORIZED/BYPASSED"),
+        _ => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT OBSERVED"),
+    };
+
+    let install = match ledger
+        .gates
+        .get(&Phase::Deploy)
+        .and_then(|gate| gate.deploy_result.as_ref())
+    {
+        None => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT RUN"),
+        Some(result) if result.mode == "readiness" && result.verified => {
+            WorkflowFact::new(WorkflowOutcome::Pass, "readiness-only")
+                .with_evidence(result.result_digest.clone())
+        }
+        Some(result) if result.mode == "execute" && result.verified => {
+            match config
+                .local_validation
+                .as_ref()
+                .map(|local| doctor_installed_deploy_health(root, local, ledger))
+            {
+                Some(Ok(())) => WorkflowFact::new(WorkflowOutcome::Pass, "installed-and-verified")
+                    .with_evidence(result.result_digest.clone()),
+                Some(Err(error)) => {
+                    WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED").with_evidence(error)
+                }
+                None => WorkflowFact::new(WorkflowOutcome::Blocked, "BLOCKED"),
+            }
+        }
+        Some(result) => WorkflowFact::new(WorkflowOutcome::Fail, "FAILED")
+            .with_evidence(result.result_digest.clone()),
+    };
+
+    let next_action = if freshness.effective_phase < freshness.stored_phase {
+        "run `mpd next` to record the required freshness rewind".into()
+    } else if ledger.phase != Phase::Done {
+        "run `mpd next --harness codex --context`".into()
+    } else if ledger.archive_closure.is_none() {
+        "run `mpd archive --yes`".into()
+    } else if !coherence.is_some_and(|value| value.coherent) {
+        "commit the exact archived result with normal Git".into()
+    } else if !matches!(push_authorization.state.as_str(), "CURRENT") {
+        "run a normal non-force `git push`; the local pre-push hook must authorize it".into()
+    } else if !parity_current {
+        "run `mpd publish --verify` after Git transport completes".into()
+    } else if !matches!(
+        install.state.as_str(),
+        "installed-and-verified" | "readiness-only"
+    ) {
+        "complete the typed final Deploy gate".into()
+    } else {
+        "no further workflow action is required".into()
+    };
+
+    WorkflowStatus {
+        worktree,
+        candidate,
+        gates: gate_fact,
+        local_validation,
+        archive,
+        commit,
+        push_authorization,
+        transfer,
+        remote_parity,
+        install,
+        containment,
+        next_action,
+    }
+}
+
+fn print_workflow_status(status: &WorkflowStatus) {
+    println!("\nWorkflow truth:");
+    for (label, fact) in [
+        ("Worktree", &status.worktree),
+        ("Candidate", &status.candidate),
+        ("Gates/freshness", &status.gates),
+        ("Local validation", &status.local_validation),
+        ("Archive", &status.archive),
+        ("Commit", &status.commit),
+        ("Push authorization", &status.push_authorization),
+        ("Transfer", &status.transfer),
+        ("Remote parity", &status.remote_parity),
+        ("Install", &status.install),
+    ] {
+        println!(
+            "  {:<19} {:<11} {}",
+            label,
+            fact.outcome.label(),
+            harness::terminal_safe(&fact.state)
+        );
+        if let Some(evidence) = &fact.evidence {
+            println!("    evidence: {}", harness::terminal_safe(evidence));
+        }
+    }
+    println!("  Containment:");
+    println!(
+        "    adapter={} full-profile={} certified-claim={}",
+        status.containment.adapter,
+        status.containment.full_local_profile,
+        status.containment.certified_claim
+    );
+    println!(
+        "    host={} spi/abi={} fixed-profile={} root-inventories={}",
+        status
+            .containment
+            .host
+            .as_deref()
+            .map(harness::terminal_safe)
+            .unwrap_or_else(|| "(not observed)".into()),
+        status
+            .containment
+            .spi_abi_digest
+            .as_deref()
+            .unwrap_or("(not observed)"),
+        status
+            .containment
+            .fixed_profile_digest
+            .as_deref()
+            .unwrap_or("(not observed)"),
+        status.containment.root_inventory_digests.len(),
+    );
+    println!(
+        "    canaries={} compiler-tree={}",
+        status.containment.canaries.outcome.label(),
+        harness::terminal_safe(&status.containment.compiler_process_tree.state)
+    );
+    for limitation in &status.containment.residual_limitations {
+        println!("    limitation: {}", harness::terminal_safe(limitation));
+    }
+    if let (Some(code), Some(action)) = (
+        &status.containment.blocker_code,
+        &status.containment.blocker_action,
+    ) {
+        println!("    blocker: {code}");
+        println!("    action: {}", harness::terminal_safe(action));
+    }
+    println!(
+        "  Next action: {}",
+        harness::terminal_safe(&status.next_action)
+    );
 }
 
 /// `manifest_view`'s scope-classification authority: either the active,
@@ -816,18 +1769,115 @@ fn manifest_view(root: &Path, change: &str) -> ManifestView {
     }
 }
 
+fn current_risk_assessment(
+    root: &Path,
+    change: &str,
+    ledger: &ledger::Ledger,
+    config: &Config,
+) -> Result<ledger::RiskAssessment, String> {
+    let manifest = closure::load_manifest(root, change).map_err(|error| error.to_string())?;
+    Ok(closure::classify_effective_risk(
+        &manifest,
+        config,
+        ledger.governance.risk,
+    ))
+}
+
+/// Refresh risk and stop immediately if current PASS evidence projects an
+/// earlier phase. The compare-before-atomic-save path prevents a stale command
+/// from overwriting a concurrently changed ledger.
+fn enforce_freshness_before_effects(
+    root: &Path,
+    change: &str,
+    ledger: &mut ledger::Ledger,
+    observed: &str,
+    config: &Config,
+    json: bool,
+) -> Result<bool, String> {
+    let assessment = current_risk_assessment(root, change, ledger, config)?;
+    let projection = closure::freshness_projection(root, change, ledger, config)?;
+    let assessment_changed = ledger.risk_assessment.as_ref() != Some(&assessment);
+    ledger.risk_assessment = Some(assessment.clone());
+    if projection.effective_phase < projection.stored_phase {
+        let stale_phases = projection.stale.iter().map(|item| item.phase).collect();
+        let reasons = projection
+            .stale
+            .iter()
+            .flat_map(|item| {
+                item.reasons
+                    .iter()
+                    .map(move |reason| format!("{}: {reason}", item.phase.slug()))
+            })
+            .collect();
+        ledger.invalidate_for_freshness(projection.effective_phase, stale_phases, reasons)?;
+        ledger::save_if_observed(root, ledger, observed).map_err(|error| error.to_string())?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "state": "rewound",
+                    "stored_phase": projection.stored_phase.slug(),
+                    "effective_phase": projection.effective_phase.slug(),
+                    "stale": projection.stale,
+                    "risk_assessment": assessment,
+                    "next": "run mpd next again after reviewing the rewind",
+                }))
+                .unwrap()
+            );
+        } else {
+            eprintln!(
+                "Stale evidence rewound {} to {} before any downstream action. Re-run `mpd next`.",
+                projection.stored_phase.label(),
+                projection.effective_phase.label()
+            );
+        }
+        return Ok(true);
+    }
+    if assessment_changed {
+        ledger::save_if_observed(root, ledger, observed).map_err(|error| error.to_string())?;
+    }
+    Ok(false)
+}
+
 fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let config = Config::load(&root);
+    let risk = current_risk_assessment(&root, &change, &ledger, &config)?;
+    let freshness = closure::freshness_projection(&root, &change, &ledger, &config)?;
     let project = Project::new(&root);
     let tasks = project.task_status(&change).unwrap_or_default();
+    let task_plan = project
+        .task_plan(&change)
+        .map_err(|error| format!("invalid tasks.md: {error}"))?;
+    let task_accounting = ledger.task_accounting(&task_plan);
     // Readiness = the ledger's gate/condition reasons PLUS unfilled core-artifact
     // stubs (which `mpd archive` also refuses), so status and archive agree.
     let mut reasons = ledger.blocking_reasons();
+    reasons.extend(current_evidence_blockers(&root, &change, &ledger));
+    if freshness.effective_phase < freshness.stored_phase {
+        reasons.push(format!(
+            "stale evidence requires rewind from {} to {}",
+            freshness.stored_phase.label(),
+            freshness.effective_phase.label()
+        ));
+    }
+    if task_plan.strict && !task_accounting.accounted() {
+        if !task_accounting.open.is_empty() {
+            reasons.push(format!(
+                "{} Builder task(s) open: {}",
+                task_accounting.open.len(),
+                task_accounting.open.join(", ")
+            ));
+        }
+        for id in &task_accounting.stale {
+            reasons.push(format!("task deferral for {id} is stale"));
+        }
+    }
     reasons.extend(artifact_stub_issues(&project, &change));
     let ready = reasons.is_empty();
-    let artifact_budget = artifact_budget(&project, &change, ledger.governance.risk);
+    let artifact_budget = artifact_budget(&project, &change, risk.effective);
     let attempt_authorization = ledger
         .attempt_authorization(ledger.phase)
         .map(|r| r.kind.label().to_string());
@@ -857,6 +1907,14 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
         .as_ref()
         .and_then(|c| closure::verify_commit_coherence(&root, c).ok());
     let parity = closure::load_parity_cache(&root);
+    let workflow = workflow_status(
+        &root,
+        &ledger,
+        &config,
+        &freshness,
+        coherence.as_ref(),
+        parity.as_ref(),
+    );
 
     if json {
         let gates: serde_json::Map<String, serde_json::Value> = ledger
@@ -873,21 +1931,26 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             "change": ledger.change,
             "ui": ledger.ui,
             "phase": ledger.phase.slug(),
+            "stored_phase": freshness.stored_phase.slug(),
+            "effective_phase": freshness.effective_phase.slug(),
+            "freshness": freshness,
             "gates": gates,
-            "tasks": { "done": tasks.done, "total": tasks.total },
+            "tasks": { "done": task_accounting.done, "deferred": task_accounting.deferred, "open": task_accounting.open.len(), "stale": task_accounting.stale, "total": task_accounting.total, "legacy_done": tasks.done, "legacy_total": tasks.total },
             "ready_to_archive": ready,
             "blocking_reasons": reasons,
             "history": serde_json::to_value(&ledger.history).unwrap_or(serde_json::Value::Null),
             "governance": ledger.governance,
+            "risk_assessment": risk,
             "artifact_budget": artifact_budget,
             "current_attempt": ledger.next_attempt(ledger.phase),
-            "attempt_limit": ledger.governance.risk.attempt_limit(),
+            "attempt_limit": risk.effective.attempt_limit(),
             "reconciliation_required": !ledger.attempt_authorized(ledger.phase),
             "attempt_authorization": attempt_authorization,
             "evidence": evidence,
             "manifest": manifest,
             "commit_coherence": coherence.as_ref().map(|c| serde_json::json!({"coherent":c.coherent,"head":c.head,"blockers":c.blockers})),
             "remote_parity": parity,
+            "workflow": workflow,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
@@ -903,11 +1966,18 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             if ledger.strict { "strict" } else { "manual" }
         );
         println!(
-            "Governance: risk {}, threat profile {} — review attempt {}/{}",
-            ledger.governance.risk,
+            "Governance: requested {}, derived {}, effective {}; threat profile {} — review attempt {}/{}",
+            risk.requested,
+            risk.derived,
+            risk.effective,
             ledger.governance.threat_profile,
             ledger.next_attempt(ledger.phase),
-            ledger.governance.risk.attempt_limit()
+            risk.effective.attempt_limit()
+        );
+        println!(
+            "Workflow: {} — {}",
+            workflow.gates.outcome.label(),
+            harness::terminal_safe(&workflow.next_action)
         );
         if ready {
             println!("Ready to archive: yes  →  mpd archive --yes");
@@ -928,20 +1998,20 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
 
     println!("Change: {}  (ui: {})", ledger.change, ledger.ui);
     println!(
-        "Governance: risk {}, threat profile {}",
-        ledger.governance.risk, ledger.governance.threat_profile
+        "Governance: requested {}, derived {}, effective {}; threat profile {}",
+        risk.requested, risk.derived, risk.effective, ledger.governance.threat_profile
     );
     println!(
         "Review attempt: {}/{}",
         ledger.next_attempt(ledger.phase),
-        ledger.governance.risk.attempt_limit()
+        risk.effective.attempt_limit()
     );
     if let Some(kind) = &attempt_authorization {
         println!(
             "Excess attempt {} authorized by {} reconciliation (base limit {}).",
             ledger.next_attempt(ledger.phase),
             kind,
-            ledger.governance.risk.attempt_limit()
+            risk.effective.attempt_limit()
         );
     }
     if let Some(warning) = &artifact_budget.warning {
@@ -1002,7 +2072,13 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
         }
     }
 
-    println!("\nTasks: {}/{} complete", tasks.done, tasks.total);
+    println!(
+        "\nTasks: {} done, {} deferred, {} open, {} total",
+        task_accounting.done,
+        task_accounting.deferred,
+        task_accounting.open.len(),
+        task_accounting.total
+    );
     println!("\nEvidence:");
     for item in &evidence {
         println!(
@@ -1051,6 +2127,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     } else {
         println!("\nRemote parity: NOT VERIFIED");
     }
+    print_workflow_status(&workflow);
     if ready {
         println!("Ready to archive: yes");
     } else {
@@ -1061,7 +2138,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     }
 
     // Point the operator at the next command instead of leaving it to be guessed.
-    let open_conditions = ledger.conditions.iter().filter(|c| !c.closed).count();
+    let open_conditions = ledger.conditions.iter().filter(|c| c.is_open()).count();
     if let Some(c) = &coherence {
         if !c.coherent {
             println!("\n→ next: commit the exact archived result");
@@ -1153,7 +2230,40 @@ fn cmd_next(
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
-    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let (mut ledger, observed) =
+        ledger::load_observed(&root, &change).map_err(|e| e.to_string())?;
+    // Archived changes no longer have an active manifest/change directory.
+    // Their publication closure is immutable evidence, so preserve the
+    // existing read-only terminal response without attempting active-change
+    // risk/freshness capture.
+    if ledger.phase == Phase::Done && ledger.archive_closure.is_some() {
+        let release_closure = release_closure_facts(&root, &change, &ledger);
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "change": change,
+                    "phase": "done",
+                    "archived": true,
+                    "release_closure": release_closure,
+                }))
+                .unwrap()
+            );
+            return Ok(0);
+        }
+        print_release_closure_facts(&release_closure);
+        if release_closure["pending_closure"].is_null() {
+            println!(
+                "{change:?} is archived and its closure metadata is resolved. Run \
+                 `mpd publish --verify` to (re)confirm remote parity."
+            );
+        }
+        return Ok(0);
+    }
+    let cfg = Config::load(&root);
+    if enforce_freshness_before_effects(&root, &change, &mut ledger, &observed, &cfg, json)? {
+        return Ok(1);
+    }
     let release_closure = release_closure_facts(&root, &change, &ledger);
     if ledger.phase == Phase::Done {
         if json {
@@ -1184,15 +2294,19 @@ fn cmd_next(
         }
         return Ok(0);
     }
-    let cfg = Config::load(&root);
-    let page_warning =
-        artifact_budget(&Project::new(&root), &change, ledger.governance.risk).warning;
+    let risk = ledger
+        .risk_assessment
+        .clone()
+        .ok_or("risk assessment missing after freshness preflight")?;
+    let page_warning = artifact_budget(&Project::new(&root), &change, risk.effective).warning;
+    let mut effective_governance = ledger.governance.clone();
+    effective_governance.risk = risk.effective;
     let mut brief = harness::brief(
         &cfg,
         &change,
         ledger.phase,
         &harness_kind,
-        &ledger.governance,
+        &effective_governance,
         ledger.strict,
         ledger.next_attempt(ledger.phase),
         !ledger.attempt_authorized(ledger.phase),
@@ -1228,7 +2342,7 @@ fn cmd_next(
     // for (phase, attempt), monotonic weakest-seen; only when non-baseline, so an
     // untuned+unmodified project's ledger is byte-unchanged by `next` (Cond 11).
     {
-        let resolved = harness::resolve_tuning_governed(&cfg, ledger.phase, ledger.governance.risk);
+        let resolved = harness::resolve_tuning_governed(&cfg, ledger.phase, risk.effective);
         let record = ledger::PersonaTuningRecord {
             rigor: resolved.rigor,
             depth: resolved.depth,
@@ -1306,6 +2420,7 @@ fn cmd_next(
         }
         v["evidence"] = evidence_hint.clone().unwrap_or(serde_json::Value::Null);
         v["release_closure"] = release_closure;
+        v["risk_assessment"] = serde_json::to_value(&risk).unwrap_or(serde_json::Value::Null);
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
     }
@@ -1381,7 +2496,7 @@ fn persona_tuning_stamp(
     if let Some(rec) = ledger.brief_tuning_for(phase, attempt) {
         return (!rec.is_baseline()).then(|| rec.clone());
     }
-    let resolved = harness::resolve_tuning_governed(cfg, phase, ledger.governance.risk);
+    let resolved = harness::resolve_tuning_governed(cfg, phase, ledger.effective_risk());
     let base_modified = phase
         .tuning_personas()
         .into_iter()
@@ -1421,6 +2536,281 @@ fn parse_exploit(raw: &str) -> Result<Exploitability, String> {
     })
 }
 
+pub(crate) struct PendingCandidateBuild {
+    captured: Option<crate::candidate::CapturedCandidate>,
+    build_output: Option<crate::local_validation::OwnedCandidateBuildOutput>,
+}
+
+impl PendingCandidateBuild {
+    pub(crate) fn new(captured: crate::candidate::CapturedCandidate) -> Self {
+        Self {
+            captured: Some(captured),
+            build_output: None,
+        }
+    }
+
+    pub(crate) fn attach_output(
+        &mut self,
+        output: crate::local_validation::OwnedCandidateBuildOutput,
+    ) {
+        self.build_output = Some(output);
+    }
+
+    fn capture(&self) -> &crate::candidate::CandidateCapture {
+        &self
+            .captured
+            .as_ref()
+            .expect("pending candidate ownership is armed")
+            .projection
+            .capture
+    }
+
+    fn captured(&self) -> &crate::candidate::CapturedCandidate {
+        self.captured
+            .as_ref()
+            .expect("pending candidate ownership is armed")
+    }
+
+    pub(crate) fn revalidate_output(&self, root: &Path) -> Result<(), String> {
+        self.build_output
+            .as_ref()
+            .ok_or("pending candidate Build has no owned typed output")?
+            .revalidate(root)
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let mut preserve_candidate = false;
+        if let Some(mut output) = self.build_output.take() {
+            if let Err(error) = output.cleanup() {
+                preserve_candidate = output.destination_exists();
+                errors.push(error);
+            }
+        }
+        if preserve_candidate {
+            let _ = self.captured.take();
+            errors.push(
+                "candidate retained because output cleanup could not prove the versioned path was unbound"
+                    .into(),
+            );
+        } else if let Some(captured) = self.captured.take() {
+            if let Err(error) = captured.cleanup() {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// The durable ledger now owns the compact binding. Dropping the runtime
+    /// handle without calling cleanup intentionally retains the root/sidecar
+    /// for Security(code), Test, and closure.
+    fn retain_after_ledger_commit(&mut self) {
+        if let Some(output) = self.build_output.as_mut() {
+            output.retain();
+        }
+        let _ = self.build_output.take();
+        let _ = self.captured.take();
+    }
+}
+
+pub(crate) fn resolve_candidate_save_outcome(
+    root: &Path,
+    pending: Option<&mut PendingCandidateBuild>,
+    outcome: ledger::ExactSaveOutcome,
+) -> Result<Option<String>, String> {
+    match outcome {
+        ledger::ExactSaveOutcome::Committed => {
+            if let Some(pending) = pending {
+                if let Err(error) = pending.revalidate_output(root) {
+                    pending.retain_after_ledger_commit();
+                    return Err(format!(
+                        "Build output changed after the exact ledger commit; durable candidate state was preserved for append-only reconciliation: {error}"
+                    ));
+                }
+                pending.retain_after_ledger_commit();
+            }
+            Ok(None)
+        }
+        ledger::ExactSaveOutcome::CommittedAfterRename { error } => {
+            if let Some(pending) = pending {
+                if let Err(output_error) = pending.revalidate_output(root) {
+                    pending.retain_after_ledger_commit();
+                    return Err(format!(
+                        "ledger commit was confirmed after a post-rename error, but Build output revalidation failed; durable candidate state was preserved for append-only reconciliation: {error}; {output_error}"
+                    ));
+                }
+                pending.retain_after_ledger_commit();
+            }
+            Ok(Some(format!(
+                "ledger commit was confirmed by exact readback after a post-rename error: {error}"
+            )))
+        }
+        ledger::ExactSaveOutcome::NotCommitted(error) => Err(error.to_string()),
+        ledger::ExactSaveOutcome::UncertainAfterRename(error) => {
+            let output_state = pending
+                .as_deref()
+                .and_then(|pending| pending.revalidate_output(root).err());
+            if let Some(pending) = pending {
+                pending.retain_after_ledger_commit();
+            }
+            Err(match output_state {
+                Some(output) => format!(
+                    "ledger commit remains uncertain and Build output revalidation failed; candidate state was preserved: {error}; {output}"
+                ),
+                None => format!(
+                    "ledger commit remains uncertain; candidate state was preserved for reconciliation: {error}"
+                ),
+            })
+        }
+    }
+}
+
+impl Drop for PendingCandidateBuild {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("candidate-transaction-cleanup-blocked: {error}");
+        }
+    }
+}
+
+fn execute_strict_candidate_build(
+    root: &Path,
+    change: &str,
+    expected_policy: &crate::config::LocalValidationConfig,
+) -> Result<
+    (
+        PendingCandidateBuild,
+        crate::local_validation::ValidationReport,
+    ),
+    String,
+> {
+    let (candidate_policy, policy_digest) = crate::local_validation::load_candidate_policy(root)?;
+    if candidate_policy != *expected_policy {
+        return Err("Build policy changed between strict config load and candidate capture".into());
+    }
+    let captured = crate::candidate::capture_candidate(root, change, &policy_digest)?;
+    let mut pending = PendingCandidateBuild::new(captured);
+    let outcome = (|| {
+        pending.captured().rehash(root)?;
+        crate::candidate::reopen_candidate(root, pending.capture())?;
+        let validation = crate::local_validation::validate_candidate_profile(
+            root,
+            pending.captured().root(),
+            pending.capture(),
+            &candidate_policy.gates.build,
+            &candidate_policy,
+        )?;
+        if let Some(output) = validation.build_output {
+            pending.attach_output(output);
+        }
+        let report = validation.report;
+        if report.status != "passed" {
+            return Err(format!(
+                "Build candidate profile {:?} refused: {}",
+                candidate_policy.gates.build,
+                report.blocker.as_deref().unwrap_or(&report.status)
+            ));
+        }
+        pending.captured().rehash(root)?;
+        crate::candidate::reopen_candidate(root, pending.capture())?;
+        pending.revalidate_output(root)?;
+        let output = report
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.build_output.as_ref())
+            .ok_or("Build candidate profile passed without a typed BuildOutputV1")?;
+        if output.candidate_id.as_deref() != Some(pending.capture().subject.id.as_str()) {
+            return Err("Build output does not bind the executed candidate ID".into());
+        }
+        Ok(report)
+    })();
+    match outcome {
+        Ok(report) => Ok((pending, report)),
+        Err(error) => match pending.cleanup() {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; candidate cleanup also failed: {cleanup}")),
+        },
+    }
+}
+
+fn retained_candidate_for_objective_gate(
+    ledger: &ledger::Ledger,
+    change: &str,
+    phase: Phase,
+) -> Result<crate::candidate::CandidateCapture, String> {
+    if !matches!(phase, Phase::SecurityCode | Phase::Test) {
+        return Err(format!(
+            "{} is not a retained-candidate objective gate",
+            phase.label()
+        ));
+    }
+    let build = ledger
+        .gates
+        .get(&Phase::Build)
+        .filter(|record| record.verdict == Verdict::Pass)
+        .ok_or("candidate-bound objective gate requires a current Build PASS")?;
+    let capture = build
+        .candidate
+        .as_ref()
+        .ok_or("current Build PASS has no retained Candidate binding")?;
+    if capture.subject.change != change {
+        return Err("current Build Candidate names a different change".into());
+    }
+    let output = build
+        .build_output
+        .as_ref()
+        .ok_or("current Build PASS has no candidate-bound Build output")?;
+    if output.candidate_id.as_deref() != Some(capture.subject.id.as_str()) {
+        return Err("current Build output and Candidate IDs differ".into());
+    }
+    if phase == Phase::Test {
+        let security = ledger
+            .gates
+            .get(&Phase::SecurityCode)
+            .filter(|record| record.verdict == Verdict::Pass)
+            .ok_or("candidate-bound Test requires a current Security(code) PASS")?;
+        if security.candidate.as_ref() != Some(capture) {
+            return Err("Build and Security(code) Candidate bindings differ".into());
+        }
+    }
+    Ok(capture.clone())
+}
+
+fn validate_candidate_report_binding(
+    report: &crate::local_validation::ValidationReport,
+    capture: &crate::candidate::CandidateCapture,
+) -> Result<(), String> {
+    let expected_request = format!("candidate:{}", capture.subject.id);
+    for (label, subject) in [
+        ("report", &report.subject),
+        (
+            "receipt",
+            &report
+                .receipt
+                .as_ref()
+                .ok_or("candidate profile passed without an ephemeral result receipt")?
+                .subject,
+        ),
+    ] {
+        if subject.requested != expected_request
+            || subject.pushed_kind != "candidate"
+            || subject.commit != capture.subject.base_commit
+            || subject.tree != capture.subject.base_tree
+            || subject.pushed_oid != capture.subject.base_commit
+            || !subject.tag_chain.is_empty()
+        {
+            return Err(format!(
+                "candidate validation {label} subject differs from the retained Candidate"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_gate(
     phase_slug: String,
@@ -1430,17 +2820,19 @@ fn cmd_gate(
     fail: bool,
     mut evidence: Option<String>,
     by: Option<String>,
-    conditions: Vec<String>,
+    mut conditions: Vec<String>,
     failure_class: Option<String>,
     exploit: Option<String>,
     reuse: Option<String>,
-    waive_artifact: Option<String>,
-    autonomous: bool,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let phase =
         Phase::from_slug(&phase_slug).ok_or_else(|| format!("unknown phase {phase_slug:?}"))?;
+    let actor = bounded_text(
+        &by.unwrap_or_else(|| phase.persona().name.to_string()),
+        "gate actor",
+    )?;
 
     let verdict = match (pass, conditional, fail, reuse.is_some()) {
         (true, false, false, _) => Verdict::Pass,
@@ -1453,43 +2845,10 @@ fn cmd_gate(
             )
         }
     };
-
-    // Strict-tier waiver validation (Cond 17), at the TOP alongside the
-    // `--reuse requires --pass` rule above: a waiver never combines with `--reuse`
-    // (the reuse seam must not skip the autonomous halt or the artifact check),
-    // requires `--pass` (it can never convert a FAIL), and is meaningless on a
-    // phase with no judgment artifact. The reason is bounded here so an invalid
-    // reason is rejected before it could suppress any check.
-    let waiver_reason = match &waive_artifact {
-        Some(raw) => {
-            if reuse.is_some() {
-                return Err("--waive-artifact cannot combine with --reuse".into());
-            }
-            if !pass {
-                return Err("--waive-artifact requires --pass".into());
-            }
-            if phase.judgment_artifact().is_none() {
-                return Err(format!(
-                    "--waive-artifact is invalid on {}: it has no judgment artifact to waive",
-                    phase.label()
-                ));
-            }
-            // Under --autonomous, waiving a SECURITY phase's artifact is a judgment
-            // call reserved for a human — halt-and-report rather than self-waive
-            // (design.md D7 / Cond 12). Non-Security judgment phases may still be
-            // waived autonomously. Checked here, before any state mutation.
-            if autonomous && matches!(phase, Phase::SecurityPlan | Phase::SecurityCode) {
-                return Ok(autonomous_halt(&format!(
-                    "waiving the {} judgment artifact requires a human decision; \
-                     re-run without --autonomous or author it (`mpd brief {}`)",
-                    phase.label(),
-                    phase.slug()
-                )));
-            }
-            Some(bounded_text(raw, "waiver reason")?)
-        }
-        None => None,
-    };
+    // Strict judgment gates default an omitted *gate* evidence pointer to the
+    // phase artifact. A conditional obligation must not silently inherit that
+    // default, so preserve whether the caller supplied its evidence explicitly.
+    let condition_evidence_supplied = evidence.is_some();
 
     let failure_class = match (verdict, failure_class) {
         (Verdict::Fail, Some(v)) => Some(v.parse::<FailureClass>()?),
@@ -1518,18 +2877,83 @@ fn cmd_gate(
             (_, _, None) => None,
         };
 
-    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
-    // A waiver only means something in the strict tier — it waives the strict
-    // judgment-artifact check. Refuse it on a manual-tier change rather than
-    // record a phantom waiver, so the manual tier stays byte-identical (D3/R1).
-    if waiver_reason.is_some() && !ledger.strict {
-        return Err(
-            "--waive-artifact requires the strict tier (start with `mpd conduct` or `mpd begin --strict`)"
-                .into(),
-        );
+    let (mut ledger, observed) =
+        ledger::load_observed_exact(&root, &change).map_err(|e| e.to_string())?;
+    if ledger.strict && !ledger.waivers.is_empty() {
+        return Ok(gate_blocked(
+            "strict gate refused: legacy artifact waivers are present; rewind and rerun the affected canonical gates",
+        ));
     }
+    if ledger.strict {
+        if let Some(issue) = strict_actor_separation_issue(&ledger, phase, &actor) {
+            return Ok(gate_blocked(&issue));
+        }
+    }
+    // Candidate-backed objective gates are always fresh executions. Refuse a
+    // reuse request before freshness/risk maintenance can write the ledger, so
+    // an inapplicable receipt cannot advance or otherwise mutate strict state.
+    if reuse.is_some()
+        && ledger.strict
+        && matches!(phase, Phase::Build | Phase::SecurityCode | Phase::Test)
+    {
+        return Err(format!(
+            "strict {} is candidate-backed and cannot reuse a prior receipt",
+            phase.label()
+        ));
+    }
+    let config = Config::load(&root);
+    if enforce_freshness_before_effects(
+        &root,
+        &change,
+        &mut ledger,
+        observed.digest(),
+        &config,
+        false,
+    )? {
+        return Ok(1);
+    }
+    // Freshness maintenance may itself have committed a risk-only ledger
+    // update. Start the gate transaction from a new exact file observation so
+    // the final compare-and-swap never relies on an image predating that write.
+    let (fresh_ledger, observed) =
+        ledger::load_observed_exact(&root, &change).map_err(|e| e.to_string())?;
+    ledger = fresh_ledger;
+    let effective_risk = ledger.effective_risk();
+    if verdict == Verdict::ConditionalPass {
+        if ledger.strict && conditions.is_empty() {
+            return Err("--conditional requires at least one --condition".into());
+        }
+        conditions = conditions
+            .iter()
+            .map(|condition| bounded_text(condition, "condition"))
+            .collect::<Result<Vec<_>, _>>()?;
+    } else if !conditions.is_empty() {
+        return Err("--condition is valid only with --conditional".into());
+    }
+    // Canonical judgment truth is checked for PASS, CONDITIONAL, and FAIL
+    // before any objective command or durable mutation. A strict condition is
+    // therefore bound to the same authored artifact that declared it.
+    if ledger.strict && phase.judgment_artifact().is_some() {
+        if let Some(message) =
+            strict_artifact_issues(&root, &change, phase, effective_risk, verdict, &actor)
+        {
+            return Ok(gate_blocked(&message));
+        }
+        evidence = validate_evidence(&root, &change, phase, evidence)?;
+    }
+    let condition_binding = if verdict == Verdict::ConditionalPass && ledger.strict {
+        if !condition_evidence_supplied {
+            return Err("--conditional requires --evidence <contained-file[#anchor]>".into());
+        }
+        let pointer = evidence
+            .as_deref()
+            .expect("explicit condition evidence was checked above");
+        Some(contained_evidence(&root, &change, pointer)?)
+    } else {
+        None
+    };
     if reuse.is_none() && !ledger.attempt_authorized(phase) {
-        return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), ledger.governance.risk));
+        return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), effective_risk));
     }
     let attempt = ledger.next_attempt(phase);
     // The persona-tuning stamp for this gate — from the brief `mpd next` recorded
@@ -1538,6 +2962,12 @@ fn cmd_gate(
     let persona_stamp = persona_tuning_stamp(&root, &Config::load(&root), &ledger, phase, attempt);
     let completed = ledger::now_epoch_secs();
     let mut checks_summary: Option<CheckSummary> = None;
+    let mut structured_gate_ran = false;
+    let mut structured_build_output = None;
+    let mut structured_validation_receipt = None;
+    let mut deploy_result = None;
+    let mut pending_candidate_build: Option<PendingCandidateBuild> = None;
+    let mut gate_candidate: Option<crate::candidate::CandidateCapture> = None;
 
     if verdict.advances() && phase == Phase::Architecture {
         let view = manifest_view(&root, &change);
@@ -1560,7 +2990,8 @@ fn cmd_gate(
         // deterministically, ahead of receipt evaluation. A waiver cannot reach
         // this path (waive + reuse is rejected at the top).
         if ledger.strict {
-            if let Some(msg) = strict_artifact_issues(&root, &change, phase, ledger.governance.risk)
+            if let Some(msg) =
+                strict_artifact_issues(&root, &change, phase, effective_risk, Verdict::Pass, &actor)
             {
                 return Ok(gate_blocked(&msg));
             }
@@ -1595,7 +3026,7 @@ fn cmd_gate(
             phase,
             GateRecord {
                 verdict: Verdict::Pass,
-                by: by.unwrap_or_else(|| phase.persona().name.to_string()),
+                by: actor.clone(),
                 evidence: Some(format!("reused from {receipt_hex}")),
                 checks: None,
                 at: date::today_utc(),
@@ -1606,8 +3037,12 @@ fn cmd_gate(
                 completed_at_epoch_secs: completed,
                 receipt: Some(receipt),
                 persona_tuning: persona_stamp.clone(),
+                candidate: None,
+                build_output: None,
+                deploy_result: None,
+                validation_receipt: None,
             },
-        );
+        )?;
         ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
         println!(
             "Recorded reused PASS for {} from {receipt_hex}.",
@@ -1619,7 +3054,122 @@ fn cmd_gate(
     // Enforcement: a PASS/CONDITIONAL on a test/secret phase must be backed by
     // a real run — the gate cannot accept the caller's word.
     if verdict.advances() {
-        if phase.requires_tests() {
+        // Refuse an open/ambiguous strict task contract before any expensive
+        // structured or legacy Test execution and before any receipt write.
+        if phase == Phase::Test {
+            let plan = Project::new(&root)
+                .task_plan(&change)
+                .map_err(|e| format!("Test gate refused: invalid tasks.md: {e}"))?;
+            let accounting = ledger.task_accounting(&plan);
+            if plan.strict && !accounting.accounted() {
+                let preview = accounting
+                    .open
+                    .iter()
+                    .take(12)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let suffix = if accounting.open.len() > 12 {
+                    " …"
+                } else {
+                    ""
+                };
+                return Ok(gate_blocked(&format!(
+                    "Test gate refused before execution: {} Builder task(s) remain open and {} deferral(s) stale: {preview}{suffix}",
+                    accounting.open.len(), accounting.stale.len()
+                )));
+            }
+        }
+        // Under the strict tier, objective Build/Security(code)/Test execution
+        // is delegated to the exact-subject structured validator. This happens
+        // only after the judgment artifact has already been checked, so an
+        // artifact/CLI mismatch cannot launch tools or publish a receipt.
+        if ledger.strict && matches!(phase, Phase::Build | Phase::SecurityCode | Phase::Test) {
+            if let Some(message) =
+                strict_artifact_issues(&root, &change, phase, effective_risk, Verdict::Pass, &actor)
+            {
+                return Ok(gate_blocked(&message));
+            }
+            let cfg = Config::load_strict(&root)?;
+            if let Some(local) = cfg.local_validation.as_ref() {
+                let profile = match phase {
+                    Phase::Build => &local.gates.build,
+                    Phase::SecurityCode => &local.gates.security_code,
+                    Phase::Test if effective_risk == RiskLevel::High => &local.gates.high_risk_test,
+                    Phase::Test => &local.gates.test,
+                    _ => unreachable!(),
+                };
+                let report = if phase == Phase::Build {
+                    let (pending, report) = execute_strict_candidate_build(&root, &change, local)?;
+                    gate_candidate = Some(pending.capture().clone());
+                    pending_candidate_build = Some(pending);
+                    report
+                } else {
+                    let capture = retained_candidate_for_objective_gate(&ledger, &change, phase)?;
+                    // Reopen and rehash the immutable projection immediately
+                    // before and after execution. This is deliberately not a
+                    // new capture of the later ambient worktree.
+                    crate::candidate::reopen_candidate(&root, &capture)?;
+                    let report = crate::local_validation::validate_candidate_profile(
+                        &root,
+                        Path::new(&capture.clone_private_root),
+                        &capture,
+                        profile,
+                        local,
+                    )?;
+                    crate::candidate::reopen_candidate(&root, &capture)?;
+                    gate_candidate = Some(capture);
+                    report.report
+                };
+                if report.status != "passed" {
+                    return Ok(gate_blocked(&format!(
+                        "{} structured profile {profile:?} refused: {}",
+                        phase.label(),
+                        report.blocker.as_deref().unwrap_or(&report.status)
+                    )));
+                }
+                let candidate = gate_candidate
+                    .as_ref()
+                    .ok_or("strict objective gate omitted its Candidate binding")?;
+                // The ephemeral execution receipt is never a Commit/HEAD
+                // substitute. Its exact subject must match the same Candidate
+                // that will be written into the durable gate record.
+                validate_candidate_report_binding(&report, candidate)?;
+                let receipt = report
+                    .receipt
+                    .ok_or("structured validator passed without a receipt")?;
+                let tests_passed: u64 = receipt
+                    .results
+                    .iter()
+                    .filter_map(|result| result.count)
+                    .sum();
+                structured_build_output = receipt.build_output.clone();
+                let command = format!(
+                    "candidate {} profile {} (receipt {})",
+                    candidate.subject.id, receipt.profile, receipt.id
+                );
+                checks_summary = Some(CheckSummary {
+                    tests_passed: (tests_passed > 0).then_some(tests_passed as usize),
+                    secrets_clean: matches!(phase, Phase::SecurityCode | Phase::Test)
+                        .then_some(true),
+                    scanner: matches!(phase, Phase::SecurityCode | Phase::Test)
+                        .then(|| "builtin+gitleaks+semgrep+cargo-audit".to_string()),
+                    command: Some(command),
+                });
+                structured_validation_receipt = Some(receipt);
+                structured_gate_ran = true;
+            } else {
+                if ledger.strict {
+                    return Ok(gate_blocked(
+                        "strict objective gate requires local_validation migration; legacy test/deploy strings are manual-only",
+                    ));
+                }
+                eprintln!(
+                    "warning: structured local_validation is absent; using deprecated legacy objective gate for manual compatibility. `mpd validate` and policy-aware hooks remain blocked until migration."
+                );
+            }
+        }
+        if phase.requires_tests() && !structured_gate_ran {
             let cfg = Config::load(&root);
             let cmd = cfg.test.ok_or_else(|| {
                 format!(
@@ -1656,7 +3206,7 @@ fn cmd_gate(
                 command: Some(outcome.command),
             });
         }
-        if phase.requires_secret_scan() {
+        if phase.requires_secret_scan() && !structured_gate_ran {
             let files = checks::git_tracked_files(&root);
             let report = checks::scan_secrets(&files);
             let scanner = report.scanner;
@@ -1717,12 +3267,107 @@ fn cmd_gate(
                 )));
             }
         }
-        // Deploy gate: when a deploy command is configured, RUN it (build +
-        // install) and refuse PASS if it fails — the machine-enforced
-        // end-of-cycle default. Unset ⇒ the gate only records deploy-ready
-        // evidence.
+        // Deploy has a closed typed branch in the strict tier. A string command
+        // is deliberately retained only for manual/legacy changes: it has no
+        // named Build receipt, no no-follow revalidation, and no byte-identity proof.
         if phase == Phase::Deploy {
-            if let Some(cmd) = Config::load(&root).deploy {
+            let cfg = if ledger.strict {
+                Config::load_strict(&root)?
+            } else {
+                Config::load(&root)
+            };
+            if let Some(local) = cfg.local_validation.as_ref() {
+                if let Err(error) = local.validate() {
+                    return Ok(gate_blocked(&format!(
+                        "Deploy gate refused: invalid typed local_validation: {error}"
+                    )));
+                }
+                if let Some(deploy) = local.deploy_output.as_ref() {
+                    let (contract, build) = match deploy {
+                        crate::config::DeployOutputConfig::Execute { .. } => {
+                            let contract = local.build_output.as_ref().ok_or_else(|| {
+                                "Deploy gate refused: typed execute Deploy requires build_output"
+                                    .to_string()
+                            })?;
+                            let build_record = ledger
+                                .gates
+                                .get(&Phase::Build)
+                                .filter(|record| record.verdict == Verdict::Pass)
+                                .ok_or_else(|| {
+                                    "Deploy gate refused: current Build has no PASS record"
+                                        .to_string()
+                                })?;
+                            let build = build_record.build_output.as_ref().ok_or_else(|| {
+                                "Deploy gate refused: current Build has no typed BuildOutputV1 (provisional output is ineligible)".to_string()
+                            })?;
+                            if ledger.strict {
+                                let values = closure::capture_dependency_values(
+                                    &root,
+                                    &change,
+                                    &ledger,
+                                    &cfg,
+                                    Phase::Build,
+                                )?;
+                                if !matches!(
+                                    closure::evidence_validity(
+                                        build_record.receipt.as_ref(),
+                                        &values
+                                    ),
+                                    closure::EvidenceValidity::Valid
+                                ) {
+                                    return Ok(gate_blocked(
+                                        "Deploy gate refused: Build source/config receipt is stale or absent",
+                                    ));
+                                }
+                            }
+                            (Some(contract), Some(build))
+                        }
+                        crate::config::DeployOutputConfig::Readiness { .. } => (None, None),
+                    };
+                    match crate::local_validation::execute_typed_deploy(
+                        &root, contract, deploy, build,
+                    ) {
+                        Ok(result) => {
+                            checks_summary
+                                .get_or_insert_with(CheckSummary::default)
+                                .command = Some(format!(
+                                "typed Deploy {} target={} definition={}",
+                                result.mode, result.target, result.definition_digest
+                            ));
+                            deploy_result = Some(result);
+                        }
+                        Err(error) => {
+                            return Ok(gate_blocked(&format!("Deploy gate refused: {error}")))
+                        }
+                    }
+                } else {
+                    if ledger.strict {
+                        return Ok(gate_blocked(
+                            "Deploy gate refused: strict changes require tagged deploy_output; legacy string/unset config is manual-only",
+                        ));
+                    }
+                    // A typed validation graph without a typed Deploy is still
+                    // migration-incomplete in the manual tier; fall through to
+                    // the legacy string only below.
+                    if let Some(cmd) = cfg.deploy {
+                        println!("Deploying: {cmd}");
+                        let outcome = tests_runner::run(&cmd, &root);
+                        if !outcome.success {
+                            return Ok(gate_blocked(&format!(
+                                "Deploy gate refused: deploy command failed (command: {})",
+                                outcome.command
+                            )));
+                        }
+                        checks_summary
+                            .get_or_insert_with(CheckSummary::default)
+                            .command = Some(outcome.command);
+                    }
+                }
+            } else if ledger.strict {
+                return Ok(gate_blocked(
+                    "Deploy gate refused: strict changes require tagged typed deploy_output; legacy string/unset config is manual-only",
+                ));
+            } else if let Some(cmd) = cfg.deploy {
                 println!("Deploying: {cmd}");
                 let outcome = tests_runner::run(&cmd, &root);
                 if !outcome.success {
@@ -1737,57 +3382,44 @@ fn cmd_gate(
             }
         }
         // Strict tier (fires only when `ledger.strict`; the manual tier is inert
-        // and byte-identical to today). This runs AFTER every objective gate
-        // above, so a waiver can never skip tests/secret/doc/deploy (Cond 5).
+        // and byte-identical to today). This runs after every objective gate.
         if ledger.strict {
             // `--evidence` must resolve to a real contained file — its OWN
             // artifact for a judgment phase — and defaults to that artifact when
             // omitted. Validation is metadata-only; it never reads content into
             // output (Cond 2).
             evidence = validate_evidence(&root, &change, phase, evidence)?;
-            // A validly-scoped waiver for this phase + attempt (recorded by this
-            // very invocation, or already on file for this attempt) skips the
-            // judgment-artifact structural check — nothing else (Cond 5, Cond 15).
-            let waived = waiver_reason.is_some()
-                || ledger
-                    .waivers
-                    .iter()
-                    .any(|w| w.phase == phase && w.attempt == attempt);
-            if !waived {
-                if let Some(msg) =
-                    strict_artifact_issues(&root, &change, phase, ledger.governance.risk)
-                {
-                    return Ok(gate_blocked(&msg));
-                }
+            if let Some(msg) =
+                strict_artifact_issues(&root, &change, phase, effective_risk, Verdict::Pass, &actor)
+            {
+                return Ok(gate_blocked(&msg));
             }
         }
     }
 
-    // Record an attempt-scoped waiver (append-only) once every objective gate and
-    // the strict evidence check have passed. A waiver only reaches here on a
-    // PASS (Cond 17), so it can never convert a FAIL; it is surfaced loudly and
-    // counted in the archive audit summary, but bypasses no objective gate (Cond 5).
-    if let Some(reason) = waiver_reason {
-        println!(
-            "  ⚠ WAIVED: {} judgment-artifact check waived — {} (attempt {attempt}, audited).",
-            phase.label(),
-            harness::terminal_safe(&reason)
-        );
-        ledger.waivers.push(Waiver {
-            phase,
-            reason,
-            attempt,
-            at_epoch_secs: completed,
-        });
-    }
-
-    let by = by.unwrap_or_else(|| phase.persona().name.to_string());
+    let build_output = if structured_gate_ran && phase == Phase::Build {
+        structured_build_output
+            .ok_or_else(|| {
+                "Build gate refused: structured Build receipt has no BuildOutputV1".to_string()
+            })?
+            .into()
+    } else if verdict == Verdict::Pass && phase == Phase::Build {
+        Config::load(&root)
+            .local_validation
+            .as_ref()
+            .and_then(|v| v.build_output.as_ref())
+            .map(|output| crate::local_validation::capture_build_output(&root, &output.path))
+            .transpose()
+            .map_err(|e| format!("Build gate refused: {e}"))?
+    } else {
+        None
+    };
     ledger.record(
         phase,
         GateRecord {
             verdict,
-            by,
-            evidence,
+            by: actor,
+            evidence: evidence.clone(),
             checks: checks_summary,
             at: date::today_utc(),
             failure_class,
@@ -1814,18 +3446,58 @@ fn cmd_gate(
                 None
             },
             persona_tuning: persona_stamp,
+            candidate: gate_candidate.clone(),
+            build_output,
+            deploy_result,
+            validation_receipt: structured_validation_receipt,
         },
-    );
+    )?;
     if verdict == Verdict::ConditionalPass {
+        let opener = phase.persona().name.to_string();
+        let (condition_evidence, condition_evidence_digest) =
+            condition_binding.clone().unwrap_or_else(|| {
+                let evidence = evidence
+                    .clone()
+                    .unwrap_or_else(|| "legacy-manual-condition".to_string());
+                let digest = digest::Digest::of_bytes(evidence.as_bytes()).to_hex();
+                (evidence, digest)
+            });
         for text in conditions {
+            let condition_number = ledger.conditions.len().saturating_add(1);
             ledger.conditions.push(Condition {
+                id: format!("{}.{}", phase.slug(), condition_number),
+                phase,
+                attempt,
                 text,
                 owner: phase.persona().name.to_string(),
                 closed: false,
+                opened_at_epoch_secs: completed,
+                events: vec![ledger::ConditionEvent::Opened {
+                    by: opener.clone(),
+                    at_epoch_secs: completed,
+                    evidence: condition_evidence.clone(),
+                    evidence_digest: condition_evidence_digest.clone(),
+                }],
             });
         }
     }
-    ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+    // Final descriptor reopen is adjacent to the ledger CAS. Earlier profile
+    // checks cannot authorize a path that was deleted or replaced while the
+    // judgment record was assembled.
+    if let Some(pending) = pending_candidate_build.as_ref() {
+        pending.revalidate_output(&root)?;
+    }
+    if let Some(candidate) = gate_candidate.as_ref() {
+        crate::candidate::reopen_candidate(&root, candidate)?;
+    }
+    crate::local_validation::maybe_crash_candidate_output("pre-ledger-cas");
+    if let Some(warning) = resolve_candidate_save_outcome(
+        &root,
+        pending_candidate_build.as_mut(),
+        ledger::save_exact_observed(&root, &ledger, &observed),
+    )? {
+        eprintln!("{warning}");
+    }
 
     println!(
         "Recorded {} for {} gate. Current phase: {}.",
@@ -2193,6 +3865,64 @@ fn read_contained(root: &Path, path: &Path) -> String {
     }
 }
 
+/// Strict archive truth requires a *current* receipt for every recorded
+/// applicable PASS. Gate and validation receipts remain distinct namespaces;
+/// this checks only the gate receipt attached to the ledger record.
+fn current_evidence_blockers(root: &Path, change: &str, ledger: &ledger::Ledger) -> Vec<String> {
+    if !ledger.strict || !Project::new(root).change_dir(change).is_dir() {
+        return Vec::new();
+    }
+    let config = Config::load(root);
+    Phase::applicable(ledger.applicability())
+        .into_iter()
+        .filter_map(|phase| {
+            let record = ledger.gates.get(&phase)?;
+            if record.verdict != Verdict::Pass {
+                return None;
+            }
+            let validity = closure::capture_dependency_values(root, change, ledger, &config, phase)
+                .ok()
+                .map(|values| closure::evidence_validity(record.receipt.as_ref(), &values))
+                .unwrap_or(closure::EvidenceValidity::Absent);
+            match validity {
+                closure::EvidenceValidity::Valid => None,
+                other => Some(format!("{} evidence is {}", phase.label(), other.label())),
+            }
+        })
+        .collect()
+}
+
+/// Resolve `path[#anchor]` to a contained, nonempty regular evidence file and
+/// return its pointer plus digest. Anchors are descriptive only; the digest
+/// always binds the full reviewed file bytes so a later edit stales the claim.
+fn contained_evidence(root: &Path, change: &str, raw: &str) -> Result<(String, String), String> {
+    let raw = bounded_text(raw, "evidence")?;
+    let (relative, anchor) = raw.split_once('#').unwrap_or((&raw, ""));
+    if relative.is_empty() {
+        return Err("evidence must name a file inside the active change directory".into());
+    }
+    let change_dir = Project::new(root).change_dir(change);
+    let path = change_dir.join(relative);
+    openspec_core::assert_contained(&change_dir, &path)
+        .map_err(|_| "evidence path escapes the active change directory".to_string())?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| format!("evidence file {relative:?} is absent"))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("evidence must be a regular non-symlink file".into());
+    }
+    let bytes = openspec_core::read_capped(&path)
+        .map_err(|error| format!("cannot read evidence: {error}"))?;
+    if bytes.trim().is_empty() {
+        return Err("evidence file must be nonempty".into());
+    }
+    let pointer = if anchor.is_empty() {
+        relative.to_string()
+    } else {
+        format!("{relative}#{anchor}")
+    };
+    Ok((pointer, digest::Digest::of_bytes(bytes.as_bytes()).to_hex()))
+}
+
 /// The strict-tier structural check of `phase`'s judgment artifact. Returns
 /// `None` when the artifact is complete (or the phase has none), or the
 /// escape-bearing refusal message when it is missing/incomplete (Cond 15). The
@@ -2208,6 +3938,8 @@ fn strict_artifact_issues(
     change: &str,
     phase: Phase,
     risk: RiskLevel,
+    expected_verdict: Verdict,
+    expected_actor: &str,
 ) -> Option<String> {
     let (filename, sections) = phase.judgment_artifact()?;
     let path = Project::new(root).change_dir(change).join(filename);
@@ -2217,7 +3949,32 @@ fn strict_artifact_issues(
         required.push("Independent review");
         required.push("Refutation");
     }
-    let issues = check_sections(&text, &required, JUDGMENT_MIN_LEN);
+    let mut issues = check_sections(&text, &required, JUDGMENT_MIN_LEN);
+    // Canonical verdict binding is activated by the explicit stable-ID task
+    // contract. Older strict changes remain structurally readable, while a
+    // high-assurance plan cannot quietly downgrade its artifact semantics.
+    match Project::new(root).task_plan(change) {
+        Ok(plan) if plan.strict => {
+            match canonical_artifact_verdict(&text) {
+                Ok(actual) if actual == expected_verdict => {}
+                Ok(actual) => issues.push(format!(
+                    "Verdict declares {} but this gate requested {}",
+                    actual.label(),
+                    expected_verdict.label()
+                )),
+                Err(issue) => issues.push(issue),
+            }
+            match canonical_artifact_actor(&text) {
+                Ok(actual) if actual == expected_actor => {}
+                Ok(actual) => issues.push(format!(
+                    "Actor declares {actual:?} but this gate records {expected_actor:?}"
+                )),
+                Err(issue) => issues.push(issue),
+            }
+        }
+        Ok(_) => {}
+        Err(error) => issues.push(format!("tasks.md stable-ID contract is invalid: {error}")),
+    }
     if issues.is_empty() {
         return None;
     }
@@ -2226,12 +3983,95 @@ fn strict_artifact_issues(
     }
     Some(format!(
         "{} gate refused: {filename} incomplete ({} issue(s)). \
-         Author it (`mpd brief {slug}`) or waive it \
-         (`mpd gate {slug} --pass --waive-artifact \"reason\"`).",
+         Author it with `mpd brief {slug}`; Commando does not permit artifact waivers.",
         phase.label(),
         issues.len(),
         slug = phase.slug(),
     ))
+}
+
+/// Read the single bounded actor identity recorded by a canonical judgment
+/// artifact. This is cooperative provenance, not authentication.
+fn canonical_artifact_actor(text: &str) -> Result<String, String> {
+    let heading_count = text
+        .lines()
+        .filter(|line| line.trim() == "## Actor")
+        .count();
+    if heading_count != 1 {
+        return Err(format!(
+            "artifact must contain exactly one `## Actor` heading (found {heading_count})"
+        ));
+    }
+    let body = extract_section(text, "Actor", CONTEXT_SECTION_MAX)
+        .ok_or_else(|| "artifact Actor section is missing or oversized".to_string())?;
+    let entries: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if entries.len() != 1 {
+        return Err("artifact Actor section must contain exactly one nonempty line".into());
+    }
+    bounded_text(entries[0], "artifact actor")
+}
+
+/// Cooperative role separation: a strict gate actor cannot equal the actor on
+/// the latest applicable upstream gate. MPD records and enforces the labels but
+/// does not claim to authenticate a model, session, or human identity.
+fn strict_actor_separation_issue(
+    ledger: &ledger::Ledger,
+    phase: Phase,
+    actor: &str,
+) -> Option<String> {
+    let prior = Phase::applicable(ledger.applicability())
+        .into_iter()
+        .take_while(|candidate| *candidate != phase)
+        .filter_map(|candidate| {
+            ledger
+                .gates
+                .get(&candidate)
+                .map(|record| (candidate, record))
+        })
+        .last();
+    let (prior_phase, prior_record) = prior?;
+    if actor != prior_record.by {
+        return None;
+    }
+    Some(format!(
+        "{} gate actor {actor:?} matches the latest upstream {} actor; use a cooperatively distinct reviewer label",
+        phase.label(),
+        prior_phase.label()
+    ))
+}
+
+/// Read exactly one canonical terminal decision from a judgment artifact.
+/// Rationale may follow the decision, but the first nonempty line under the
+/// unique `## Verdict` heading must be one of the ledger's literal values.
+/// This prevents loose prose such as `PASS — probably` from being interpreted
+/// differently by an author, a reviewer, and the CLI.
+fn canonical_artifact_verdict(text: &str) -> Result<Verdict, String> {
+    let heading_count = text
+        .lines()
+        .filter(|line| line.trim() == "## Verdict")
+        .count();
+    if heading_count != 1 {
+        return Err(format!(
+            "artifact must contain exactly one `## Verdict` heading (found {heading_count})"
+        ));
+    }
+    let body = extract_section(text, "Verdict", CONTEXT_SECTION_MAX)
+        .ok_or_else(|| "artifact Verdict section is missing or oversized".to_string())?;
+    let token = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| "Verdict section has no canonical decision".to_string())?;
+    match token {
+        "PASS" => Ok(Verdict::Pass),
+        "CONDITIONAL PASS" => Ok(Verdict::ConditionalPass),
+        "FAIL" => Ok(Verdict::Fail),
+        _ => Err("Verdict must begin with exactly PASS, CONDITIONAL PASS, or FAIL".into()),
+    }
 }
 
 /// Validate a strict-mode `--evidence` pointer WITHOUT reading its content into
@@ -2337,45 +4177,39 @@ fn artifact_stub_issues(project: &Project, change: &str) -> Vec<String> {
 
 /// The archive-time strict re-check (design.md Cond 9 / B2). A change's judgment
 /// gates all passed at gate time, but an artifact can still evaporate before the
-/// change is folded into the permanent record — the exact CARC hole. Under
-/// `ledger.strict`, sweep every APPLICABLE judgment phase and re-run its
-/// structural check via [`strict_artifact_issues`], collecting a refusal for any
-/// that no longer passes. A phase whose passing gate carried a validly-scoped
-/// waiver (a waiver for that phase AND that phase's recorded gate attempt) is
-/// treated as satisfied and surfaced WAIVED, never blocking — otherwise a
-/// legitimate gate-time waiver would be an un-archivable dead-end. Returns the
-/// escape-bearing refusals (empty ⇒ every artifact survived) and the labels of
-/// the phases counted WAIVED in the audit summary. Reads go through the same
-/// symlink-refusing, size-capped path as the gate (Cond 1); no artifact content
-/// is surfaced.
-fn strict_archive_recheck(
-    root: &Path,
-    change: &str,
-    ledger: &ledger::Ledger,
-) -> (Vec<String>, Vec<&'static str>) {
+/// change is folded into the permanent record. Under `ledger.strict`, sweep every
+/// applicable judgment phase and re-run its structural check. Historical waiver
+/// records are explicit blockers: the current Commando contract denies waivers.
+/// Reads go through the same symlink-refusing, size-capped path as the gate; no
+/// artifact content is surfaced.
+fn strict_archive_recheck(root: &Path, change: &str, ledger: &ledger::Ledger) -> Vec<String> {
     let mut refusals = Vec::new();
-    let mut waived = Vec::new();
+    if !ledger.waivers.is_empty() {
+        refusals.push(
+            "historical artifact waiver records are present; rewind and rerun the affected canonical gates"
+                .into(),
+        );
+    }
     for phase in Phase::applicable(ledger.applicability()) {
         if phase.judgment_artifact().is_none() {
             continue;
         }
-        // The waiver is attempt-scoped to the phase's *recorded* passing gate;
-        // a rewind (`invalidate_from_security`) has already dropped waivers for
-        // any rewound phase, so a surviving match is for the current attempt.
-        let attempt = ledger.gates.get(&phase).map(|r| r.attempt).unwrap_or(0);
-        let waived_here = ledger
-            .waivers
-            .iter()
-            .any(|w| w.phase == phase && w.attempt == attempt);
-        if waived_here {
-            waived.push(phase.label());
+        let Some(record) = ledger.gates.get(&phase) else {
+            refusals.push(format!("{} has no recorded gate actor", phase.label()));
             continue;
-        }
-        if let Some(msg) = strict_artifact_issues(root, change, phase, ledger.governance.risk) {
+        };
+        if let Some(msg) = strict_artifact_issues(
+            root,
+            change,
+            phase,
+            ledger.effective_risk(),
+            Verdict::Pass,
+            &record.by,
+        ) {
             refusals.push(msg);
         }
     }
-    (refusals, waived)
+    refusals
 }
 
 /// The archive transient-path pre-flight (design.md Cond 8). A transient `.mpd/`
@@ -2404,7 +4238,46 @@ fn uncovered_transient_paths(root: &Path) -> Vec<&'static str> {
         .collect()
 }
 
-fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdResult {
+fn cmd_repair_state(to: String, reason: String, yes: bool, change: Option<String>) -> CmdResult {
+    let root = find_root()?;
+    let change = resolve_change(&root, change)?;
+    if ledger::current(&root).as_deref() != Some(change.as_str()) {
+        return Err("repair-state applies only to the active current change".into());
+    }
+    let rewind = Phase::from_slug(&to).ok_or_else(|| format!("unknown phase {to:?}"))?;
+    let (mut ledger, observed) =
+        ledger::load_observed(&root, &change).map_err(|error| error.to_string())?;
+    let already_exists = ledger.repair_state_preview(rewind, &reason)?;
+    if already_exists {
+        println!(
+            "Rewind to {} already exists; no state changed.",
+            rewind.label()
+        );
+        return Ok(0);
+    }
+    if !yes {
+        println!(
+            "Preview only: repair would append a reconciliation and rewind {} to {} (observed ledger {}). Re-run with --yes to apply; no PASS will be synthesized.",
+            ledger.phase.label(), rewind.label(), observed
+        );
+        return Ok(0);
+    }
+    ledger.repair_state_to(rewind, &reason, &observed)?;
+    ledger::save_if_observed(&root, &ledger, &observed).map_err(|error| error.to_string())?;
+    println!(
+        "Applied append-only legacy repair; current phase is {}. No PASS or archive content was created.",
+        rewind.label()
+    );
+    Ok(0)
+}
+
+fn cmd_resolve(
+    index: Option<usize>,
+    all: bool,
+    by: String,
+    evidence: String,
+    change: Option<String>,
+) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
     let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
@@ -2414,18 +4287,31 @@ fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdRe
         (None, false) => {
             return Err("specify a condition number (see `mpd status`) or --all".into())
         }
+        _ => {}
+    }
+    let (evidence, evidence_digest) = if ledger.strict {
+        contained_evidence(&root, &change, &evidence)?
+    } else {
+        let evidence = bounded_text(&evidence, "condition evidence")?;
+        let digest = digest::Digest::of_bytes(evidence.as_bytes()).to_hex();
+        (evidence, digest)
+    };
+
+    match (index, all) {
         (Some(i), false) => {
-            ledger.close_condition(i)?;
+            ledger.close_condition(i, &by, evidence.clone(), evidence_digest.clone())?;
             println!("Closed condition #{i}.");
         }
         (None, true) => {
-            let n = ledger.close_all_conditions();
+            let n = ledger.close_all_conditions(&by, evidence.clone(), evidence_digest.clone())?;
             println!("Closed {n} open condition(s).");
         }
+        // Validated above before any evidence-file read or state mutation.
+        _ => unreachable!("invalid resolve arguments were rejected above"),
     }
     ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
 
-    let remaining = ledger.conditions.iter().filter(|c| !c.closed).count();
+    let remaining = ledger.conditions.iter().filter(|c| c.is_open()).count();
     if remaining == 0 {
         let tail = if ledger.ready_to_archive() {
             " Ready to archive."
@@ -2439,32 +4325,333 @@ fn cmd_resolve(index: Option<usize>, all: bool, change: Option<String>) -> CmdRe
     Ok(0)
 }
 
+fn cmd_task(command: TaskCommand) -> CmdResult {
+    let root = find_root()?;
+    let (id, change) = match &command {
+        TaskCommand::Defer { id, change, .. } | TaskCommand::Revoke { id, change, .. } => {
+            (id.as_str(), change.clone())
+        }
+    };
+    let change = resolve_change(&root, change)?;
+    let plan = Project::new(&root)
+        .task_plan(&change)
+        .map_err(|error| format!("task command refused: invalid tasks.md: {error}"))?;
+    if !plan.strict {
+        return Err("task command requires a strict stable-ID tasks.md plan".into());
+    }
+    let task = plan
+        .entries
+        .iter()
+        .find(|task| task.id == id)
+        .ok_or_else(|| format!("no current Builder task with ID {id:?}"))?;
+    let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    match command {
+        TaskCommand::Defer {
+            owner,
+            reason,
+            evidence,
+            ..
+        } => {
+            // The current hardening plan declares no deferrals. Keep that
+            // constraint in the artifact rather than inventing a global policy.
+            let tasks_text = read_contained(&root, &Project::new(&root).tasks_path(&change));
+            if tasks_text
+                .to_ascii_lowercase()
+                .contains("this change allows no task deferral")
+            {
+                return Err("this change's task plan allows no task deferral".into());
+            }
+            let (evidence, evidence_digest) = contained_evidence(&root, &change, &evidence)?;
+            ledger.defer_task(task, &owner, &reason, evidence, evidence_digest)?;
+            println!(
+                "Deferred task {} with evidence-bound record digest.",
+                task.id
+            );
+        }
+        TaskCommand::Revoke { reason, .. } => {
+            ledger.revoke_task_deferral(task, &reason)?;
+            println!("Revoked current deferral for task {}.", task.id);
+        }
+    }
+    ledger::save(&root, &ledger).map_err(|error| error.to_string())?;
+    Ok(0)
+}
+
+/// Validate the staged governance record used by the pre-commit hook.  This is
+/// intentionally separate from `manifest_view`: the latter is a status UI and
+/// may inspect the worktree, while a hook must make its decision solely from
+/// bounded Git index postimages plus the current coordinator name.
+fn staged_precommit_governance(root: &Path) -> Result<(), String> {
+    // A completed archive has deliberately removed the active change directory
+    // while its ignored pending-closure pointer remains the sole coordinator
+    // for the one closure commit. Its transaction journal is bounded and
+    // read-only; use its concrete targets rather than trying to read deleted
+    // active manifest/state postimages from the index.
+    let pending = openspec_core::inspect(root)
+        .map_err(|_| "pre-commit blocked: pending closure metadata is malformed")?;
+    let pending_scope = match pending.as_ref() {
+        Some(view) if view.stage == openspec_core::TransactionState::AwaitingCommit => {
+            if view.truncated {
+                return Err(
+                    "pre-commit blocked: pending closure scope exceeds its safe view cap".into(),
+                );
+            }
+            let mut scope = Vec::new();
+            for row in &view.classifications {
+                if let Some((source, destination)) = row.path.split_once(" -> ") {
+                    scope.push(source.to_string());
+                    scope.push(destination.to_string());
+                } else {
+                    scope.push(row.path.clone());
+                }
+            }
+            scope.sort();
+            scope.dedup();
+            Some(scope)
+        }
+        Some(_) => {
+            return Err("pre-commit blocked: pending closure is not ready for its commit".into())
+        }
+        None => None,
+    };
+    let change = pending
+        .as_ref()
+        .map(|view| view.change.clone())
+        .map(Ok)
+        .unwrap_or_else(|| {
+            resolve_change(root, None)
+                .map_err(|_| "pre-commit blocked: no active change coordinator".to_string())
+        })?;
+    let entries = git::diff_cached_name_status(root)
+        .map_err(|error| format!("pre-commit blocked: cannot parse staged changes: {error}"))?;
+    for entry in &entries {
+        if !matches!(entry.status, 'A' | 'C' | 'D' | 'M' | 'R' | 'T') {
+            return Err(format!(
+                "pre-commit blocked: unsupported staged status {:?}",
+                entry.status
+            ));
+        }
+        digest::validate_canonical_path(&entry.path)
+            .map_err(|_| "pre-commit blocked: unsafe staged destination path".to_string())?;
+        if let Some(source) = &entry.orig_path {
+            digest::validate_canonical_path(source)
+                .map_err(|_| "pre-commit blocked: unsafe staged rename source path".to_string())?;
+        }
+    }
+
+    let change_dir = format!("openspec/changes/{change}");
+    let manifest_path = format!("{change_dir}/manifest.json");
+    let tasks_path = format!("{change_dir}/tasks.md");
+    let ledger_path = format!(".mpd/state/{change}.json");
+    let judgment_paths: Vec<String> = Phase::applicable(crate::phase::Applicability {
+        ui: true,
+        docs: true,
+    })
+    .into_iter()
+    .filter_map(|phase| {
+        phase
+            .judgment_artifact()
+            .map(|(name, _)| format!("{change_dir}/{name}"))
+    })
+    .collect();
+    let staged_ledger = if let Some(scope) = pending_scope {
+        for entry in &entries {
+            for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
+                let policy_path = path == ".mpd/config.json"
+                    || path.starts_with(".mpd/directives/")
+                    || path == ".githooks/pre-commit"
+                    || path == ".githooks/pre-push";
+                if !policy_path && !closure::covers_concrete_paths(&scope, path) {
+                    return Err(format!(
+                        "pre-commit blocked: staged path falls outside pending closure scope: {}",
+                        harness::terminal_safe(path)
+                    ));
+                }
+            }
+        }
+        None
+    } else {
+        let protected = |path: &str| {
+            path == manifest_path
+                || path == tasks_path
+                || path == ledger_path
+                || judgment_paths.iter().any(|candidate| candidate == path)
+        };
+        for entry in &entries {
+            if entry.status == 'D' && protected(&entry.path) {
+                return Err(format!(
+                    "pre-commit blocked: deletion of required governance artifact {}",
+                    entry.path
+                ));
+            }
+            if matches!(entry.status, 'R' | 'C')
+                && entry.orig_path.as_deref().is_some_and(protected)
+            {
+                return Err(
+                    "pre-commit blocked: rename/copy of required governance artifact".into(),
+                );
+            }
+        }
+
+        // The manifest and ledger are read from `:<path>` even when they are
+        // not part of this staged diff, so an unstaged worktree edit cannot
+        // broaden a hook decision. A missing index object is a coherence
+        // failure, not a reason to fall back to the worktree.
+        let manifest_bytes = git::staged_blob(root, &manifest_path).map_err(|_| {
+            "pre-commit blocked: active manifest is absent or unreadable in the index".to_string()
+        })?;
+        let manifest_text = std::str::from_utf8(&manifest_bytes)
+            .map_err(|_| "pre-commit blocked: active manifest is not UTF-8")?;
+        let manifest: closure::ChangeManifest = serde_json::from_str(manifest_text)
+            .map_err(|_| "pre-commit blocked: active manifest is malformed")?;
+        if !manifest.validate().is_empty() {
+            return Err("pre-commit blocked: active manifest has invalid scope".into());
+        }
+        let ledger_bytes = git::staged_blob(root, &ledger_path).map_err(|_| {
+            "pre-commit blocked: active ledger is absent or unreadable in the index".to_string()
+        })?;
+        let ledger: ledger::Ledger = serde_json::from_slice(&ledger_bytes)
+            .map_err(|_| "pre-commit blocked: active ledger is malformed")?;
+        if ledger.change != change || !ledger.integrity_blockers().is_empty() {
+            return Err("pre-commit blocked: active ledger is incoherent".into());
+        }
+
+        let system = closure::active_system_scope(root, &change);
+        for entry in &entries {
+            for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
+                let policy_path = path == ".mpd/config.json"
+                    || path.starts_with(".mpd/directives/")
+                    || path == ".githooks/pre-commit"
+                    || path == ".githooks/pre-push";
+                if !policy_path && !manifest.covers(path, &system) {
+                    return Err(format!(
+                        "pre-commit blocked: staged path falls outside active manifest scope: {}",
+                        harness::terminal_safe(path)
+                    ));
+                }
+            }
+        }
+        Some(ledger)
+    };
+
+    for entry in &entries {
+        if entry.status == 'D' {
+            continue;
+        }
+        let path = &entry.path;
+        if path == &tasks_path {
+            let bytes = git::staged_blob(root, path)
+                .map_err(|_| "pre-commit blocked: cannot read staged tasks.md".to_string())?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| "pre-commit blocked: staged tasks.md is not UTF-8")?;
+            openspec_core::parse_task_plan_text(text)
+                .map_err(|_| "pre-commit blocked: staged tasks.md violates stable task rules")?;
+        }
+        if judgment_paths.iter().any(|candidate| candidate == path)
+            && staged_ledger.as_ref().is_some_and(|ledger| ledger.strict)
+        {
+            let staged_ledger = staged_ledger.as_ref().expect("checked above");
+            let phase = Phase::applicable(staged_ledger.applicability())
+                .into_iter()
+                .find(|phase| {
+                    phase
+                        .judgment_artifact()
+                        .is_some_and(|(name, _)| path.ends_with(name))
+                })
+                .ok_or_else(|| {
+                    "pre-commit blocked: unknown staged judgment artifact".to_string()
+                })?;
+            let bytes = git::staged_blob(root, path).map_err(|_| {
+                "pre-commit blocked: cannot read staged judgment artifact".to_string()
+            })?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| "pre-commit blocked: staged judgment artifact is not UTF-8")?;
+            let (_, sections) = phase.judgment_artifact().expect("filtered above");
+            if !check_sections(text, sections, JUDGMENT_MIN_LEN).is_empty() {
+                return Err("pre-commit blocked: staged judgment artifact is incomplete".into());
+            }
+            if openspec_core::parse_task_plan_text(
+                std::str::from_utf8(
+                    &git::staged_blob(root, &tasks_path).map_err(|_| {
+                        "pre-commit blocked: cannot read staged tasks.md".to_string()
+                    })?,
+                )
+                .map_err(|_| "pre-commit blocked: staged tasks.md is not UTF-8")?,
+            )
+            .map_err(|_| "pre-commit blocked: staged tasks.md violates stable task rules")?
+            .strict
+                && canonical_artifact_verdict(text).is_err()
+            {
+                return Err(
+                    "pre-commit blocked: staged judgment artifact has no canonical verdict".into(),
+                );
+            }
+        }
+        if path == ".mpd/config.json" {
+            let bytes = git::staged_blob(root, path)
+                .map_err(|_| "pre-commit blocked: cannot read staged config".to_string())?;
+            // Keep syntax failures distinct from a well-formed document whose
+            // typed policy does not satisfy the current schema. Parsing Config
+            // directly would collapse a missing newly-required policy field
+            // into the generic malformed-config path and hide the actionable
+            // fail-closed policy diagnosis.
+            let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|_| "pre-commit blocked: staged config is malformed")?;
+            let has_local_validation = value
+                .as_object()
+                .is_some_and(|object| object.contains_key("local_validation"));
+            let config = serde_json::from_value::<Config>(value).map_err(|_| {
+                if has_local_validation {
+                    "pre-commit blocked: staged local validation policy is invalid"
+                } else {
+                    "pre-commit blocked: staged config is malformed"
+                }
+            })?;
+            if let Some(local_validation) = &config.local_validation {
+                local_validation
+                    .validate()
+                    .map_err(|_| "pre-commit blocked: staged local validation policy is invalid")?;
+            }
+        }
+        if path.starts_with(".mpd/directives/") {
+            let relative = path.trim_start_matches(".mpd/directives/");
+            if !crate::directives::bundled()
+                .iter()
+                .any(|(known, _)| *known == relative)
+            {
+                return Err("pre-commit blocked: unknown staged directive path".into());
+            }
+            let bytes = git::staged_blob(root, path)
+                .map_err(|_| "pre-commit blocked: cannot read staged directive".to_string())?;
+            if std::str::from_utf8(&bytes).map_or(true, |text| text.trim().is_empty()) {
+                return Err("pre-commit blocked: staged directive is empty or non-UTF-8".into());
+            }
+        }
+        if path.starts_with(".githooks/") {
+            if path != ".githooks/pre-commit" && path != ".githooks/pre-push" {
+                return Err("pre-commit blocked: unknown staged hook policy path".into());
+            }
+            let bytes = git::staged_blob(root, path)
+                .map_err(|_| "pre-commit blocked: cannot read staged hook policy".to_string())?;
+            if std::str::from_utf8(&bytes).map_or(true, |text| !text.starts_with("#!/bin/sh")) {
+                return Err("pre-commit blocked: staged hook policy is malformed".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
     let root = find_root()?;
-    let files = if staged {
-        checks::git_staged_files(&root)
+    let report = if staged {
+        checks::scan_staged_postimages(&root)?
     } else {
-        checks::git_tracked_files(&root)
+        checks::scan_secrets(&checks::git_tracked_files(&root))
     };
-    let report = checks::scan_secrets(&files);
     let scanner = report.scanner;
     let (findings, suppressed) =
         crate::allowlist::Allowlist::load(&root).filter(report.findings, &root);
     let mut failed = false;
-    if staged {
-        if let Ok(change) = resolve_change(&root, None) {
-            let view = manifest_view(&root, &change);
-            if view.state == "blocked" {
-                failed = true;
-                eprintln!("Change manifest blocked by out-of-scope staged paths:");
-                let path_limit = Config::load(&root).human_path_list_limit();
-                for path in view.unrelated_staged.iter().take(path_limit) {
-                    eprintln!("  {}", harness::terminal_safe(path));
-                }
-            }
-        }
-    }
-
     // Suppression reporting is a security signal — never silenced by --quiet.
     if suppressed > 0 {
         println!("Secret scan: {suppressed} finding(s) suppressed by allowlist.");
@@ -2517,6 +4704,643 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
             println!("Checks passed (secret scan clean via {}).", report.scanner);
         }
         Ok(0)
+    }
+}
+
+fn cmd_validate(commit: Option<String>, profile: Option<String>, json: bool) -> CmdResult {
+    let root = find_root()?;
+    let cfg = Config::load(&root);
+    let local = cfg.local_validation.ok_or_else(|| {
+        "structured local_validation is absent; legacy `test` is compatibility-only and cannot authorize local validation".to_string()
+    })?;
+    let report = crate::local_validation::validate_profile(
+        &root,
+        commit.as_deref(),
+        profile.as_deref(),
+        &local,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    } else {
+        println!(
+            "Local validation {}: {} ({})",
+            report.status, report.subject.commit, report.subject.tree
+        );
+        println!("Profile: {}", report.profile);
+        if let Some(receipt) = &report.receipt {
+            println!("Receipt: {}", receipt.id);
+        }
+        if let Some(blocker) = &report.blocker {
+            eprintln!("Validation blocked: {blocker}");
+        }
+    }
+    Ok(if report.status == "passed" { 0 } else { 1 })
+}
+
+fn cmd_identity(path: Option<String>, json: bool) -> CmdResult {
+    let root = find_root()?;
+    let identity = crate::local_validation::identity_report(&root, path.as_deref())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&identity).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "{} {} {} {}",
+            identity.artifact.path,
+            identity.artifact.size,
+            identity.artifact.mode,
+            identity.artifact.sha256
+        );
+    }
+    Ok(0)
+}
+
+fn cmd_hook(command: HookCommand) -> CmdResult {
+    match command {
+        HookCommand::PreCommit { json } => {
+            // Reuse the same fast staged postimage scanner as the compatibility
+            // hook. It is read-only and deliberately does not run a profile or
+            // any configured command; governance is read from exact index blobs.
+            let root = find_root()?;
+            staged_precommit_governance(&root)?;
+            let code = cmd_check(true, true)?;
+            if json {
+                println!(
+                    "{{\"schema\":1,\"hook\":\"pre-commit\",\"status\":\"{}\"}}",
+                    if code == 0 { "passed" } else { "blocked" }
+                );
+            }
+            Ok(code)
+        }
+        HookCommand::PrePush {
+            remote_name,
+            remote_location,
+            json,
+        } => {
+            let root = find_root()?;
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut input)
+                .map_err(|e| format!("malformed-hook-input: cannot read pre-push stdin: {e}"))?;
+            if input.len() > 1024 * 1024 {
+                return Err("malformed-hook-input: pre-push stdin exceeds its cap".into());
+            }
+            // Reject malformed wire data before configuration/trust lookup so a
+            // hook failure always identifies malformed Git input precisely.
+            let _ = crate::local_validation::parse_pre_push_records(&input)?;
+            let cfg = Config::load(&root);
+            let local = cfg.local_validation.ok_or_else(|| {
+                "pre-push blocked: structured local_validation is absent; activate an explicitly reviewed policy first".to_string()
+            })?;
+            let authorization = crate::local_validation::authorize_pre_push(
+                &root,
+                &remote_name,
+                &remote_location,
+                &input,
+                &local,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&authorization).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "pre-push authorization: {} objects / {} bytes / {} deletions ({})",
+                    authorization.object_count,
+                    authorization.object_bytes,
+                    authorization.deletion_count,
+                    authorization.object_set_digest
+                );
+            }
+            Ok(0)
+        }
+        HookCommand::ApproveDeletion {
+            remote_name,
+            remote_location,
+            remote_ref,
+            old_oid,
+            yes,
+            json,
+        } => {
+            if !yes {
+                return Err(
+                    "deletion approval is a one-use local authorization mutation; rerun with --yes"
+                        .into(),
+                );
+            }
+            let root = find_root()?;
+            let cfg = Config::load(&root);
+            let local = cfg.local_validation.ok_or_else(|| {
+                "deletion approval blocked: structured local_validation is absent".to_string()
+            })?;
+            let approval = crate::local_validation::create_deletion_approval(
+                &root,
+                &remote_name,
+                &remote_location,
+                &remote_ref,
+                &old_oid,
+                &local,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&approval).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "Deletion approval READY id={} ref={} old={}; it is consumed by one exact matching pre-push invocation.",
+                    approval.id, approval.remote_ref, approval.old_oid
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn cmd_policy(command: PolicyCommand) -> CmdResult {
+    match command {
+        #[cfg(test)]
+        PolicyCommand::Status { commit, json } => {
+            let root = find_root()?;
+            let cfg = Config::load(&root);
+            let local = cfg.local_validation.ok_or_else(|| "structured local_validation is absent; legacy `test` cannot become a trusted policy".to_string())?;
+            let report = crate::local_validation::preflight(&root, commit.as_deref(), &local)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                println!(
+                    "Local validation subject: {} ({})",
+                    report.subject.commit, report.subject.tree
+                );
+                if let Some(blocker) = report.blocker {
+                    eprintln!("Validation blocked: {blocker}");
+                }
+            }
+            Ok(0)
+        }
+        #[cfg(test)]
+        PolicyCommand::Bootstrap {
+            commit,
+            confirm_digest,
+            pretrust_proof,
+            nonce,
+            reviewed,
+        } => {
+            require_pretrust_mode("bootstrap")?;
+            if !reviewed {
+                return Err(
+                    "policy bootstrap requires --i-reviewed-this-policy; it creates a clone-local trust root"
+                        .into(),
+                );
+            }
+            let root = find_root()?;
+            let cfg = Config::load(&root);
+            let local = cfg.local_validation.ok_or_else(|| {
+                "structured local_validation is absent; legacy `test` cannot become a trusted policy"
+                    .to_string()
+            })?;
+            let (oid, already_completed) =
+                crate::local_validation::bootstrap_first_adoption_policy(
+                    &root,
+                    &local,
+                    crate::local_validation::BootstrapRequest {
+                        checkpoint_oid: &commit,
+                        reviewed_policy_digest: &confirm_digest,
+                        pretrust_proof_digest: &pretrust_proof,
+                        nonce: &nonce,
+                    },
+                )?;
+            if already_completed {
+                println!("Trusted local validation policy already completed at {oid}; exact proof/policy/nonce inputs were reparsed without a second CAS.");
+            } else {
+                println!("Trusted local validation policy initialized at {oid}. This is owner authorization, not an independent attestation.");
+            }
+            Ok(0)
+        }
+        #[cfg(test)]
+        PolicyCommand::Promote {
+            commit,
+            confirm_digest,
+        } => {
+            let root = find_root()?;
+            let report =
+                crate::local_validation::promote_trusted_policy(&root, &commit, &confirm_digest)?;
+            println!(
+                "Trusted policy promoted at {} from {} for immutable commit {}.",
+                report.promoted_policy_oid, report.trusted_before_oid, report.subject_commit
+            );
+            println!("Semantic review:");
+            for change in &report.semantic_diff {
+                println!("- {change}");
+            }
+            println!(
+                "Reviewed candidate digests: policy={}, tool-lock={}, sandbox={}, hooks={}",
+                report.candidate_policy_digest,
+                report.candidate_tool_lock_digest,
+                report.candidate_sandbox_digest,
+                report.candidate_hook_digest
+            );
+            println!("Promotion created no validation receipt or gate PASS; separately activate the expected policy/coordinator if needed.");
+            Ok(0)
+        }
+        PolicyCommand::Activate {
+            commit,
+            confirm_policy_digest,
+            coordinator,
+            confirm_executable_digest,
+            hooks,
+            yes,
+        } => {
+            if !yes {
+                return Err("policy activation is a local trust mutation; rerun with --yes after reviewing every printed digest".into());
+            }
+            let root = find_root()?;
+            let activation = crate::local_validation::activate_reviewed_policy(
+                &root,
+                &commit,
+                &confirm_policy_digest,
+                &coordinator,
+                &confirm_executable_digest,
+                &hooks,
+            )?;
+            println!(
+                "ACTIVE policy={} commit={} coordinator={} hooks={}",
+                activation.trusted_policy_oid,
+                commit,
+                confirm_executable_digest,
+                hooks.display()
+            );
+            println!("Activation created no validation receipt, gate PASS, push authorization, transfer, or remote-parity fact.");
+            Ok(0)
+        }
+    }
+}
+
+#[cfg(test)]
+fn cmd_first_adoption(command: FirstAdoptionCommand) -> CmdResult {
+    match command {
+        FirstAdoptionCommand::Prepare {
+            change,
+            base,
+            branch,
+            upstream,
+            security_evidence,
+            json,
+        } => {
+            require_pretrust_mode("verify")?;
+            let root = find_root()?;
+            // Evidence is intentionally only a contained input marker here; no
+            // profile/check is executed by preparation.
+            let evidence = Project::new(&root)
+                .change_dir(&change)
+                .join(&security_evidence);
+            let _ = openspec_core::read_contained_capped(&root, &evidence, 1024 * 1024)
+                .map_err(|e| format!("invalid first-adoption security evidence: {e}"))?;
+            let scope = crate::local_validation::prepare_checkpoint_scope(
+                &root,
+                &change,
+                &base,
+                &branch,
+                upstream.as_deref(),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&scope).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "Prepared checkpoint scope {} entries, digest {}",
+                    scope.entries.len(),
+                    scope.aggregate_digest
+                );
+                for entry in &scope.entries {
+                    println!(
+                        "  {}",
+                        match entry {
+                            crate::local_validation::CheckpointEntryV1::Present {
+                                path, ..
+                            } => path,
+                            crate::local_validation::CheckpointEntryV1::Deleted {
+                                path, ..
+                            } => path,
+                        }
+                    );
+                }
+            }
+            Ok(0)
+        }
+        FirstAdoptionCommand::VerifyCheckpoint {
+            change,
+            checkpoint,
+            security_evidence,
+            confirm_policy_digest,
+            confirm_coordinator_digest,
+            json,
+        } => {
+            require_pretrust_mode("verify")?;
+            let root = find_root()?;
+            let cfg = Config::load(&root);
+            let local = cfg.local_validation.ok_or_else(|| "structured local_validation is absent; first adoption cannot construct a trusted policy".to_string())?;
+            let (proof, digest, nonce) = crate::local_validation::verify_first_adoption_checkpoint(
+                &root,
+                &change,
+                &checkpoint,
+                &security_evidence,
+                &local,
+                &confirm_policy_digest,
+                &confirm_coordinator_digest,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "proof": proof,
+                        "pretrust_proof_digest": digest,
+                        "bootstrap_nonce_preimage": nonce,
+                    })
+                );
+            } else {
+                println!(
+                    "Verified checkpoint proof {digest}; public nonce: {}",
+                    nonce
+                );
+            }
+            Ok(0)
+        }
+        FirstAdoptionCommand::Restart {
+            change,
+            stage,
+            superseded_checkpoint,
+            superseded_proof,
+            replacement_tip,
+            security_evidence,
+            actor,
+            reason,
+            yes,
+            json,
+        } => {
+            let root = find_root()?;
+            let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+            let stage = match stage.as_str() {
+                "pretrust" => ledger::FirstAdoptionRestartStage::Pretrust,
+                "posttrust" => ledger::FirstAdoptionRestartStage::Posttrust,
+                _ => return Err("restart stage must be exactly pretrust or posttrust".into()),
+            };
+            if !git::valid_oid_hex(&superseded_checkpoint) {
+                return Err("superseded checkpoint must be a full lowercase object id".into());
+            }
+            if !git::sanitized_commit_exists(&root, &superseded_checkpoint)
+                .map_err(|e| e.to_string())?
+            {
+                return Err("superseded checkpoint is not an existing direct commit".into());
+            }
+            if let Some(replacement) = replacement_tip.as_deref() {
+                if !git::valid_oid_hex(replacement) {
+                    return Err("replacement tip must be a full lowercase object id".into());
+                }
+                if !git::sanitized_commit_exists(&root, replacement).map_err(|e| e.to_string())? {
+                    return Err("replacement tip is not an existing direct commit".into());
+                }
+                match git::sanitized_is_ancestor(&root, &superseded_checkpoint, replacement)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(true) if replacement != superseded_checkpoint => {}
+                    Some(true) => {
+                        return Err("replacement tip must differ from superseded checkpoint".into());
+                    }
+                    Some(false) => {
+                        return Err(
+                            "replacement tip must descend from the superseded checkpoint".into(),
+                        );
+                    }
+                    None => return Err("checkpoint ancestry is unavailable locally".into()),
+                }
+            }
+            let trusted =
+                git::sanitized_direct_ref_oid(&root, "refs/mpd/trusted-validation-policy")
+                    .map_err(|e| e.to_string())?;
+            if let Some(oid) = trusted.as_deref() {
+                if !git::sanitized_commit_exists(&root, oid).map_err(|e| e.to_string())? {
+                    return Err("trusted-policy ref does not name an existing direct commit".into());
+                }
+            }
+            match (stage, trusted.as_ref()) {
+                (ledger::FirstAdoptionRestartStage::Pretrust, Some(_)) => {
+                    return Err("pretrust restart refused after trusted-policy CAS".into());
+                }
+                (ledger::FirstAdoptionRestartStage::Posttrust, None) => {
+                    return Err(
+                        "posttrust restart requires the initialized trusted-policy ref".into(),
+                    );
+                }
+                _ => {}
+            }
+            if matches!(stage, ledger::FirstAdoptionRestartStage::Posttrust) {
+                let reconciliation = ledger
+                    .first_adoption_reconciliations
+                    .first()
+                    .ok_or("posttrust restart requires first-adoption reconciliation")?;
+                if trusted.as_deref() != Some(reconciliation.policy_object_oid.as_str()) {
+                    return Err(
+                        "posttrust restart trusted ref differs from reconciliation policy object"
+                            .into(),
+                    );
+                }
+            }
+            if let Some(proof) = superseded_proof.as_deref() {
+                crate::digest::Digest::from_hex(proof)?;
+                crate::local_validation::verify_restart_superseded_proof(
+                    &root,
+                    &change,
+                    &superseded_checkpoint,
+                    proof,
+                )?;
+            }
+            let evidence_relative = std::path::Path::new(&security_evidence);
+            if security_evidence.is_empty()
+                || evidence_relative.is_absolute()
+                || evidence_relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err("first-adoption restart evidence path is unsafe".into());
+            }
+            let evidence_path = Project::new(&root)
+                .change_dir(&change)
+                .join(evidence_relative);
+            let evidence = openspec_core::read_contained_capped(&root, &evidence_path, 1024 * 1024)
+                .map_err(|e| format!("invalid first-adoption restart evidence: {e}"))?;
+            if canonical_artifact_verdict(&evidence)? != Verdict::Pass {
+                return Err("first-adoption restart requires reviewed PASS evidence".into());
+            }
+            let event = ledger::FirstAdoptionRestartV1 {
+                schema: 1,
+                stage,
+                superseded_checkpoint_oid: superseded_checkpoint,
+                superseded_proof_digest: superseded_proof,
+                replacement_tip_oid: replacement_tip,
+                actor,
+                reason,
+                evidence_digest: crate::digest::Digest::of_bytes(evidence.as_bytes()).to_hex(),
+                at_epoch_secs: ledger::now_epoch_secs(),
+            };
+            let mut candidate = ledger.clone();
+            let appended = candidate.append_first_adoption_restart(event.clone())?;
+            let first = candidate
+                .first_adoption_restarts
+                .first()
+                .ok_or("restart eligibility state is unexpectedly empty")?;
+            let eligibility = candidate.first_adoption_eligibility(
+                &first.superseded_checkpoint_oid,
+                first.superseded_proof_digest.as_deref(),
+                &first.evidence_digest,
+            )?;
+            if !yes {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": if appended { "preview" } else { "already-recorded" },
+                            "event": event,
+                            "eligibility": eligibility,
+                            "mutated": false,
+                        })
+                    );
+                } else if appended {
+                    println!(
+                        "Preview: append first-adoption restart; latest eligible checkpoint {}. Rerun with --yes.",
+                        eligibility.latest_eligible_checkpoint_oid
+                    );
+                } else {
+                    println!("First-adoption restart is already recorded; no mutation needed.");
+                }
+                return Ok(0);
+            }
+            if appended {
+                ledger::save(&root, &candidate).map_err(|e| e.to_string())?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": if appended { "restarted" } else { "already-recorded" },
+                        "eligibility": eligibility,
+                        "mutated": appended,
+                    })
+                );
+            } else if appended {
+                println!(
+                    "First-adoption restart appended; latest eligible checkpoint {}. No gate PASS or Git ref was created.",
+                    eligibility.latest_eligible_checkpoint_oid
+                );
+            } else {
+                println!("First-adoption restart is already recorded; no second event appended.");
+            }
+            Ok(0)
+        }
+        FirstAdoptionCommand::Reconcile {
+            change,
+            checkpoint,
+            policy_object,
+            pretrust_proof,
+            security_evidence,
+            reason,
+            yes,
+            json,
+        } => {
+            let root = find_root()?;
+            let mut ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+            for (label, value) in [
+                ("checkpoint", &checkpoint),
+                ("policy-object", &policy_object),
+            ] {
+                if !(value.len() == 40 || value.len() == 64)
+                    || !value.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err(format!("invalid {label} oid"));
+                }
+            }
+            crate::digest::Digest::from_hex(&pretrust_proof)?;
+            let evidence_path = Project::new(&root)
+                .change_dir(&change)
+                .join(&security_evidence);
+            let _ = openspec_core::read_contained_capped(&root, &evidence_path, 1024 * 1024)
+                .map_err(|e| format!("invalid first-adoption security evidence: {e}"))?;
+            let proof = crate::local_validation::verify_first_adoption_reconciliation(
+                &root,
+                &change,
+                &checkpoint,
+                &policy_object,
+                &pretrust_proof,
+                &security_evidence,
+            )?;
+            let trusted_policy_digest =
+                crate::local_validation::trusted_policy_object_digest(&root, &policy_object)?;
+            let event = ledger::FirstAdoptionReconciliationV1 {
+                schema: 1,
+                checkpoint_oid: checkpoint,
+                policy_object_oid: policy_object,
+                pretrust_proof_digest: pretrust_proof,
+                security_evidence,
+                reason: ledger::bounded_text(&reason, "reason")?,
+                at_epoch_secs: ledger::now_epoch_secs(),
+                checkpoint_scope_digest: proof.checkpoint_scope.aggregate_digest.clone(),
+                security_evidence_digest: proof.security_evidence_digest.clone(),
+                bootstrap_nonce_digest: proof.nonce_digest.clone(),
+                trusted_policy_digest,
+            };
+            if let Some(existing) = ledger.first_adoption_reconciliations.first() {
+                let same = existing.checkpoint_oid == event.checkpoint_oid
+                    && existing.policy_object_oid == event.policy_object_oid
+                    && existing.pretrust_proof_digest == event.pretrust_proof_digest
+                    && existing.security_evidence == event.security_evidence
+                    && existing.reason == event.reason
+                    && existing.checkpoint_scope_digest == event.checkpoint_scope_digest
+                    && existing.security_evidence_digest == event.security_evidence_digest
+                    && existing.bootstrap_nonce_digest == event.bootstrap_nonce_digest
+                    && existing.trusted_policy_digest == event.trusted_policy_digest;
+                if !same {
+                    return Err("conflicting first-adoption reconciliation already exists".into());
+                }
+                if json {
+                    println!("{{\"status\":\"already-reconciled\"}}");
+                } else {
+                    println!("First-adoption already reconciled; no second event appended.");
+                }
+                return Ok(0);
+            }
+            if !yes {
+                if json {
+                    println!("{{\"status\":\"preview\",\"action\":\"rewind-build\"}}");
+                } else {
+                    println!("Preview: append one first-adoption reconciliation and rewind to Build; rerun with --yes.");
+                }
+                return Ok(0);
+            }
+            ledger.reconcile_first_adoption(event)?;
+            ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+            if json {
+                println!("{{\"status\":\"reconciled\",\"phase\":\"build\"}}");
+            } else {
+                println!("First-adoption reconciled; provisional Build history retained and current phase rewound to Build.");
+            }
+            Ok(0)
+        }
+    }
+}
+
+#[cfg(test)]
+fn require_pretrust_mode(expected: &str) -> Result<(), String> {
+    match std::env::var("MPD_PRETRUST_MODE") {
+        Ok(observed) if observed == expected => Ok(()),
+        _ => Err(format!(
+            "pretrust control-plane command refused outside the reviewed {expected} sandbox; use scripts/run-pretrust.sh"
+        )),
     }
 }
 
@@ -2749,6 +5573,78 @@ fn relative_to_root(root: &Path, path: &Path) -> Result<String, String> {
     Ok(s.replace('\\', "/"))
 }
 
+/// Read one exact regular repository postimage for Candidate closure
+/// construction.  The descriptor is opened no-follow and its identity/length
+/// is rechecked after the bounded read so a path replacement cannot be
+/// silently attributed to the reviewed overlay.
+fn closure_postimage_from_file(
+    root: &Path,
+    relative: &str,
+) -> Result<closure::ClosureFilePostimage, String> {
+    digest::validate_canonical_path(relative).map_err(|error| error.to_string())?;
+    let path = root.join(relative);
+    openspec_core::assert_contained(root, &path).map_err(|error| error.to_string())?;
+    let before = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot inspect closure postimage {relative:?}: {error}"))?;
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > 16 * 1024 * 1024 {
+        return Err(format!(
+            "closure postimage {relative:?} is not a bounded regular file"
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("cannot open closure postimage {relative:?}: {error}"))?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read closure postimage {relative:?}: {error}"))?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(format!("closure postimage {relative:?} exceeds its cap"));
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck closure postimage {relative:?}: {error}"))?;
+    #[cfg(unix)]
+    let unchanged = {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mode() == after.mode()
+    };
+    #[cfg(not(unix))]
+    let unchanged = before.len() == after.len();
+    if !unchanged {
+        return Err(format!(
+            "closure postimage {relative:?} changed during its bounded read"
+        ));
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if after.permissions().mode() & 0o111 != 0 {
+            0o100755
+        } else {
+            0o100644
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = 0o100644;
+    Ok(closure::ClosureFilePostimage {
+        path: relative.to_string(),
+        mode,
+        bytes,
+    })
+}
+
 /// A stable, lowercase-kebab label for a transaction stage — matches its
 /// serde wire tag so text and JSON never disagree on vocabulary.
 fn stage_label(stage: openspec_core::TransactionState) -> &'static str {
@@ -2888,10 +5784,31 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     }
 
     let change = resolve_change(&root, change)?;
-    let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
+    let (mut ledger, observed) =
+        ledger::load_observed(&root, &change).map_err(|e| e.to_string())?;
+    let config = Config::load(&root);
+    if enforce_freshness_before_effects(&root, &change, &mut ledger, &observed, &config, false)? {
+        return Ok(1);
+    }
 
     // Irreversibility guard: never archive over an unmet gate or open condition.
-    let reasons = ledger.blocking_reasons();
+    let mut reasons = ledger.blocking_reasons();
+    let task_plan = Project::new(&root)
+        .task_plan(&change)
+        .map_err(|error| format!("Cannot archive {change:?} — invalid tasks.md: {error}"))?;
+    let task_accounting = ledger.task_accounting(&task_plan);
+    if task_plan.strict && !task_accounting.accounted() {
+        if !task_accounting.open.is_empty() {
+            reasons.push(format!(
+                "{} Builder task(s) remain open: {}",
+                task_accounting.open.len(),
+                task_accounting.open.join(", ")
+            ));
+        }
+        for id in &task_accounting.stale {
+            reasons.push(format!("task deferral for {id} is stale"));
+        }
+    }
     if !reasons.is_empty() {
         eprintln!("Cannot archive {change:?} — unmet gates/conditions:");
         for r in &reasons {
@@ -2930,13 +5847,10 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     // Irreversibility guard #3 (strict tier only): the judgment artifacts that
     // passed at gate time must still be present and complete now — a re-check
     // against the exact evaporation this change fixes (design.md Cond 9 / B2).
-    // A validly-scoped waiver for an applicable phase is surfaced WAIVED, never
-    // blocking. Inert when `strict=false`, so the manual tier is unchanged.
+    // Current Commando policy denies artifact waivers. Inert when
+    // `strict=false`, so the manual tier is unchanged.
     if ledger.strict {
-        let (refusals, waived) = strict_archive_recheck(&root, &change, &ledger);
-        for label in &waived {
-            println!("  ⚠ WAIVED: {label} judgment artifact (audited, not re-checked).");
-        }
+        let refusals = strict_archive_recheck(&root, &change, &ledger);
         if !refusals.is_empty() {
             eprintln!(
                 "Cannot archive {change:?} — judgment artifacts evaporated after their gate:"
@@ -2964,6 +5878,15 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             return Ok(1);
         }
         eprintln!("Warning: run `mpd doctor --fix` before archiving with --yes.");
+    }
+
+    let evidence_blockers = current_evidence_blockers(&root, &change, &ledger);
+    if !evidence_blockers.is_empty() {
+        eprintln!("Cannot archive {change:?} — gate evidence is no longer current:");
+        for blocker in &evidence_blockers {
+            eprintln!("  - {blocker}");
+        }
+        return Ok(1);
     }
 
     let plan = project
@@ -3013,6 +5936,76 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         println!("\nDry run. Re-run with --yes to apply.");
         return Ok(0);
     }
+
+    // Modern strict gates retain a Build Candidate.  When present, archive
+    // must carry it through full Candidate-to-Commit equivalence.  Ledgers
+    // created by the older manual tier have no Candidate record and retain
+    // the legacy scoped-coherence path; absence is never upgraded into a
+    // modern claim.
+    let candidate_context = if let Some(build_capture) = ledger
+        .gates
+        .get(&Phase::Build)
+        .and_then(|record| record.candidate.as_ref())
+    {
+        for phase in [Phase::SecurityCode, Phase::Test] {
+            let capture = ledger
+                .gates
+                .get(&phase)
+                .and_then(|record| record.candidate.as_ref())
+                .ok_or_else(|| {
+                    format!(
+                        "cannot archive: {} has no retained Candidate binding",
+                        phase.label()
+                    )
+                })?;
+            if capture.subject.id != build_capture.subject.id {
+                return Err(format!(
+                    "cannot archive: {} Candidate differs from Build",
+                    phase.label()
+                ));
+            }
+        }
+        let candidate = crate::candidate::reopen_candidate(&root, build_capture)?;
+        let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
+        let mut phase_postimages = Vec::new();
+        for phase in [
+            Phase::SecurityCode,
+            Phase::DesignSignoff,
+            Phase::Test,
+            Phase::Documentation,
+            Phase::DocValidation,
+        ] {
+            if !phase.is_active(ledger.applicability()) {
+                continue;
+            }
+            let record = ledger.gates.get(&phase).ok_or_else(|| {
+                format!("cannot archive: {} gate record is missing", phase.label())
+            })?;
+            let receipt_id = record
+                .receipt
+                .as_ref()
+                .ok_or_else(|| format!("cannot archive: {} receipt is missing", phase.label()))?
+                .id
+                .to_hex();
+            let filename = match phase {
+                Phase::SecurityCode => "security-code.md",
+                Phase::DesignSignoff => "design-signoff.md",
+                Phase::Test => "test.md",
+                Phase::Documentation => "documentation.md",
+                Phase::DocValidation => "doc-validation.md",
+                _ => unreachable!(),
+            };
+            let relative = format!("openspec/changes/{change}/{filename}");
+            phase_postimages.push(closure::PhaseArtifactPostimage {
+                phase,
+                receipt_id,
+                file: closure_postimage_from_file(&root, &relative)?,
+            });
+        }
+        Some((candidate, candidate_root, phase_postimages))
+    } else {
+        None
+    };
 
     // ---- Compose every planned postimage into ONE crash-safe transaction ----
     // (archive-transaction.md; design.md "Archive and commit lifecycle").
@@ -3082,6 +6075,45 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     let archived_at = ledger::now_epoch_secs();
 
     let ledger_bytes_out: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
+    let closure_plan_out: std::cell::RefCell<Option<closure::CandidateClosurePlan>> =
+        std::cell::RefCell::new(None);
+    let documentation_postimages = candidate_context
+        .as_ref()
+        .map(|_| {
+            let doc_validation_receipt_id = ledger
+                .gates
+                .get(&Phase::DocValidation)
+                .and_then(|record| record.receipt.as_ref())
+                .ok_or("cannot archive: Doc Validation receipt is missing")?
+                .id
+                .to_hex();
+            Ok::<closure::ReviewedDocumentationPostimages, String>(
+                closure::ReviewedDocumentationPostimages {
+                    doc_validation_receipt_id,
+                    files: doc_fold
+                        .as_ref()
+                        .map(|(target, content)| {
+                            Ok(closure::ClosureFilePostimage::regular(
+                                relative_to_root(&root, target)?,
+                                content.as_bytes().to_vec(),
+                            ))
+                        })
+                        .into_iter()
+                        .collect::<Result<Vec<_>, String>>()?,
+                },
+            )
+        })
+        .transpose()?;
+    let spec_postimages = plan
+        .updates
+        .iter()
+        .map(|update| {
+            Ok(closure::ClosureFilePostimage::regular(
+                relative_to_root(&root, &update.target_path)?,
+                update.content.as_bytes().to_vec(),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let plan_txn = openspec_core::build_plan(
         &root,
         &change,
@@ -3094,21 +6126,45 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         final_scoped_digest_oc,
         |transaction_id| {
             let mut lg = ledger.clone();
-            lg.archive_closure = Some(ArchiveClosure {
+            let archive_closure = ArchiveClosure {
                 base_commit: base_commit.clone(),
                 archive_path: archive_target_rel.clone(),
                 transaction_id: digest::Digest::from_hex(&transaction_id.to_hex())
                     .expect("openspec_core Digest hex always parses as an mpd Digest"),
+                candidate_id: candidate_context
+                    .as_ref()
+                    .map(|(candidate, _, _)| candidate.capture.subject.id.clone()),
                 allowed_paths: closure_scope.clone(),
                 system_paths: scope_snapshot.clone(),
                 post_archive_digest: final_scoped_digest,
                 archived_at,
-            });
+            };
+            lg.archive_closure = Some(archive_closure.clone());
             let mut bytes = serde_json::to_string_pretty(&lg)
                 .expect("ledger always serializes")
                 .into_bytes();
             bytes.push(b'\n');
             *ledger_bytes_out.borrow_mut() = Some(bytes.clone());
+            if let Some((candidate, candidate_root, phase_postimages)) = &candidate_context {
+                let closure_plan = closure::build_candidate_closure_plan(
+                    candidate_root,
+                    candidate,
+                    &archive_closure,
+                    phase_postimages,
+                    documentation_postimages
+                        .as_ref()
+                        .expect("modern Candidate closure has documentation evidence"),
+                    &closure::DeterministicArchivePostimages {
+                        spec_writes: spec_postimages.clone(),
+                        ledger: closure::ClosureFilePostimage::regular(
+                            ledger_path_rel.clone(),
+                            bytes.clone(),
+                        ),
+                    },
+                )
+                .expect("archive inputs were validated before the transaction callback");
+                *closure_plan_out.borrow_mut() = Some(closure_plan);
+            }
             openspec_core::TargetWrite {
                 target: ledger_path_rel.clone(),
                 bytes,
@@ -3122,6 +6178,10 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             .into_inner()
             .expect("the closure_ledger callback always runs inside build_plan"),
     );
+
+    if let Some(closure_plan) = closure_plan_out.into_inner() {
+        closure::save_candidate_closure_plan(&root, &closure_plan)?;
+    }
 
     openspec_core::prepare(&root, &plan_txn, &contents).map_err(|e| e.to_string())?;
     match openspec_core::drive(&root).map_err(|e| e.to_string())? {
@@ -3536,7 +6596,783 @@ fn humanize_secs(secs: u64) -> String {
     }
 }
 
-fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
+const VALIDATOR_POLICY_CHECKS: &[&str] = &[
+    "typed-config-effective-graph",
+    "trusted-direct-ref-object-cas",
+    "clone-private-hooks-coordinator",
+    "directive-parity",
+    "locked-tools-rust-components-offline-cache",
+    "sandbox-contract-capability",
+    "advisory-revision-tree-freshness",
+    "path-safety-private-state-log-health",
+    "note-codec-direct-ref-readability",
+];
+
+const VALIDATOR_POLICY_EXCLUSIONS: &[&str] = &[
+    "current-subject-receipt",
+    "deploy-install-record",
+    "installed-path-identity",
+    "installed-identity-probe",
+    "configured-validation-execution",
+    "remote-parity",
+];
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorSeverity {
+    Info,
+    Blocker,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorFinding {
+    code: String,
+    severity: DoctorSeverity,
+    component: String,
+    state: String,
+    message: String,
+    fix: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScopedDoctorReport {
+    /// Stable, versioned machine format. New meanings require a schema bump.
+    schema: u32,
+    scope: String,
+    included_checks: Vec<String>,
+    excluded_checks: Vec<String>,
+    resolved_subject: Option<String>,
+    findings: Vec<DoctorFinding>,
+    effects: DoctorEffectCounts,
+    status: String,
+}
+
+/// Explicit negative-effect evidence for each scoped doctor invocation. These
+/// counters are produced by the command DAG itself: scoped doctor has no edge
+/// to validation, install, probe, or remote observation functions.
+#[derive(Debug, Default, Serialize)]
+struct DoctorEffectCounts {
+    configured_validation: u32,
+    install: u32,
+    identity_probe: u32,
+    remote: u32,
+}
+
+fn doctor_finding(
+    code: &str,
+    component: &str,
+    fix: &str,
+    check: impl FnOnce() -> Result<(), String>,
+) -> DoctorFinding {
+    match check() {
+        Ok(()) => DoctorFinding {
+            code: code.into(),
+            severity: DoctorSeverity::Info,
+            component: component.into(),
+            state: "healthy".into(),
+            message: format!("{component} is healthy"),
+            fix: String::new(),
+        },
+        Err(message) => DoctorFinding {
+            code: code.into(),
+            severity: DoctorSeverity::Blocker,
+            component: component.into(),
+            state: "blocked".into(),
+            message,
+            fix: fix.into(),
+        },
+    }
+}
+
+fn doctor_directive_parity(root: &Path) -> Result<(), String> {
+    let base = root.join(".mpd/directives");
+    for (relative, bundled) in crate::directives::bundled() {
+        let path = base.join(relative);
+        openspec_core::assert_contained(root, &path)
+            .map_err(|e| format!("unsafe directive {relative}: {e}"))?;
+        let actual = openspec_core::read_contained_capped(root, &path, 1024 * 1024)
+            .map_err(|e| format!("directive {relative} is missing or unreadable: {e}"))?;
+        if actual != bundled {
+            return Err(format!(
+                "directive {relative} differs from bundled doctrine"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn static_doctor_findings(
+    root: &Path,
+) -> (
+    Vec<DoctorFinding>,
+    Option<crate::config::LocalValidationConfig>,
+    Option<crate::local_validation::Subject>,
+) {
+    let mut findings = Vec::new();
+    let loaded = Config::load_strict(root).and_then(|config| {
+        let local = config
+            .local_validation
+            .ok_or("structured local_validation is absent")?;
+        local.validate()?;
+        Ok(local)
+    });
+    let local = loaded.as_ref().ok().cloned();
+    findings.push(match loaded {
+        Ok(_) => doctor_finding(
+            "typed-config-effective-graph",
+            "local-validation",
+            "repair .mpd/config.json with the supported structured local_validation schema",
+            || crate::local_validation::static_policy_check(root),
+        ),
+        Err(message) => DoctorFinding {
+            code: "typed-config-effective-graph".into(),
+            severity: DoctorSeverity::Blocker,
+            component: "local-validation".into(),
+            state: "blocked".into(),
+            message,
+            fix: "repair .mpd/config.json with the supported structured local_validation schema"
+                .into(),
+        },
+    });
+
+    let mut subject = None;
+    if let Some(local) = &local {
+        let preflight = crate::local_validation::preflight(root, Some("HEAD"), local);
+        match preflight {
+            Ok(preflight) => {
+                subject = Some(preflight.subject.clone());
+                findings.push(match preflight.blocker {
+                    Some(message) => DoctorFinding {
+                        code: "trusted-direct-ref-object-cas".into(),
+                        severity: DoctorSeverity::Blocker,
+                        component: "trusted-policy".into(),
+                        state: "blocked".into(),
+                        message,
+                        fix: "activate the reviewed direct immutable policy object".into(),
+                    },
+                    None => DoctorFinding {
+                        code: "trusted-direct-ref-object-cas".into(),
+                        severity: DoctorSeverity::Info,
+                        component: "trusted-policy".into(),
+                        state: "healthy".into(),
+                        message: "trusted direct policy object matches the exact HEAD policy"
+                            .into(),
+                        fix: String::new(),
+                    },
+                });
+            }
+            Err(message) => findings.push(DoctorFinding {
+                code: "trusted-direct-ref-object-cas".into(),
+                severity: DoctorSeverity::Blocker,
+                component: "trusted-policy".into(),
+                state: "blocked".into(),
+                message,
+                fix: "repair the exact HEAD policy inputs and direct trusted-policy ref".into(),
+            }),
+        }
+        // This preflight is intentionally evaluated once. The three findings
+        // are separate operator-facing components of one acyclic static input
+        // observation, not three repeated filesystem/tool/cache traversals.
+        let static_inputs = crate::local_validation::doctor_static_validation_inputs(root, local);
+        for (code, component, fix) in [
+            (
+                "locked-tools-rust-components-offline-cache",
+                "toolchain",
+                "run the reviewed bootstrap to restore locked tools, Rust components, and the offline Cargo cache",
+            ),
+            (
+                "sandbox-contract-capability",
+                "sandbox",
+                "restore the mandatory reviewed network-denial sandbox adapter and profile",
+            ),
+            (
+                "advisory-revision-tree-freshness",
+                "advisory-db",
+                "refresh the clone-private advisory database from its reviewed lock",
+            ),
+        ] {
+            findings.push(doctor_finding(code, component, fix, || static_inputs.clone()));
+        }
+    } else {
+        for (code, component) in [
+            ("trusted-direct-ref-object-cas", "trusted-policy"),
+            ("locked-tools-rust-components-offline-cache", "toolchain"),
+            ("sandbox-contract-capability", "sandbox"),
+            ("advisory-revision-tree-freshness", "advisory-db"),
+        ] {
+            findings.push(DoctorFinding {
+                code: code.into(),
+                severity: DoctorSeverity::Blocker,
+                component: component.into(),
+                state: "blocked".into(),
+                message:
+                    "cannot inspect this policy input until structured local_validation is valid"
+                        .into(),
+                fix: "repair .mpd/config.json first".into(),
+            });
+        }
+    }
+    findings.push(doctor_finding(
+        "clone-private-hooks-coordinator",
+        "activation",
+        "activate the reviewed clone-private coordinator and hook launchers",
+        || crate::local_validation::doctor_activation_health(root),
+    ));
+    findings.push(doctor_finding(
+        "directive-parity",
+        "directives",
+        "review and synchronize project directives with the bundled doctrine",
+        || doctor_directive_parity(root),
+    ));
+    findings.push(doctor_finding(
+        "path-safety-private-state-log-health",
+        "private-state",
+        "remove or repair unsafe clone-private state through the reviewed recovery workflow",
+        || crate::local_validation::doctor_private_state_health(root),
+    ));
+    if let Some(subject) = &subject {
+        findings.push(doctor_finding(
+            "note-codec-direct-ref-readability",
+            "receipt-store",
+            "repair the direct validation-notes ref or its bounded receipt codec",
+            || crate::local_validation::doctor_note_store_health(root, subject),
+        ));
+    } else {
+        findings.push(DoctorFinding {
+            code: "note-codec-direct-ref-readability".into(),
+            severity: DoctorSeverity::Blocker,
+            component: "receipt-store".into(),
+            state: "blocked".into(),
+            message: "cannot resolve a safe exact HEAD subject for note codec inspection".into(),
+            fix: "repair local Git object health and the structured validation policy".into(),
+        });
+    }
+    (findings, local, subject)
+}
+
+fn resolve_runtime_head(root: &Path) -> Result<String, String> {
+    let head = git::head_commit(root)
+        .map_err(|e| e.to_string())?
+        .ok_or("runtime-health requires a committed HEAD")?;
+    let dirty = git::status_v2(root)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .any(|entry| !matches!(entry, git::StatusEntry::Ignored { .. }));
+    if dirty {
+        return Err(format!(
+            "runtime-health requires a clean exact HEAD; resolved {head} but repository state is dirty"
+        ));
+    }
+    Ok(head)
+}
+
+/// Resolve runtime ownership after archive clears `.mpd/current`. Pending
+/// closure metadata is authoritative while present; after it is removed, the
+/// newest archived ledger whose base is in HEAD ancestry is selected under a
+/// bounded, non-following state-directory scan.
+fn resolve_runtime_ledger(root: &Path, head: &str) -> Result<ledger::Ledger, String> {
+    if let Some(change) = ledger::current(root) {
+        return ledger::load(root, &change).map_err(|e| e.to_string());
+    }
+    match openspec_core::inspect(root) {
+        Ok(Some(pending)) => {
+            return ledger::load(root, &pending.change).map_err(|e| e.to_string());
+        }
+        Ok(None) => {}
+        Err(error) => return Err(format!("pending closure metadata is unreadable: {error}")),
+    }
+    let state = ledger::mpd_dir(root).join("state");
+    openspec_core::assert_contained(root, &state).map_err(|e| e.to_string())?;
+    let entries = std::fs::read_dir(&state)
+        .map_err(|e| format!("ledger state directory is unavailable: {e}"))?;
+    let mut candidates = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= 256 {
+            return Err("ledger state directory exceeds the 256-entry runtime cap".into());
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let entry_path = entry.path();
+        let Some(name) = entry_path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if openspec_core::validate_change_name(name).is_err() {
+            continue;
+        }
+        let candidate = ledger::load(root, name).map_err(|e| e.to_string())?;
+        let Some(closure) = candidate.archive_closure.as_ref() else {
+            continue;
+        };
+        if git::is_ancestor(root, &closure.base_commit, head).map_err(|e| e.to_string())?
+            == Some(true)
+        {
+            candidates.push((closure.archived_at, candidate));
+        }
+    }
+    candidates.sort_by_key(|(archived_at, _)| *archived_at);
+    let Some((latest_at, latest)) = candidates.pop() else {
+        return Err("no active, pending, or archived runtime ledger is available".into());
+    };
+    if candidates
+        .last()
+        .is_some_and(|(archived_at, _)| *archived_at == latest_at)
+    {
+        return Err("multiple archived ledgers are equally eligible for runtime-health".into());
+    }
+    Ok(latest)
+}
+
+/// Reopen and hash the declared installed artifact without executing it. The
+/// observation must match the recorded Build identity and the exact Deploy
+/// definition/result digest; readiness-only Deploy instead re-hashes its
+/// contained evidence file.
+fn doctor_installed_deploy_health(
+    root: &Path,
+    local: &crate::config::LocalValidationConfig,
+    ledger: &ledger::Ledger,
+) -> Result<(), String> {
+    let deploy = local
+        .deploy_output
+        .as_ref()
+        .ok_or("typed Deploy configuration is absent")?;
+    let record = ledger
+        .gates
+        .get(&Phase::Deploy)
+        .and_then(|gate| gate.deploy_result.as_ref())
+        .ok_or("typed Deploy record is absent")?;
+    if record.schema != 1 || !record.verified {
+        return Err("typed Deploy record is unsupported or unverified".into());
+    }
+    let definition = serde_json::to_vec(deploy).map_err(|e| e.to_string())?;
+    if digest::Digest::of_bytes(&definition).to_hex() != record.definition_digest {
+        return Err("Deploy record differs from the configured Deploy definition".into());
+    }
+    match deploy {
+        crate::config::DeployOutputConfig::Execute {
+            artifact,
+            installed_path,
+            target,
+            ..
+        } => {
+            if record.mode != "execute"
+                || record.target != *target
+                || !record.install_executed
+                || record.probe_executed
+            {
+                return Err("execute Deploy record has inconsistent effect state".into());
+            }
+            let contract = local
+                .build_output
+                .as_ref()
+                .ok_or("typed Build output configuration is absent")?;
+            let build = ledger
+                .gates
+                .get(&Phase::Build)
+                .and_then(|gate| gate.build_output.as_ref())
+                .ok_or("typed Build output record is absent")?;
+            if build.schema != 1
+                || build.size > build.max_bytes
+                || build.mode != build.required_mode
+                || build.name != *artifact
+                || build.name != contract.name
+                || build.path != contract.path
+                || build.max_bytes != contract.max_bytes
+                || build.required_mode != contract.required_mode
+            {
+                return Err("Build record differs from the configured artifact contract".into());
+            }
+            let installed = crate::local_validation::identity(root, installed_path)?;
+            if installed.size != build.size
+                || installed.mode != build.mode
+                || installed.sha256 != build.sha256
+            {
+                return Err(
+                    "installed path identity differs from the recorded Build output".into(),
+                );
+            }
+            let expected = serde_json::to_vec(&serde_json::json!({
+                "build_sha256": build.sha256,
+                "installed_sha256": installed.sha256,
+                "installed_size": installed.size,
+                "installed_mode": installed.mode,
+            }))
+            .map_err(|e| e.to_string())?;
+            if digest::Digest::of_bytes(&expected).to_hex() != record.result_digest {
+                return Err("installed path identity differs from the Deploy result digest".into());
+            }
+        }
+        crate::config::DeployOutputConfig::Readiness { evidence, target } => {
+            if record.mode != "readiness"
+                || record.target != *target
+                || record.install_executed
+                || record.probe_executed
+            {
+                return Err("readiness Deploy record has inconsistent effect state".into());
+            }
+            let bytes =
+                openspec_core::read_contained_capped(root, &root.join(evidence), 1024 * 1024)
+                    .map_err(|e| format!("readiness evidence is unavailable: {e}"))?;
+            if digest::Digest::of_bytes(bytes.as_bytes()).to_hex() != record.result_digest {
+                return Err("readiness evidence differs from the Deploy result digest".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runtime_doctor_findings(
+    root: &Path,
+    local: Option<&crate::config::LocalValidationConfig>,
+) -> (Vec<DoctorFinding>, Option<String>, bool) {
+    runtime_doctor_findings_with_receipt(root, local, |root, local, profile| {
+        crate::local_validation::doctor_runtime_receipt_health(root, local, profile)
+    })
+}
+
+fn runtime_doctor_findings_with_receipt(
+    root: &Path,
+    local: Option<&crate::config::LocalValidationConfig>,
+    receipt_observer: impl FnOnce(
+        &Path,
+        &crate::config::LocalValidationConfig,
+        &str,
+    ) -> Result<crate::local_validation::DoctorReceiptHealth, String>,
+) -> (Vec<DoctorFinding>, Option<String>, bool) {
+    let mut findings = Vec::new();
+    let head = resolve_runtime_head(root);
+    let subject = head.as_ref().ok().cloned();
+    findings.push(match &head {
+        Ok(head) => DoctorFinding {
+            code: "clean-resolved-head".into(),
+            severity: DoctorSeverity::Info,
+            component: "subject".into(),
+            state: "clean".into(),
+            message: format!("runtime-health resolved one clean exact HEAD {head}"),
+            fix: String::new(),
+        },
+        Err(message) => DoctorFinding {
+            code: "clean-resolved-head".into(),
+            severity: DoctorSeverity::Blocker,
+            component: "subject".into(),
+            state: "blocked".into(),
+            message: message.clone(),
+            fix: "commit or remove local changes, then issue a receipt for exact HEAD".into(),
+        },
+    });
+
+    let runtime_ledger = head.as_deref().map_or_else(
+        |_| Err("clean HEAD is unavailable".into()),
+        |head| resolve_runtime_ledger(root, head),
+    );
+    let receipt = match local {
+        Some(local) => {
+            let profile = match runtime_ledger.as_ref() {
+                Ok(ledger) if ledger.effective_risk() == RiskLevel::High => {
+                    &local.gates.high_risk_test
+                }
+                _ => &local.gates.test,
+            };
+            receipt_observer(root, local, profile)
+        }
+        None => Err("structured local_validation is absent".into()),
+    };
+    let receipt_subject = receipt
+        .as_ref()
+        .ok()
+        .map(|value| value.subject.commit.clone());
+    findings.push(match receipt {
+        Ok(health) if Some(health.subject.commit.as_str()) == subject.as_deref() => DoctorFinding {
+            code: "exact-head-required-receipt".into(),
+            severity: DoctorSeverity::Info,
+            component: "validation-receipt".into(),
+            state: "current".into(),
+            message: format!(
+                "required profile {} has current receipt {} for {}",
+                health.profile, health.receipt_id, health.subject.commit
+            ),
+            fix: String::new(),
+        },
+        Ok(health) => DoctorFinding {
+            code: "exact-head-required-receipt".into(),
+            severity: DoctorSeverity::Blocker,
+            component: "validation-receipt".into(),
+            state: "stale".into(),
+            message: format!(
+                "required receipt binds {} instead of resolved HEAD {}",
+                health.subject.commit,
+                subject.as_deref().unwrap_or("(unresolved)")
+            ),
+            fix: "run exact-HEAD local validation after policy health is restored".into(),
+        },
+        Err(message) => DoctorFinding {
+            code: "exact-head-required-receipt".into(),
+            severity: DoctorSeverity::Blocker,
+            component: "validation-receipt".into(),
+            state: "blocked".into(),
+            message,
+            fix: "run exact-HEAD local validation after policy health is restored".into(),
+        },
+    });
+
+    let mut coherent = false;
+    match runtime_ledger {
+        Ok(runtime_ledger) => {
+            findings.push(DoctorFinding {
+                code: "active-pending-ledger".into(),
+                severity: DoctorSeverity::Info,
+                component: "ledger".into(),
+                state: "readable".into(),
+                message: format!("ledger for change {} is readable", runtime_ledger.change),
+                fix: String::new(),
+            });
+            let deploy_record = runtime_ledger
+                .gates
+                .get(&Phase::Deploy)
+                .and_then(|gate| gate.deploy_result.as_ref());
+            findings.push(match deploy_record {
+                Some(result) if result.verified => DoctorFinding {
+                    code: "deploy-install-record".into(),
+                    severity: DoctorSeverity::Info,
+                    component: "deploy".into(),
+                    state: "observed".into(),
+                    message: format!("verified {} Deploy record is present", result.mode),
+                    fix: String::new(),
+                },
+                _ => DoctorFinding {
+                    code: "deploy-install-record".into(),
+                    severity: DoctorSeverity::Blocker,
+                    component: "deploy".into(),
+                    state: "blocked".into(),
+                    message: "no verified Deploy/install record is available".into(),
+                    fix: "complete the typed Deploy gate; doctor will not install or probe".into(),
+                },
+            });
+            findings.push(match local {
+                Some(local) => match doctor_installed_deploy_health(root, local, &runtime_ledger) {
+                    Ok(()) => DoctorFinding {
+                        code: "installed-path-identity".into(),
+                        severity: DoctorSeverity::Info,
+                        component: "installed-artifact".into(),
+                        state: "current".into(),
+                        message: "configured installed path matches Build and Deploy identity"
+                            .into(),
+                        fix: String::new(),
+                    },
+                    Err(message) => DoctorFinding {
+                        code: "installed-path-identity".into(),
+                        severity: DoctorSeverity::Blocker,
+                        component: "installed-artifact".into(),
+                        state: "blocked".into(),
+                        message,
+                        fix: "rerun typed Deploy; doctor will not install or execute identity"
+                            .into(),
+                    },
+                },
+                None => DoctorFinding {
+                    code: "installed-path-identity".into(),
+                    severity: DoctorSeverity::Blocker,
+                    component: "installed-artifact".into(),
+                    state: "blocked".into(),
+                    message: "structured local_validation is absent".into(),
+                    fix: "repair typed Deploy configuration".into(),
+                },
+            });
+            findings.push(match runtime_ledger.archive_closure.as_ref() {
+                Some(archive) => match closure::verify_commit_coherence(root, archive) {
+                    Ok(observation)
+                        if observation.coherent
+                            && observation.head.as_deref() == subject.as_deref()
+                            && receipt_subject.as_deref() == subject.as_deref() =>
+                    {
+                        coherent = true;
+                        DoctorFinding {
+                            code: "archived-closure-head-coherence".into(),
+                            severity: DoctorSeverity::Info,
+                            component: "closure".into(),
+                            state: "coherent".into(),
+                            message: format!(
+                                "archived closure and current receipt cohere with exact HEAD {}",
+                                subject.as_deref().unwrap_or_default()
+                            ),
+                            fix: String::new(),
+                        }
+                    }
+                    Ok(observation) => DoctorFinding {
+                        code: "archived-closure-head-coherence".into(),
+                        severity: DoctorSeverity::Blocker,
+                        component: "closure".into(),
+                        state: "blocked".into(),
+                        message: format!(
+                            "closure/HEAD/receipt incoherent: {}",
+                            observation.blockers.join(", ")
+                        ),
+                        fix: "restore the closure commit and issue a receipt for exact HEAD".into(),
+                    },
+                    Err(message) => DoctorFinding {
+                        code: "archived-closure-head-coherence".into(),
+                        severity: DoctorSeverity::Blocker,
+                        component: "closure".into(),
+                        state: "blocked".into(),
+                        message,
+                        fix: "repair the archive closure before validation or push".into(),
+                    },
+                },
+                None => DoctorFinding {
+                    code: "archived-closure-head-coherence".into(),
+                    severity: DoctorSeverity::Blocker,
+                    component: "closure".into(),
+                    state: "blocked".into(),
+                    message: "no archived closure record is available".into(),
+                    fix: "complete archive and create its coherent closure commit".into(),
+                },
+            });
+        }
+        Err(message) => {
+            for (code, component) in [
+                ("active-pending-ledger", "ledger"),
+                ("deploy-install-record", "deploy"),
+                ("installed-path-identity", "installed-artifact"),
+                ("archived-closure-head-coherence", "closure"),
+            ] {
+                findings.push(DoctorFinding {
+                    code: code.into(),
+                    severity: DoctorSeverity::Blocker,
+                    component: component.into(),
+                    state: "blocked".into(),
+                    message: format!("runtime state is unreadable: {message}"),
+                    fix: "repair the active, pending, or archived ledger state".into(),
+                });
+            }
+        }
+    }
+    (findings, subject, coherent)
+}
+
+fn doctor_expected_pending_remote(coherent: bool, findings: &[DoctorFinding]) -> bool {
+    coherent
+        && !findings
+            .iter()
+            .any(|finding| matches!(finding.severity, DoctorSeverity::Blocker))
+}
+
+fn cmd_scoped_doctor(scope: &str, json: bool, enforce: bool) -> CmdResult {
+    if !matches!(scope, "validator-policy" | "runtime-health") {
+        return Err("--scope must be validator-policy or runtime-health".into());
+    }
+    let root = find_root()?;
+    let (mut findings, local, static_subject) = static_doctor_findings(&root);
+    let mut included_checks = VALIDATOR_POLICY_CHECKS
+        .iter()
+        .map(|check| (*check).to_string())
+        .collect::<Vec<_>>();
+    let mut excluded_checks = VALIDATOR_POLICY_EXCLUSIONS
+        .iter()
+        .map(|check| (*check).to_string())
+        .collect::<Vec<_>>();
+    let mut resolved_subject = static_subject.map(|subject| subject.commit);
+    let mut expected_pending_remote = false;
+    if scope == "runtime-health" {
+        included_checks.extend(
+            [
+                "clean-resolved-head",
+                "exact-head-required-receipt",
+                "activation-observation",
+                "active-pending-ledger",
+                "deploy-install-record",
+                "installed-path-identity",
+                "archived-closure-head-coherence",
+                "expected-pending-remote-state",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        excluded_checks.retain(|check| {
+            check != "current-subject-receipt"
+                && check != "deploy-install-record"
+                && check != "installed-path-identity"
+        });
+        let (runtime, subject, coherent) = runtime_doctor_findings(&root, local.as_ref());
+        resolved_subject = subject.or(resolved_subject);
+        findings.extend(runtime);
+        expected_pending_remote = doctor_expected_pending_remote(coherent, &findings);
+        if expected_pending_remote {
+            findings.push(DoctorFinding {
+                code: "remote-parity".into(),
+                severity: DoctorSeverity::Info,
+                component: "remote-parity".into(),
+                state: "expected_pending_remote".into(),
+                message: "local closure is coherent; fresh remote parity remains an explicit later observation".into(),
+                fix: String::new(),
+            });
+        }
+    }
+    let blocked = findings
+        .iter()
+        .any(|finding| matches!(finding.severity, DoctorSeverity::Blocker));
+    let report = ScopedDoctorReport {
+        schema: 1,
+        scope: scope.into(),
+        included_checks,
+        excluded_checks,
+        resolved_subject,
+        findings,
+        effects: DoctorEffectCounts::default(),
+        status: if blocked {
+            "blocked".into()
+        } else if expected_pending_remote {
+            "expected_pending_remote".into()
+        } else {
+            "pass".into()
+        },
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("mpd doctor --scope {scope} (read-only)");
+        println!(
+            "  resolved subject: {}",
+            report.resolved_subject.as_deref().unwrap_or("(unresolved)")
+        );
+        println!("  included checks: {}", report.included_checks.join(", "));
+        println!("  excluded checks: {}", report.excluded_checks.join(", "));
+        println!(
+            "  effects: validation={} install={} identity-probe={} remote={}",
+            report.effects.configured_validation,
+            report.effects.install,
+            report.effects.identity_probe,
+            report.effects.remote
+        );
+        for finding in report
+            .findings
+            .iter()
+            .filter(|finding| matches!(finding.severity, DoctorSeverity::Blocker))
+        {
+            println!("  BLOCKED [{}] {}", finding.code, finding.message);
+        }
+    }
+    if enforce && blocked {
+        eprintln!("doctor --scope {scope} blocked; inspect typed findings for repairs");
+        return Ok(3);
+    }
+    Ok(0)
+}
+
+fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> CmdResult {
+    if let Some(scope) = scope {
+        if fix {
+            return Err("--scope cannot be combined with --fix".into());
+        }
+        return cmd_scoped_doctor(&scope, json, enforce);
+    }
+    if enforce {
+        return Err("--enforce requires --scope validator-policy|runtime-health".into());
+    }
     let root = find_root().ok();
     if fix {
         // `--fix` performs the one add-only gitignore write and reports it; the
@@ -3553,11 +7389,13 @@ fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
         .unwrap_or(false);
     let gitleaks = checks::tool_available("gitleaks");
     let semgrep = checks::tool_available("semgrep");
-    let test_cmd = root.as_ref().map(|r| Config::load(r).test).unwrap_or(None);
-    let deploy_cmd = root
+    let configured = root.as_ref().map(|r| Config::load(r));
+    let test_cmd = configured.as_ref().and_then(|c| c.test.clone());
+    let deploy_cmd = configured.as_ref().and_then(|c| c.deploy.clone());
+    let local_validation = configured
         .as_ref()
-        .map(|r| Config::load(r).deploy)
-        .unwrap_or(None);
+        .and_then(|c| c.local_validation.as_ref());
+    let local_validation_status = local_validation.map(|v| v.validate());
     let allow_entries = root.as_ref().map_or(0, |r| {
         let al = crate::allowlist::Allowlist::load(r);
         al.paths.len() + al.allow.len()
@@ -3579,7 +7417,7 @@ fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
         .and_then(|r| Config::load(r).hermetic_reuse_policy().cloned())
         .map(|p| p.is_complete())
         .unwrap_or(false);
-    let closure_cfg = root.as_ref().map(|r| Config::load(r));
+    let closure_cfg = configured;
     let closure_default_remote = closure_cfg
         .as_ref()
         .and_then(|c| c.closure.as_ref())
@@ -3607,6 +7445,11 @@ fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
             "semgrep": semgrep,
             "test_command": test_cmd,
             "deploy_command": deploy_cmd,
+            "local_validation": match local_validation_status.as_ref() {
+                None => serde_json::json!({"configured":false,"migration_blocker":"structured local_validation is absent; legacy test is compatibility-only"}),
+                Some(Ok(())) => serde_json::json!({"configured":true,"valid":true}),
+                Some(Err(error)) => serde_json::json!({"configured":true,"valid":false,"error":error}),
+            },
             "allowlist_entries": allow_entries,
             "current_change": current,
             "pending_closure": pending_closure.as_ref().map(|v| serde_json::json!({"change":v.change,"stage":stage_label(v.stage),"write_eligible":v.write_eligible})),
@@ -3711,12 +7554,522 @@ fn cmd_doctor(json: bool, fix: bool) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_documentation, check_sections, extract_section, has_unfilled_placeholder,
-        parse_exploit, strict_gate_command, upstream_artifact_pointers, validate_evidence,
+        canonical_artifact_actor, canonical_artifact_verdict, check_documentation, check_sections,
+        current_validation_status, doctor_expected_pending_remote, doctor_installed_deploy_health,
+        extract_section, has_unfilled_placeholder, parse_exploit, receipt_failure_fact,
+        resolve_runtime_head, resolve_runtime_ledger, retained_candidate_for_objective_gate,
+        runtime_doctor_findings_with_receipt, sandbox_blocker, strict_actor_separation_issue,
+        strict_gate_command, upstream_artifact_pointers, validate_evidence, WorkflowOutcome,
         REQUIRED_DOC_SECTIONS,
     };
+    use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, Verdict};
     use crate::phase::{Applicability, Phase};
     use proptest::prelude::*;
+    use std::process::Command;
+
+    fn doctor_test_dir(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-doctor-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn doctor_gate_record() -> GateRecord {
+        GateRecord {
+            verdict: Verdict::Pass,
+            by: "fixture".into(),
+            evidence: None,
+            checks: Some(CheckSummary::default()),
+            at: "2026-01-01".into(),
+            failure_class: None,
+            exploitability: None,
+            attempt: 1,
+            started_at_epoch_secs: 1,
+            completed_at_epoch_secs: 2,
+            receipt: None,
+            persona_tuning: None,
+            candidate: None,
+            build_output: None,
+            deploy_result: None,
+            validation_receipt: None,
+        }
+    }
+
+    fn candidate_capture(id: char) -> crate::candidate::CandidateCapture {
+        crate::candidate::CandidateCapture {
+            subject: crate::candidate::CandidateSubject {
+                version: 1,
+                change: "candidate-chain".into(),
+                base_commit: "a".repeat(40),
+                base_tree: "b".repeat(40),
+                manifest_digest: "c".repeat(64),
+                entries_digest: "d".repeat(64),
+                policy_digest: "e".repeat(64),
+                source_digest: "f".repeat(64),
+                id: id.to_string().repeat(64),
+            },
+            clone_private_root: "/private/candidate".into(),
+            storage: crate::candidate::CandidateStorageBinding {
+                record_path: "/private/candidate.json".into(),
+                record_sha256: "1".repeat(64),
+                root_device: 1,
+                root_inode: 2,
+                record_device: 1,
+                record_inode: 3,
+            },
+            counts: crate::candidate::CandidateCounts::default(),
+            excluded_dirty_digest: "2".repeat(64),
+            excluded_dirty_sample: Vec::new(),
+            declared_status_digest: "3".repeat(64),
+            captured_at_epoch_secs: 1,
+        }
+    }
+
+    fn candidate_output(id: &str) -> crate::ledger::BuildOutputV1 {
+        crate::ledger::BuildOutputV1 {
+            schema: 1,
+            name: "mpd".into(),
+            path: ".mpd/build-output/mpd".into(),
+            max_bytes: 1024,
+            required_mode: 0o755,
+            size: 1,
+            mode: 0o755,
+            device: 1,
+            inode: 2,
+            sha256: "4".repeat(64),
+            candidate_id: Some(id.into()),
+        }
+    }
+
+    #[test]
+    fn strict_objective_gates_require_one_candidate_id() {
+        let capture = candidate_capture('5');
+        let mut ledger =
+            ledger::Ledger::new("candidate-chain", "mpd", false, ledger::ChangeKind::Fix);
+        ledger.strict = true;
+        ledger
+            .record(Phase::Architecture, doctor_gate_record())
+            .unwrap();
+        ledger
+            .record(Phase::SecurityPlan, doctor_gate_record())
+            .unwrap();
+        let mut build = doctor_gate_record();
+        build.candidate = Some(capture.clone());
+        build.build_output = Some(candidate_output(&capture.subject.id));
+        ledger.record(Phase::Build, build).unwrap();
+
+        let security_capture =
+            retained_candidate_for_objective_gate(&ledger, "candidate-chain", Phase::SecurityCode)
+                .unwrap();
+        assert_eq!(security_capture.subject.id, capture.subject.id);
+        let mut security = doctor_gate_record();
+        security.candidate = Some(security_capture);
+        ledger.record(Phase::SecurityCode, security).unwrap();
+
+        let test_capture =
+            retained_candidate_for_objective_gate(&ledger, "candidate-chain", Phase::Test).unwrap();
+        assert_eq!(test_capture.subject.id, capture.subject.id);
+        let mut test = doctor_gate_record();
+        test.candidate = Some(test_capture);
+        ledger.record(Phase::Test, test).unwrap();
+
+        let ids = [Phase::Build, Phase::SecurityCode, Phase::Test].map(|phase| {
+            ledger.gates[&phase]
+                .candidate
+                .as_ref()
+                .unwrap()
+                .subject
+                .id
+                .clone()
+        });
+        assert!(ids.iter().all(|id| id == &capture.subject.id));
+
+        let mut mismatched = ledger.clone();
+        mismatched
+            .gates
+            .get_mut(&Phase::SecurityCode)
+            .unwrap()
+            .candidate = Some(candidate_capture('6'));
+        assert!(
+            retained_candidate_for_objective_gate(&mismatched, "candidate-chain", Phase::Test)
+                .unwrap_err()
+                .contains("bindings differ")
+        );
+    }
+
+    #[test]
+    fn runtime_ledger_resolves_archived_state_after_current_clears_and_requires_clean_head() {
+        let root = doctor_test_dir("archived-ledger");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("base"), b"base\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "base"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Doctor Test",
+                "-c",
+                "user.email=doctor@invalid",
+                "commit",
+                "-qm",
+                "base",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let base = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let mut archived =
+            ledger::Ledger::new("archived-change", "mpd", false, ledger::ChangeKind::Fix);
+        archived.archive_closure = Some(crate::closure::ArchiveClosure {
+            base_commit: base,
+            archive_path: "openspec/changes/archive/archived-change".into(),
+            transaction_id: crate::digest::Digest::of_bytes(b"doctor-transaction"),
+            candidate_id: None,
+            allowed_paths: vec![".mpd/state/archived-change.json".into()],
+            system_paths: vec![".mpd/state/archived-change.json".into()],
+            post_archive_digest: crate::digest::Digest::of_bytes(b"doctor-postimage"),
+            archived_at: 10,
+        });
+        ledger::save(&root, &archived).unwrap();
+        assert!(Command::new("git")
+            .args(["add", ".mpd/state/archived-change.json"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Doctor Test",
+                "-c",
+                "user.email=doctor@invalid",
+                "commit",
+                "-qm",
+                "archived ledger",
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(!ledger::current_path(&root).exists());
+        let head = resolve_runtime_head(&root).unwrap();
+        assert_eq!(
+            resolve_runtime_ledger(&root, &head).unwrap().change,
+            "archived-change"
+        );
+        std::fs::write(root.join("dirty"), b"dirty\n").unwrap();
+        assert!(resolve_runtime_head(&root).unwrap_err().contains("dirty"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reopens_installed_path_and_blocks_mismatch_or_absence_without_probe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = doctor_test_dir("installed-identity");
+        let config: crate::config::Config =
+            serde_json::from_str(include_str!("../../../.mpd/config.json")).unwrap();
+        let local = config.local_validation.unwrap();
+        let build_contract = local.build_output.as_ref().unwrap();
+        let deploy = local.deploy_output.as_ref().unwrap();
+        let (installed_path, target) = match deploy {
+            crate::config::DeployOutputConfig::Execute {
+                installed_path,
+                target,
+                ..
+            } => (installed_path, target),
+            _ => panic!("repository fixture uses execute Deploy"),
+        };
+        for relative in [&build_contract.path, installed_path] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"same reviewed installed bytes\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let build = crate::local_validation::capture_configured_build_output(&root, build_contract)
+            .unwrap();
+        let installed = crate::local_validation::identity(&root, installed_path).unwrap();
+        let definition = serde_json::to_vec(deploy).unwrap();
+        let result = serde_json::to_vec(&serde_json::json!({
+            "build_sha256": build.sha256,
+            "installed_sha256": installed.sha256,
+            "installed_size": installed.size,
+            "installed_mode": installed.mode,
+        }))
+        .unwrap();
+        let mut ledger =
+            ledger::Ledger::new("installed-doctor", "mpd", false, ledger::ChangeKind::Fix);
+        let mut build_gate = doctor_gate_record();
+        build_gate.build_output = Some(build);
+        ledger.gates.insert(Phase::Build, build_gate);
+        let mut deploy_gate = doctor_gate_record();
+        deploy_gate.deploy_result = Some(ledger::DeployResultV1 {
+            schema: 1,
+            mode: "execute".into(),
+            target: target.clone(),
+            definition_digest: crate::digest::Digest::of_bytes(&definition).to_hex(),
+            result_digest: crate::digest::Digest::of_bytes(&result).to_hex(),
+            install_executed: true,
+            probe_executed: false,
+            verified: true,
+        });
+        ledger.gates.insert(Phase::Deploy, deploy_gate);
+
+        doctor_installed_deploy_health(&root, &local, &ledger).unwrap();
+        std::fs::write(
+            root.join(installed_path),
+            b"same length but altered bytes\n",
+        )
+        .unwrap();
+        assert!(doctor_installed_deploy_health(&root, &local, &ledger)
+            .unwrap_err()
+            .contains("installed path identity"));
+        std::fs::remove_file(root.join(installed_path)).unwrap();
+        assert!(doctor_installed_deploy_health(&root, &local, &ledger).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_health_composes_closure_head_receipt_and_deploy_before_pending_remote() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = doctor_test_dir("coherent-runtime");
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(
+            root.join(".gitignore"),
+            ".mpd/state/\n.mpd/build-output/\n.mpd/local/\n",
+        )
+        .unwrap();
+        assert!(Command::new("git")
+            .args(["add", ".gitignore"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let commit = |message: &str| {
+            assert!(Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Doctor Test",
+                    "-c",
+                    "user.email=doctor@invalid",
+                    "commit",
+                    "-qm",
+                    message,
+                ])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        };
+        commit("runtime base");
+        let oid = || {
+            String::from_utf8(
+                Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&root)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        let base = oid();
+        std::fs::write(root.join("artifact.txt"), b"archived postimage\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "artifact.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        commit("closure commit");
+        let head = oid();
+        let allowed = vec!["artifact.txt".to_string()];
+        let postimage = crate::closure::scoped_digest_for_patterns(&root, &allowed).unwrap();
+
+        let config: crate::config::Config =
+            serde_json::from_str(include_str!("../../../.mpd/config.json")).unwrap();
+        let local = config.local_validation.unwrap();
+        let build_contract = local.build_output.as_ref().unwrap();
+        let deploy = local.deploy_output.as_ref().unwrap();
+        let (installed_path, target) = match deploy {
+            crate::config::DeployOutputConfig::Execute {
+                installed_path,
+                target,
+                ..
+            } => (installed_path, target),
+            _ => panic!("repository fixture uses execute Deploy"),
+        };
+        for relative in [&build_contract.path, installed_path] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"coherent runtime binary\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let build = crate::local_validation::capture_configured_build_output(&root, build_contract)
+            .unwrap();
+        let installed = crate::local_validation::identity(&root, installed_path).unwrap();
+        let definition = serde_json::to_vec(deploy).unwrap();
+        let result = serde_json::to_vec(&serde_json::json!({
+            "build_sha256": build.sha256,
+            "installed_sha256": installed.sha256,
+            "installed_size": installed.size,
+            "installed_mode": installed.mode,
+        }))
+        .unwrap();
+        let mut runtime_ledger =
+            ledger::Ledger::new("runtime-closure", "mpd", false, ledger::ChangeKind::Fix);
+        runtime_ledger.governance.risk = ledger::RiskLevel::High;
+        runtime_ledger.archive_closure = Some(crate::closure::ArchiveClosure {
+            base_commit: base,
+            archive_path: "openspec/changes/archive/runtime-closure".into(),
+            transaction_id: crate::digest::Digest::of_bytes(b"runtime-transaction"),
+            candidate_id: None,
+            allowed_paths: allowed.clone(),
+            system_paths: allowed,
+            post_archive_digest: postimage,
+            archived_at: 20,
+        });
+        let mut build_gate = doctor_gate_record();
+        build_gate.build_output = Some(build);
+        runtime_ledger.gates.insert(Phase::Build, build_gate);
+        let mut deploy_gate = doctor_gate_record();
+        deploy_gate.deploy_result = Some(ledger::DeployResultV1 {
+            schema: 1,
+            mode: "execute".into(),
+            target: target.clone(),
+            definition_digest: crate::digest::Digest::of_bytes(&definition).to_hex(),
+            result_digest: crate::digest::Digest::of_bytes(&result).to_hex(),
+            install_executed: true,
+            probe_executed: false,
+            verified: true,
+        });
+        runtime_ledger.gates.insert(Phase::Deploy, deploy_gate);
+        ledger::save(&root, &runtime_ledger).unwrap();
+        let tree = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD^{tree}"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let health = |commit: String| crate::local_validation::DoctorReceiptHealth {
+            subject: crate::local_validation::Subject {
+                requested: "HEAD".into(),
+                pushed_oid: commit.clone(),
+                pushed_kind: "commit".into(),
+                tag_chain: Vec::new(),
+                commit,
+                tree: tree.clone(),
+            },
+            receipt_id: "f".repeat(64),
+            profile: local.gates.high_risk_test.clone(),
+            sandbox: crate::local_validation::SandboxReceiptBindingV1 {
+                contract_version: 1,
+                adapter_digest: "a".repeat(64),
+                profile_digest: "b".repeat(64),
+                environment_keys: Vec::new(),
+                certified_host: "fixture-host".into(),
+                adapter_abi_digest: "c".repeat(64),
+                canary_contract_digest: "d".repeat(64),
+                residual_limitations: Vec::new(),
+                run_request_digests: Vec::new(),
+                run_authority_digests: Vec::new(),
+                run_root_inventory_digests: Vec::new(),
+                run_canary_digests: Vec::new(),
+            },
+            results: Vec::new(),
+        };
+
+        let (findings, subject, coherent) =
+            runtime_doctor_findings_with_receipt(&root, Some(&local), |_, _, profile| {
+                assert_eq!(profile, local.gates.high_risk_test);
+                Ok(health(head.clone()))
+            });
+        assert_eq!(subject.as_deref(), Some(head.as_str()));
+        assert!(coherent);
+        assert!(doctor_expected_pending_remote(coherent, &findings));
+        assert!(findings
+            .iter()
+            .all(|finding| !matches!(finding.severity, super::DoctorSeverity::Blocker)));
+
+        let (stale, _, coherent) =
+            runtime_doctor_findings_with_receipt(&root, Some(&local), |_, _, _| {
+                Ok(health("a".repeat(40)))
+            });
+        assert!(!doctor_expected_pending_remote(coherent, &stale));
+        assert!(stale
+            .iter()
+            .any(|finding| finding.code == "exact-head-required-receipt"
+                && matches!(finding.severity, super::DoctorSeverity::Blocker)));
+
+        let (missing, _, coherent) =
+            runtime_doctor_findings_with_receipt(&root, Some(&local), |_, _, _| {
+                Err("required exact-HEAD receipt is Missing".into())
+            });
+        assert!(!doctor_expected_pending_remote(coherent, &missing));
+
+        std::fs::write(root.join("outside.txt"), b"out of closure scope\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "outside.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        commit("out-of-scope closure mismatch");
+        let moved_head = oid();
+        let (mismatch, _, coherent) =
+            runtime_doctor_findings_with_receipt(&root, Some(&local), |_, _, _| {
+                Ok(health(moved_head))
+            });
+        assert!(!coherent);
+        assert!(!doctor_expected_pending_remote(coherent, &mismatch));
+        assert!(mismatch.iter().any(|finding| {
+            finding.code == "archived-closure-head-coherence"
+                && matches!(finding.severity, super::DoctorSeverity::Blocker)
+        }));
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn extract_section_captures_body_to_next_h2_and_is_bounded() {
@@ -3763,6 +8116,142 @@ mod tests {
     }
 
     #[test]
+    fn canonical_artifact_verdict_requires_one_exact_token() {
+        assert_eq!(
+            canonical_artifact_verdict("## Verdict\n\nPASS\n\nRationale follows.\n").unwrap(),
+            Verdict::Pass
+        );
+        assert_eq!(
+            canonical_artifact_verdict("## Verdict\nCONDITIONAL PASS\n").unwrap(),
+            Verdict::ConditionalPass
+        );
+        assert!(canonical_artifact_verdict("## Verdict\nPASS — prose\n").is_err());
+        assert!(canonical_artifact_verdict("## Verdict\n\nPASS\n\n## Verdict\n\nPASS\n").is_err());
+        assert!(canonical_artifact_verdict("## Verdict\n\npass\n").is_err());
+    }
+
+    #[test]
+    fn canonical_actor_is_exact_and_same_actor_is_blocked_cooperatively() {
+        assert_eq!(
+            canonical_artifact_actor("## Actor\n\nSecurity reviewer 2\n\n## Verdict\nPASS\n")
+                .unwrap(),
+            "Security reviewer 2"
+        );
+        assert!(canonical_artifact_actor("## Actor\nA\nB\n").is_err());
+        assert!(canonical_artifact_actor("## Actor\nA\n## Actor\nA\n").is_err());
+
+        let mut ledger = ledger::Ledger::new("actors", "mpd", true, ChangeKind::Feature);
+        ledger.strict = true;
+        let mut prior = doctor_gate_record();
+        prior.by = "same-session".into();
+        ledger.gates.insert(Phase::DesignMock, prior);
+        assert!(
+            strict_actor_separation_issue(&ledger, Phase::Architecture, "same-session")
+                .unwrap()
+                .contains("matches")
+        );
+        assert!(
+            strict_actor_separation_issue(&ledger, Phase::Architecture, "architect-session")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_outcomes_receipt_states_and_sandbox_actions_are_canonical() {
+        let outcomes = [
+            WorkflowOutcome::Pass,
+            WorkflowOutcome::Fail,
+            WorkflowOutcome::Blocked,
+            WorkflowOutcome::Conditional,
+            WorkflowOutcome::Stale,
+            WorkflowOutcome::InProgress,
+            WorkflowOutcome::NotRun,
+        ];
+        assert_eq!(
+            serde_json::to_value(outcomes).unwrap(),
+            serde_json::json!([
+                "PASS",
+                "FAIL",
+                "BLOCKED",
+                "CONDITIONAL",
+                "STALE",
+                "IN PROGRESS",
+                "NOT RUN"
+            ])
+        );
+        assert_eq!(receipt_failure_fact("no receipt exists").state, "MISSING");
+        assert_eq!(receipt_failure_fact("receipt failed").state, "FAILED");
+        assert_eq!(receipt_failure_fact("receipt is stale").state, "STALE");
+        assert_eq!(receipt_failure_fact("malformed input").state, "BLOCKED");
+
+        let cases = [
+            ("host changed", "sandbox.host-drift"),
+            ("sandbox ABI symbol changed", "sandbox.spi-abi-drift"),
+            ("profile digest changed", "sandbox.profile-drift"),
+            ("root inventory changed", "sandbox.root-drift"),
+            ("canary denied unexpectedly", "sandbox.canary-failed"),
+            (
+                "required receipt missing",
+                "sandbox.full-profile-incomplete",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let (code, action) = sandbox_blocker(error);
+            assert_eq!(code, expected_code);
+            assert!(!action.is_empty());
+            assert!(
+                !action.contains(" or "),
+                "blocker action must offer one path"
+            );
+        }
+        assert_eq!(
+            sandbox_blocker("unclassified fault").0,
+            "sandbox.spi-abi-drift"
+        );
+
+        let canary = "a".repeat(64);
+        let sandbox = crate::local_validation::SandboxReceiptBindingV1 {
+            contract_version: 1,
+            adapter_digest: "b".repeat(64),
+            profile_digest: "c".repeat(64),
+            environment_keys: vec!["PATH".into()],
+            certified_host: "macOS fixture".into(),
+            adapter_abi_digest: "d".repeat(64),
+            canary_contract_digest: canary.clone(),
+            residual_limitations: vec!["fixture limitation".into()],
+            run_request_digests: vec!["e".repeat(64)],
+            run_authority_digests: vec!["f".repeat(64)],
+            run_root_inventory_digests: vec!["1".repeat(64)],
+            run_canary_digests: vec![canary],
+        };
+        let results = vec![crate::local_validation::ValidationCheckResult {
+            name: "check".into(),
+            kind: "SelfCheck".into(),
+            outcome: "passed".into(),
+            exit: Some(0),
+            count: Some(1),
+            duration_millis: 1,
+            log_digest: "2".repeat(64),
+        }];
+        let (validation, containment) =
+            current_validation_status("build", "receipt", &sandbox, &results, "passed", false);
+        assert_eq!(validation.outcome, WorkflowOutcome::Pass);
+        assert_eq!(containment.adapter, "CERTIFIED");
+        assert_eq!(containment.full_local_profile, "NOT CERTIFIED");
+        assert_eq!(
+            containment.blocker_code.as_deref(),
+            Some("sandbox.full-profile-incomplete")
+        );
+
+        let (validation, containment) =
+            current_validation_status("test", "receipt", &sandbox, &results, "passed", true);
+        assert_eq!(validation.outcome, WorkflowOutcome::Pass);
+        assert_eq!(containment.full_local_profile, "CERTIFIED");
+        assert_eq!(containment.certified_claim, "CERTIFIED");
+        assert!(containment.blocker_code.is_none());
+    }
+
+    #[test]
     fn upstream_pointers_resolve_artifacts_and_honor_applicability() {
         // Security (code) reads the plan; the pointer is security-plan.md.
         let ptrs = upstream_artifact_pointers(
@@ -3773,10 +8262,8 @@ mod tests {
             },
         );
         assert_eq!(ptrs, vec![("Security (plan)", "security-plan.md")]);
-        // Design Sign-off's upstream is DesignMock (no judgment artifact →
-        // skipped) and Design Review (design-review.md). With ui=false BOTH are
-        // inapplicable design phases, so nothing resolves; with ui=true only the
-        // Design Review artifact shows (DesignMock has none).
+        // Design Sign-off's upstream includes both canonical design artifacts.
+        // With ui=false both are inapplicable; with ui=true both resolve.
         let no_ui = upstream_artifact_pointers(
             Phase::DesignSignoff,
             Applicability {
@@ -3792,7 +8279,13 @@ mod tests {
                 docs: false,
             },
         );
-        assert_eq!(with_ui, vec![("Design Review", "design-review.md")]);
+        assert_eq!(
+            with_ui,
+            vec![
+                ("Design Mock", "design-mock.md"),
+                ("Design Review", "design-review.md")
+            ]
+        );
     }
 
     #[test]

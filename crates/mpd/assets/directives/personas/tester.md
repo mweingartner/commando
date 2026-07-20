@@ -15,3 +15,8 @@ Directives:
   verification** — confirm the runner actually executed tests; measure adequacy
   (coverage/mutation) where configured, not just green-count.
 - Investigate every failure; a red suite blocks.
+- For structured local validation, run the governance-selected `test` or
+  `high-risk-test` profile and verify locked tools, offline inputs, sandbox/resource/
+  cleanup behavior, composite receipts, fresh outgoing-object authorization, scoped
+  doctor exclusions, and the nonrecursive Build-to-Deploy-to-identity chain. A hosted
+  result cannot replace local evidence.

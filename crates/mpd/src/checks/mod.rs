@@ -70,14 +70,6 @@ pub fn run_external_scanners(root: &Path) -> ExternalScan {
     scan
 }
 
-/// Files staged for commit (`ACMR` filter), as absolute paths that still exist.
-pub fn git_staged_files(root: &Path) -> Vec<PathBuf> {
-    git_files(
-        root,
-        &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-    )
-}
-
 /// All git-tracked files, as absolute paths.
 pub fn git_tracked_files(root: &Path) -> Vec<PathBuf> {
     git_files(root, &["ls-files"])
@@ -117,5 +109,88 @@ pub fn scan_secrets(paths: &[PathBuf]) -> SecretReport {
     SecretReport {
         scanner: "builtin",
         findings,
+    }
+}
+
+/// Scan exactly the staged index postimages, never the possibly-different
+/// working-tree files. This is the fast pre-commit authority: Git plumbing is
+/// read-only and a malformed path/blob makes the caller fail closed.
+pub fn scan_staged_postimages(root: &Path) -> Result<SecretReport, String> {
+    let mut findings = Vec::new();
+    for entry in crate::git::diff_cached_name_status(root)
+        .map_err(|e| format!("cannot enumerate staged postimages: {e}"))?
+    {
+        if !matches!(entry.status, 'A' | 'C' | 'M' | 'R' | 'T') {
+            continue;
+        }
+        let path = entry.path;
+        crate::digest::validate_canonical_path(&path)
+            .map_err(|_| "unsafe staged path".to_string())?;
+        let path_buf = Path::new(&path);
+        if let Some(rule) = secrets::suspicious_filename(path_buf) {
+            findings.push(secrets::Finding {
+                path: path.clone(),
+                line: 0,
+                rule,
+            });
+        }
+        let blob = crate::git::staged_blob(root, &path)
+            .map_err(|_| "cannot read bounded staged postimage".to_string())?;
+        if let Ok(text) = std::str::from_utf8(&blob) {
+            findings.extend(secrets::scan_text(&path, text));
+        }
+    }
+    Ok(SecretReport {
+        scanner: "builtin-staged",
+        findings,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn staged_scan_reads_index_postimage_not_dirty_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-staged-scan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(root.join("input.txt"), "safe staged bytes\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "input.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(
+            root.join("input.txt"),
+            "token = \"abc123abc123abc123abc123\"\n",
+        )
+        .unwrap();
+        let report = scan_staged_postimages(&root).unwrap();
+        assert!(
+            report.findings.is_empty(),
+            "dirty worktree bytes must be excluded"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

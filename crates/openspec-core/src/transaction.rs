@@ -2240,7 +2240,7 @@ mod tests {
         prepare(dir.path(), &plan, &contents).unwrap();
         let jpath = journal_path(dir.path(), plan.id);
         let mut bytes = fs::read(&jpath).unwrap();
-        bytes.extend(std::iter::repeat(b' ').take((MAX_JOURNAL_BYTES as usize) + 1));
+        bytes.extend(std::iter::repeat_n(b' ', (MAX_JOURNAL_BYTES as usize) + 1));
         fs::write(&jpath, bytes).unwrap();
         let err = drive(dir.path()).unwrap_err();
         assert!(matches!(err, TransactionError::Corrupt(_)));

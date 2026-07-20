@@ -1,0 +1,12 @@
+#!/bin/sh
+# Git supplies remote name and location as two arguments; stdin is forwarded
+# byte-for-byte to the Rust coordinator, which owns protocol parsing.
+if ! command -v mpd >/dev/null 2>&1; then
+  echo "mpd: pre-push blocked; approved coordinator is unavailable" >&2
+  exit 1
+fi
+if [ "$#" -ne 2 ]; then
+  echo "mpd: pre-push blocked; Git did not supply remote arguments" >&2
+  exit 1
+fi
+exec mpd hook pre-push "$1" "$2"

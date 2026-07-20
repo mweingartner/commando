@@ -5,9 +5,10 @@
 //! phase state machine, durable gate ledger, deterministic checks, and a
 //! harness-agnostic `next` brief. No Node runtime dependency.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod allowlist;
+pub mod candidate;
 mod checks;
 mod cli;
 mod closure;
@@ -18,9 +19,13 @@ mod git;
 mod githooks;
 mod harness;
 mod ledger;
+mod local_validation;
 mod pathmatch;
 mod personas;
 mod phase;
+mod sandbox;
+#[cfg(target_os = "macos")]
+mod sandbox_macos;
 mod scaffold;
 
 use std::process::ExitCode;

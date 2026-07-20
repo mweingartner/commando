@@ -5,6 +5,7 @@
 
 use openspec_core::project::empty_spec;
 use openspec_core::{CoreError, Project};
+use proptest::prelude::*;
 use std::path::PathBuf;
 
 /// A unique temp directory for one test.
@@ -117,6 +118,121 @@ fn task_status_malformed_brackets_are_not_counted() {
     let status = project.task_status("c").unwrap();
     assert_eq!(status.total, 1);
     assert_eq!(status.done, 0);
+}
+
+#[test]
+fn strict_task_plan_rejects_duplicate_alias_unicode_and_overflow_ids() {
+    let sb = Sandbox::new("strict-invalid");
+    let project = Project::new(&sb.dir);
+    for (name, body, needle) in [
+        (
+            "duplicate",
+            "Every box is required and has a stable ID.\n- [ ] 1.1 first\n- [ ] 1.1 second\n",
+            "duplicate task id",
+        ),
+        (
+            "alias",
+            "Every box is required and has a stable ID.\n- [ ] 01.1 alias\n",
+            "canonical ASCII",
+        ),
+        (
+            "unicode",
+            "Every box is required and has a stable ID.\n- [ ] １.1 unicode\n",
+            "canonical ASCII",
+        ),
+        (
+            "overflow",
+            "Every box is required and has a stable ID.\n- [ ] 4294967296.1 too-large\n",
+            "canonical ASCII",
+        ),
+    ] {
+        sb.write(&format!("openspec/changes/{name}/tasks.md"), body);
+        let error = project.task_plan(name).unwrap_err();
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+}
+
+#[test]
+fn strict_task_plan_ignores_fences_and_exposes_open_ids() {
+    let sb = Sandbox::new("strict-valid");
+    sb.write(
+        "openspec/changes/c/tasks.md",
+        "Every box is required and has a stable ID.\n\
+         - [x] 1.1 finished\n\
+         ```markdown\n\
+         - [ ] 99.1 example only\n\
+         ```\n\
+         - [ ] 2.3 pending\n",
+    );
+    let plan = Project::new(&sb.dir).task_plan("c").unwrap();
+    assert!(plan.strict);
+    assert_eq!(plan.entries.len(), 2);
+    assert_eq!(plan.open_ids(), vec!["2.3"]);
+    assert!(!plan.complete());
+}
+
+#[test]
+fn strict_task_plan_ignores_commented_checkbox_aliases() {
+    let sb = Sandbox::new("strict-commented");
+    sb.write(
+        "openspec/changes/c/tasks.md",
+        "Every box is required and has a stable ID.\n<!--\n- [ ] 1.1 hidden\n-->\n- [ ] 2.1 real\n",
+    );
+    let plan = Project::new(&sb.dir).task_plan("c").unwrap();
+    assert_eq!(plan.open_ids(), vec!["2.1"]);
+}
+
+#[test]
+fn legacy_task_plan_is_readable_without_stable_id_contract() {
+    let sb = Sandbox::new("legacy-plan");
+    sb.write("openspec/changes/c/tasks.md", "- [ ] old task\n");
+    let plan = Project::new(&sb.dir).task_plan("c").unwrap();
+    assert!(!plan.strict);
+    assert!(plan.entries.is_empty());
+    assert!(plan.complete());
+}
+
+proptest! {
+    /// Stable task targeting is tied to the normalized full record, not the
+    /// checkbox marker or an ID that could otherwise be silently retargeted.
+    /// This seeded generator covers progress flips, changed text, and reorder
+    /// independently of the parser implementation's example tests.
+    #[test]
+    fn strict_task_record_binding_is_progress_insensitive_but_contract_sensitive(
+        first in "[a-z]{1,30}",
+        second in "[a-z]{1,30}",
+    ) {
+        prop_assume!(first != second);
+        let sb = Sandbox::new("task-binding-prop");
+        let header = "Every box is required and has a stable ID.\n";
+        sb.write(
+            "openspec/changes/c/tasks.md",
+            &format!("{header}- [ ] 1.1 {first}\n  continuation\n- [x] 2.2 {second}\n"),
+        );
+        let project = Project::new(&sb.dir);
+        let original = project.task_plan("c").unwrap();
+        sb.write(
+            "openspec/changes/c/tasks.md",
+            &format!("{header}- [x] 1.1 {first}\n  continuation\n- [ ] 2.2 {second}\n"),
+        );
+        let progress_only = project.task_plan("c").unwrap();
+        prop_assert_eq!(original.normalized_progress_record(), progress_only.normalized_progress_record());
+        prop_assert_eq!(&original.entries[0].record_digest, &progress_only.entries[0].record_digest);
+
+        sb.write(
+            "openspec/changes/c/tasks.md",
+            &format!("{header}- [x] 1.1 {first}changed\n  continuation\n- [ ] 2.2 {second}\n"),
+        );
+        let changed = project.task_plan("c").unwrap();
+        prop_assert_ne!(&original.entries[0].record_digest, &changed.entries[0].record_digest);
+
+        sb.write(
+            "openspec/changes/c/tasks.md",
+            &format!("{header}- [ ] 2.2 {second}\n- [ ] 1.1 {first}\n  continuation\n"),
+        );
+        let reordered = project.task_plan("c").unwrap();
+        prop_assert_ne!(original.normalized_progress_record(), reordered.normalized_progress_record());
+    }
 }
 
 // ---- discover ---------------------------------------------------------------

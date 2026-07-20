@@ -1,0 +1,19 @@
+rules:
+  - id: rust-subprocess-network-client
+    languages: [rust]
+    severity: WARNING
+    message: Local validation must not add direct network-client subprocesses.
+    patterns:
+      - pattern-either:
+          - pattern: std::process::Command::new("curl")
+          - pattern: std::process::Command::new("wget")
+          - pattern: Command::new("curl")
+          - pattern: Command::new("wget")
+  - id: rust-world-writable-permissions
+    languages: [rust]
+    severity: WARNING
+    message: World-writable files require an explicit security review.
+    patterns:
+      - pattern-either:
+          - pattern: $PERMS.set_mode(0o777)
+          - pattern: $PERMS.set_mode(0o666)

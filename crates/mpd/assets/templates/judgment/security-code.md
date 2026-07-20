@@ -1,5 +1,9 @@
 # Security (code) review
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; not authenticated. -->
+
 ## Findings
 
 <!-- Concrete defects found in the real code on disk, most severe first. Each

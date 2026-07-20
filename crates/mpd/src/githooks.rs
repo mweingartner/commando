@@ -2,8 +2,8 @@
 //! floor.
 //!
 //! Every harness eventually calls `git commit`, so a git hook enforces the
-//! secret-scan and test gates regardless of which tool (or human) drove the
-//! change. The hook shells out to `mpd check --staged`.
+//! staged gate regardless of which tool (or human) drove the change. The hook
+//! shells out only to the typed `mpd hook pre-commit` coordinator.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,22 +42,21 @@ fn hooks_dir(root: &Path) -> Option<PathBuf> {
     git_output(root, &["rev-parse", "--git-path", "hooks"]).map(resolve)
 }
 
-/// The `pre-commit` hook script. `MPD_GATE_SKIP=1` bypasses one commit.
+/// The legacy-installed pre-commit hook.  It is deliberately fail-closed: an
+/// unavailable coordinator is a broken local policy, not permission to commit.
+/// Trusted clone-private launchers installed by the local-validation activation
+/// path supersede this compatibility hook.
 pub const PRE_COMMIT: &str = r#"#!/bin/sh
 # mpd pre-commit gate: fast secret scan on staged changes (tests run at the
-# Build/Test gate and in CI, not on every commit).
-# Bypass a single commit with MPD_GATE_SKIP=1.
-if [ "$MPD_GATE_SKIP" = "1" ]; then
-    echo "mpd: pre-commit gate skipped (MPD_GATE_SKIP=1)"
-    exit 0
-fi
+# Build/Test gate and local pre-push validation, not on every commit).
 if command -v mpd >/dev/null 2>&1; then
-    mpd check --staged || {
-        echo "mpd: commit blocked by pre-commit gate (run 'mpd check --staged' for detail)"
+    mpd hook pre-commit || {
+        echo "mpd: commit blocked by pre-commit gate (run 'mpd hook pre-commit' for detail)"
         exit 1
     }
 else
-    echo "mpd: binary not on PATH; pre-commit gate not enforced"
+    echo "mpd: binary not on PATH; commit blocked (restore the approved coordinator)"
+    exit 1
 fi
 exit 0
 "#;

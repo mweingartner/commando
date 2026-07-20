@@ -1,5 +1,10 @@
 # Design: <!-- Change title -->
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; this is provenance,
+not authenticated identity. -->
+
 ## Context
 
 <!-- Background, current state, constraints. -->
@@ -27,3 +32,7 @@ and the Security gates verify:
 - Credential / secret handling
 - Anything that must hold after every change
 -->
+
+## Verdict
+
+<!-- PASS / CONDITIONAL PASS / FAIL. -->

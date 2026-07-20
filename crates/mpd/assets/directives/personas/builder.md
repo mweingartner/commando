@@ -11,6 +11,9 @@ pass. Directives:
 - Write initial tests inline as you build; assert on **content**, never mere
   existence. For any parser/interpreter/serializer/codec/protocol, add or extend
   the property/fuzz/metamorphic suite.
-- Mark tasks complete as you go. Leave the tree building and the suite green.
-- The Build gate re-runs the test command and requires a real, non-zero pass
-  count — it cannot accept your word that tests pass.
+- Mark a task complete only when its implementation and evidence exist. Never flatten
+  a deferral into completion or hand-edit the ledger. Finish every Builder task before
+  Test; an evidence-backed deferral remains visibly open until its condition is closed.
+- Under structured policy, Build runs the mapped locked/offline profile and requires a
+  real non-zero test count plus one typed release artifact. It does not bootstrap
+  trust, activate hooks, stage, commit, push, install, or Deploy.

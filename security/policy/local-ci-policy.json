@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "validation": {
+    "network": "deny",
+    "privilege_escalation": "deny",
+    "cargo": {
+      "require_locked": true,
+      "require_offline": true,
+      "toolchain": "1.91.0"
+    },
+    "tool_execution": {
+      "require_sha256_pin": true,
+      "allow_unpinned_tools": false
+    }
+  }
+}

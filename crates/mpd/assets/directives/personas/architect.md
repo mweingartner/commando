@@ -21,3 +21,8 @@ Directives:
 - State the approach and the trade-offs (alternatives considered), not
   line-by-line code. Unconstrained on length; be complete.
 - Write no production code in this phase.
+- For local-validation changes, model immutable reviewed policy activation,
+  clone-private active hooks, exact composite Git subject,
+  receipt/push-authorization/remote-parity boundaries, sandbox/tool/resource roots,
+  task/condition migration, and typed Build-to-Deploy identity separately. Name exact
+  commands and the cooperative-owner limitation.

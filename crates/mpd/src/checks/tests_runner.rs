@@ -34,6 +34,9 @@ pub fn run(command: &str, dir: &Path) -> TestOutcome {
     let output = Command::new("sh")
         .arg("-c")
         .arg(command)
+        // An ambient containment marker must never leak into an uncontained
+        // test run: guarded suites would silently skip and count as passes.
+        .env_remove("MPD_SANDBOXED")
         .current_dir(dir)
         .output();
 

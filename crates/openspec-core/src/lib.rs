@@ -32,6 +32,7 @@ pub mod names;
 pub mod parse;
 pub mod project;
 pub mod render;
+pub mod safe_fs;
 pub mod schema;
 pub mod transaction;
 pub mod validate;
@@ -41,8 +42,15 @@ pub use merge::{merge, MergeError, MergeStats};
 pub use model::{DeltaSpec, Issue, Removed, Rename, Requirement, Scenario, Severity, Spec};
 pub use names::{validate_capability_name, validate_change_name};
 pub use parse::{parse_delta, parse_spec, ParseError};
-pub use project::{assert_contained, read_capped, ArchivePlan, Project, SpecUpdate, TaskStatus};
+pub use project::{
+    assert_contained, parse_task_plan_text, read_capped, ArchivePlan, Project, SpecUpdate,
+    TaskEntry, TaskPlan, TaskStatus,
+};
 pub use render::{render_delta, render_spec};
+pub use safe_fs::{
+    atomic_write_contained, atomic_write_contained_classified, read_contained_capped,
+    AtomicWriteOutcome, DEFAULT_MAX_BYTES,
+};
 pub use schema::{Artifact, ChangeMeta, Schema, YamlError};
 pub use transaction::{
     abandon_apply, build_plan, drive, inspect, prepare, recover_apply, ArchiveTransactionPlan,

@@ -1,0 +1,6 @@
+# Reviewed Linux ordinary-validation adapter contract. Rust supplies fixed
+# --unshare-net, --die-with-parent, --new-session, proc/dev, and tmpfs mounts;
+# explicit read-only binds for system runtime roots, the exact subject,
+# digest-locked tool roots, Rust/Cargo cache roots; and a single writable bind
+# for the owned per-run runtime. It never binds host /, HOME, or the live repo.
+# Absence of bubblewrap or this marker blocks validation; no fallback exists.

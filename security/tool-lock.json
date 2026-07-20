@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "policy": "Validation uses reviewed package archives or an explicit Homebrew package root, then binds the clone-private installed executable digest. Version-only or ambient-PATH trust is forbidden.",
+  "tools": [
+    {
+      "name": "rust-toolchain",
+      "version": "1.91.0",
+      "acquisition": "homebrew-package-root",
+      "package_root": "/opt/homebrew/Cellar/rust/1.91.0",
+      "dependency_roots": [
+        "/opt/homebrew/Cellar/libgit2/1.9.1",
+        "/opt/homebrew/Cellar/libssh2/1.11.1",
+        "/opt/homebrew/Cellar/llvm/21.1.4",
+        "/opt/homebrew/Cellar/openssl@3/3.6.3",
+        "/opt/homebrew/Cellar/z3/4.15.4",
+        "/opt/homebrew/Cellar/zstd/1.5.7_1"
+      ],
+      "executables": {
+        "cargo": "70e53e80b92a3e8a52426e1b0f1185daca413cd3ee1a5fccf056514408cd53e4",
+        "rustc": "db322098ad9652508fcf0ca84830d987b5799df66bcf47d5aabae14ab5a02a68",
+        "rustfmt": "125e1440b94cf4e21d64a87983d1171867ae1189f5009f5d092c9e748ab4c47f",
+        "cargo-clippy": "8acb16f96897ed0b9c3fa92ff0bd3b172c5dec2b6541028d199b01817a7b6c56"
+      },
+      "platform": "aarch64-apple-darwin"
+    },
+    {
+      "name": "cargo-audit",
+      "version": "0.22.2",
+      "acquisition": "crates.io-archive",
+      "source": "https://static.crates.io/crates/cargo-audit/cargo-audit-0.22.2.crate",
+      "package_sha256": "700c2b240f7fd330c24b675fe429f73a5b676531fcc6300400b2b67f155ba12a",
+      "install_root": "mpd/tools/cargo-audit"
+    },
+    {
+      "name": "semgrep",
+      "version": "1.169.0",
+      "acquisition": "homebrew-bottle-root",
+      "package_root": "/opt/homebrew/Cellar/semgrep/1.169.0",
+      "dependency_roots": [
+        "/opt/homebrew/Cellar/certifi/2026.6.17",
+        "/opt/homebrew/Cellar/cffi/2.1.0",
+        "/opt/homebrew/Cellar/cryptography/49.0.0",
+        "/opt/homebrew/Cellar/dwarfutils/2.3.2",
+        "/opt/homebrew/Cellar/gmp/6.3.0",
+        "/opt/homebrew/Cellar/libev/4.33",
+        "/opt/homebrew/Cellar/mpdecimal/4.0.1",
+        "/opt/homebrew/Cellar/openssl@3/3.6.3",
+        "/opt/homebrew/Cellar/pcre2/10.47_1",
+        "/opt/homebrew/Cellar/pycparser/3.0",
+        "/opt/homebrew/Cellar/pydantic/2.13.4",
+        "/opt/homebrew/Cellar/python@3.14/3.14.6",
+        "/opt/homebrew/Cellar/rpds-py/2026.6.3",
+        "/opt/homebrew/Cellar/sqlite/3.50.4",
+        "/opt/homebrew/Cellar/tree-sitter/0.26.11",
+        "/opt/homebrew/Cellar/xz/5.8.3",
+        "/opt/homebrew/Cellar/zstd/1.5.7_1",
+        "/opt/homebrew/lib/python3.14/site-packages"
+      ],
+      "bottle_url": "https://ghcr.io/v2/homebrew/core/semgrep/blobs/sha256:a559bc50ee882233511f4d5f6d98ac5373a598a60dc5a91c3c5129cfb0165b8f",
+      "bottle_sha256": "a559bc50ee882233511f4d5f6d98ac5373a598a60dc5a91c3c5129cfb0165b8f",
+      "inventory": "mpd/tools/semgrep-homebrew.json",
+      "platform": "aarch64-apple-darwin"
+    },
+    {
+      "name": "gitleaks",
+      "version": "8.30.1",
+      "acquisition": "homebrew-package-root",
+      "package_root": "/opt/homebrew/Cellar/gitleaks/8.30.1",
+      "executable_sha256": "f414bc2fb952be6c9072b75cb411e3368614ef4b16d48dbd9ad238034afd2302",
+      "platform": "aarch64-apple-darwin"
+    }
+  ]
+}

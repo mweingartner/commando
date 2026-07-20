@@ -1,5 +1,9 @@
 # Test report
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; not authenticated. -->
+
 ## Coverage
 
 <!-- What was tested: functional and non-functional (performance, load/stress,

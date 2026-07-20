@@ -1,5 +1,9 @@
 # Doc validation
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; not authenticated. -->
+
 ## Architect lens
 
 <!-- The Architect validates the documentation for accuracy against what was

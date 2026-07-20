@@ -33,10 +33,10 @@
 
 use crate::digest::{self, Digest};
 use crate::git;
-use crate::ledger::Verdict;
+use crate::ledger::{RiskAssessment, RiskLevel, Verdict};
 use crate::pathmatch::glob_match;
 use crate::phase::Phase;
-use openspec_core::{assert_contained, read_capped, validate_change_name};
+use openspec_core::{assert_contained, read_capped, validate_change_name, Project};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Current schema for [`EvidenceReceipt`] / [`DependencySnapshot`].
-pub const RECEIPT_SCHEMA: u32 = 1;
+pub const RECEIPT_SCHEMA: u32 = 2;
 /// Current schema for [`HermeticReusePolicy`].
 pub const HERMETIC_POLICY_SCHEMA: u32 = 1;
 /// Current schema for [`ChangeManifest`].
@@ -79,6 +79,12 @@ pub enum DependencyKey {
     /// Design/plan artifact content (Design Mock, Architecture, Design
     /// Review/Sign-off phases).
     DesignArtifacts,
+    /// The Design Mock's own artifact only. Separate from later Architecture
+    /// output so authoring a plan cannot retroactively stale the mock receipt.
+    DesignMockArtifact,
+    /// Proposal/design/tasks contract, with task progress normalized. This is
+    /// Architecture input, not a dependency of the earlier Design Mock.
+    ArchitecturePlan,
     /// The configured test command text (Build, Test).
     TestCommand,
     /// Compiler/toolchain identity strings.
@@ -128,6 +134,8 @@ impl DependencyKey {
             Governance => "governance",
             Config => "config",
             DesignArtifacts => "design-artifacts",
+            DesignMockArtifact => "design-mock-artifact",
+            ArchitecturePlan => "architecture-plan",
             TestCommand => "test-command",
             Toolchain => "toolchain",
             ProducedArtifact => "produced-artifact",
@@ -236,6 +244,11 @@ pub struct ArchiveClosure {
     /// The archive transaction's identity (see
     /// `openspec_core::ArchiveTransactionPlan::id`).
     pub transaction_id: Digest,
+    /// Exact Build Candidate whose retained tree is the source of a modern
+    /// closure plan. Absent only on legacy archives created before candidate
+    /// equivalence existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
     /// The declared/system scope this closure covers — the manifest's
     /// (possibly glob) `paths`/`shared_paths` plus [`SystemScope::paths`],
     /// merged and deduplicated. Used for post-commit coherence
@@ -347,6 +360,912 @@ pub struct CommitCoherence {
     pub coherent: bool,
     pub head: Option<String>,
     pub blockers: Vec<String>,
+}
+
+// =====================================================================
+// Candidate-to-closure equivalence
+// =====================================================================
+
+/// Schema for [`CandidateClosurePlan`]. The plan is deliberately distinct
+/// from both a Candidate gate receipt and an immutable Commit validation
+/// receipt: equality of their trees never collapses those two subjects.
+pub const CANDIDATE_CLOSURE_SCHEMA: u32 = 1;
+const MAX_CLOSURE_TREE_ENTRIES: usize = 100_000;
+const MAX_CLOSURE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CLOSURE_TREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// One canonical regular-file postimage admitted after Candidate capture.
+/// Bytes are an input to plan construction only; the durable plan retains
+/// their length and digest rather than duplicating source content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureFilePostimage {
+    pub path: String,
+    pub mode: u32,
+    pub bytes: Vec<u8>,
+}
+
+impl ClosureFilePostimage {
+    pub fn regular(path: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            path: path.into(),
+            mode: 0o100644,
+            bytes: bytes.into(),
+        }
+    }
+}
+
+/// A current, canonical downstream judgment artifact. `receipt_id` is kept
+/// separate from the file digest so the closure binds both what was reviewed
+/// and the gate evidence that admitted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseArtifactPostimage {
+    pub phase: Phase,
+    pub receipt_id: String,
+    pub file: ClosureFilePostimage,
+}
+
+/// Durable documentation admitted only through a distinct Doc Validation
+/// receipt. An empty file list is valid when the reviewed change has no
+/// durable-document target, but the receipt identity remains mandatory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewedDocumentationPostimages {
+    pub doc_validation_receipt_id: String,
+    pub files: Vec<ClosureFilePostimage>,
+}
+
+/// Exact archive-transaction outputs that are neither Candidate source nor
+/// reviewed durable documentation. Spec writes are restricted to canonical
+/// OpenSpec targets. The ledger postimage has a dedicated field because it is
+/// mutable process state before archive and must prove its exact Candidate and
+/// [`ArchiveClosure`] bindings before it can enter the commit expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeterministicArchivePostimages {
+    pub spec_writes: Vec<ClosureFilePostimage>,
+    pub ledger: ClosureFilePostimage,
+}
+
+/// Canonical path/mode/content identity for one expected or observed commit
+/// file. Git tree modes are normalized to exactly `100644` or `100755`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosureTreeEntry {
+    pub path: String,
+    pub mode: u32,
+    pub byte_len: u64,
+    pub sha256: String,
+}
+
+/// Full expected post-archive tree. `candidate_id` and the later
+/// `commit_oid` in [`CandidateClosureEquivalence`] intentionally remain
+/// separate subject identities even when every entry is equal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateClosurePlan {
+    pub schema: u32,
+    pub candidate_id: String,
+    pub candidate_base_commit: String,
+    pub archive_path: String,
+    pub archive_transaction_id: String,
+    pub overlay_digest: String,
+    pub expected_tree_digest: String,
+    pub entries: Vec<ClosureTreeEntry>,
+}
+
+/// Exact comparison of one immutable Commit tree with one Candidate-derived
+/// closure plan. A non-equivalent comparison is a successful observation with
+/// blockers, not a Commit receipt and not a remote-parity observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateClosureEquivalence {
+    pub equivalent: bool,
+    pub candidate_id: String,
+    pub commit_oid: String,
+    pub expected_tree_digest: String,
+    pub observed_tree_digest: String,
+    pub blockers: Vec<String>,
+}
+
+/// Build the only allowed Candidate-to-archive projection:
+///
+/// 1. the complete retained Candidate tree;
+/// 2. current canonical downstream phase artifacts with their receipts;
+/// 3. separately reviewed durable documentation;
+/// 4. deterministic spec and exact closure-ledger postimages; and
+/// 5. the active-change to dated-archive rename.
+///
+/// No live worktree bytes are consulted. Source/config/script/task changes
+/// therefore cannot be smuggled in as an overlay, and mutable process state
+/// has no generic overlay path.
+pub fn build_candidate_closure_plan(
+    candidate_root: &Path,
+    candidate: &crate::candidate::CandidateProjection,
+    closure: &ArchiveClosure,
+    phase_artifacts: &[PhaseArtifactPostimage],
+    documentation: &ReviewedDocumentationPostimages,
+    archive: &DeterministicArchivePostimages,
+) -> Result<CandidateClosurePlan, String> {
+    validate_candidate_closure_binding(candidate_root, candidate, closure)?;
+
+    let change = &candidate.capture.subject.change;
+    let active_prefix = format!("openspec/changes/{change}");
+    validate_archive_path(change, &active_prefix, &closure.archive_path)?;
+    let manifest = load_manifest(candidate_root, change)
+        .map_err(|error| format!("candidate closure cannot read its retained manifest: {error}"))?;
+    if !manifest.is_ready() {
+        return Err("candidate closure manifest is not ready".into());
+    }
+
+    let mut expected = inventory_closure_tree(candidate_root)?;
+    verify_candidate_scope_entries(&expected, &candidate.entries)?;
+    let mut overlay_claims = BTreeMap::<String, String>::new();
+    let mut overlay_entries = Vec::<digest::Entry>::new();
+
+    for artifact in phase_artifacts {
+        Digest::from_hex(&artifact.receipt_id)
+            .map_err(|_| "phase artifact receipt ID is not a canonical SHA-256 digest")?;
+        let expected_name = match artifact.phase {
+            Phase::SecurityCode => "security-code.md",
+            Phase::DesignSignoff => "design-signoff.md",
+            Phase::Test => "test.md",
+            Phase::Documentation => "documentation.md",
+            Phase::DocValidation => "doc-validation.md",
+            _ => {
+                return Err(format!(
+                    "{} is not a post-Candidate canonical artifact phase",
+                    artifact.phase.label()
+                ))
+            }
+        };
+        let expected_path = format!("{active_prefix}/{expected_name}");
+        if artifact.file.path != expected_path {
+            return Err(format!(
+                "canonical {} artifact must be exactly {expected_path:?}",
+                artifact.phase.label()
+            ));
+        }
+        claim_overlay(
+            &mut overlay_claims,
+            &artifact.file.path,
+            &format!("phase:{}", artifact.phase.slug()),
+        )?;
+        apply_postimage(&mut expected, &artifact.file)?;
+        overlay_entries.push(postimage_digest_entry(
+            &format!("phase/{}/{}", artifact.phase.slug(), artifact.receipt_id),
+            &artifact.file,
+        )?);
+    }
+
+    Digest::from_hex(&documentation.doc_validation_receipt_id)
+        .map_err(|_| "Doc Validation receipt ID is not a canonical SHA-256 digest")?;
+    for document in &documentation.files {
+        validate_documentation_postimage(
+            &manifest,
+            &active_prefix,
+            &closure.archive_path,
+            document,
+        )?;
+        claim_overlay(
+            &mut overlay_claims,
+            &document.path,
+            "reviewed-documentation",
+        )?;
+        apply_postimage(&mut expected, document)?;
+        overlay_entries.push(postimage_digest_entry(
+            &format!(
+                "documentation/{}/{}",
+                documentation.doc_validation_receipt_id, document.path
+            ),
+            document,
+        )?);
+    }
+
+    for spec in &archive.spec_writes {
+        validate_spec_postimage(spec)?;
+        claim_overlay(&mut overlay_claims, &spec.path, "archive-spec-postimage")?;
+        apply_postimage(&mut expected, spec)?;
+        overlay_entries.push(postimage_digest_entry(
+            &format!("archive-spec/{}", spec.path),
+            spec,
+        )?);
+    }
+
+    validate_archive_ledger_postimage(candidate, closure, &archive.ledger)?;
+    claim_overlay(
+        &mut overlay_claims,
+        &archive.ledger.path,
+        "archive-ledger-postimage",
+    )?;
+    apply_postimage(&mut expected, &archive.ledger)?;
+    overlay_entries.push(postimage_digest_entry("archive-ledger", &archive.ledger)?);
+
+    rename_expected_prefix(&mut expected, &active_prefix, &closure.archive_path)?;
+    let entries = expected.into_values().collect::<Vec<_>>();
+    validate_closure_entries(&entries)?;
+    let expected_tree_digest = closure_tree_digest(&entries)?;
+    let overlay_digest = digest::canonical_digest(
+        "candidate-closure-overlays",
+        CANDIDATE_CLOSURE_SCHEMA,
+        overlay_entries,
+    )
+    .map_err(|error| error.to_string())?
+    .to_hex();
+    Ok(CandidateClosurePlan {
+        schema: CANDIDATE_CLOSURE_SCHEMA,
+        candidate_id: candidate.capture.subject.id.clone(),
+        candidate_base_commit: candidate.capture.subject.base_commit.clone(),
+        archive_path: closure.archive_path.clone(),
+        archive_transaction_id: closure.transaction_id.to_hex(),
+        overlay_digest,
+        expected_tree_digest,
+        entries,
+    })
+}
+
+/// Materialize and compare an exact immutable Commit against a previously
+/// built full-tree plan. This does not consult or update remote parity and
+/// does not issue a Commit validation receipt.
+pub fn verify_candidate_commit_equivalence(
+    root: &Path,
+    commit: &str,
+    plan: &CandidateClosurePlan,
+) -> Result<CandidateClosureEquivalence, String> {
+    validate_candidate_closure_plan(plan)?;
+    let subject = crate::local_validation::capture_subject(root, Some(commit))?;
+    if subject.pushed_kind != "commit"
+        || !subject.tag_chain.is_empty()
+        || subject.commit != subject.pushed_oid
+    {
+        return Err("closure equivalence requires a direct immutable Commit subject".into());
+    }
+    let materialized = crate::local_validation::materialize_subject(root, &subject)?;
+    let comparison = (|| {
+        let observed = inventory_closure_tree(&materialized.root)?
+            .into_values()
+            .collect::<Vec<_>>();
+        compare_candidate_closure_entries(plan, &subject.commit, &observed)
+    })();
+    match (comparison, materialized.cleanup()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(format!(
+            "closure comparison completed but exact Commit cleanup failed: {cleanup}"
+        )),
+        (Err(error), Err(cleanup)) => Err(format!(
+            "{error}; exact Commit cleanup also failed: {cleanup}"
+        )),
+    }
+}
+
+/// Persist a canonical Candidate closure plan in clone-private Git state.
+/// The transaction ID is the only accepted filename and an existing unequal
+/// plan blocks instead of being overwritten.
+pub fn save_candidate_closure_plan(root: &Path, plan: &CandidateClosurePlan) -> Result<(), String> {
+    validate_candidate_closure_plan(plan)?;
+    let directory = candidate_closure_plan_directory(root, true)?;
+    let path = directory.join(format!("{}.json", plan.archive_transaction_id));
+    let mut bytes = serde_json::to_vec(plan).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    if path.exists() {
+        let existing = load_candidate_closure_plan(root, &plan.archive_transaction_id)?;
+        return if existing == *plan {
+            Ok(())
+        } else {
+            Err("a different Candidate closure plan already exists for this transaction".into())
+        };
+    }
+    let temporary = directory.join(format!(
+        ".{}.{}.tmp",
+        plan.archive_transaction_id,
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        use std::io::Write;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+        std::fs::File::open(&directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Load and canonicalize the clone-private plan for one archive transaction.
+pub fn load_candidate_closure_plan(
+    root: &Path,
+    transaction_id: &str,
+) -> Result<CandidateClosurePlan, String> {
+    Digest::from_hex(transaction_id).map_err(|_| "Candidate closure transaction ID is invalid")?;
+    let directory = candidate_closure_plan_directory(root, false)?;
+    let path = directory.join(format!("{transaction_id}.json"));
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|_| "Candidate closure plan is missing")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 * 1024
+    {
+        return Err("Candidate closure plan is unsafe or oversized".into());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let mut file = options.open(&path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    use std::io::Read;
+    file.read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let plan: CandidateClosurePlan =
+        serde_json::from_slice(&bytes).map_err(|_| "Candidate closure plan is malformed")?;
+    validate_candidate_closure_plan(&plan)?;
+    if plan.archive_transaction_id != transaction_id {
+        return Err("Candidate closure plan transaction binding differs".into());
+    }
+    let mut canonical = serde_json::to_vec(&plan).map_err(|error| error.to_string())?;
+    canonical.push(b'\n');
+    if canonical != bytes {
+        return Err("Candidate closure plan is not canonical".into());
+    }
+    Ok(plan)
+}
+
+fn candidate_closure_plan_directory(root: &Path, create: bool) -> Result<PathBuf, String> {
+    let common = crate::local_validation::git_common_dir(root)?;
+    let mpd = common.join("mpd");
+    let directory = mpd.join("closure-plans");
+    if create {
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mpd, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for (path, label) in [
+        (&mpd, "clone-private MPD directory"),
+        (&directory, "Candidate closure plan directory"),
+    ] {
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|_| format!("{label} is unavailable"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!("{label} is unsafe"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(format!("{label} is not owner-only"));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn compare_candidate_closure_entries(
+    plan: &CandidateClosurePlan,
+    commit_oid: &str,
+    observed: &[ClosureTreeEntry],
+) -> Result<CandidateClosureEquivalence, String> {
+    let observed_tree_digest = closure_tree_digest(observed)?;
+    let mut expected_by_path = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed_by_path = observed
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = expected_by_path
+        .keys()
+        .chain(observed_by_path.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    let mut blockers = Vec::new();
+    for path in paths {
+        match (expected_by_path.remove(path), observed_by_path.remove(path)) {
+            (Some(_), None) => blockers.push(format!("missing path {path:?}")),
+            (None, Some(_)) => blockers.push(format!("extra path {path:?}")),
+            (Some(expected), Some(observed)) => {
+                if expected.mode != observed.mode {
+                    blockers.push(format!(
+                        "mode mismatch at {path:?}: expected {:o}, observed {:o}",
+                        expected.mode, observed.mode
+                    ));
+                }
+                if expected.byte_len != observed.byte_len || expected.sha256 != observed.sha256 {
+                    blockers.push(format!("content digest mismatch at {path:?}"));
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    blockers.sort();
+    Ok(CandidateClosureEquivalence {
+        equivalent: blockers.is_empty() && observed_tree_digest == plan.expected_tree_digest,
+        candidate_id: plan.candidate_id.clone(),
+        commit_oid: commit_oid.to_string(),
+        expected_tree_digest: plan.expected_tree_digest.clone(),
+        observed_tree_digest,
+        blockers,
+    })
+}
+
+fn validate_candidate_closure_binding(
+    candidate_root: &Path,
+    candidate: &crate::candidate::CandidateProjection,
+    closure: &ArchiveClosure,
+) -> Result<(), String> {
+    let subject = &candidate.capture.subject;
+    for (label, value) in [
+        ("candidate ID", subject.id.as_str()),
+        (
+            "candidate manifest digest",
+            subject.manifest_digest.as_str(),
+        ),
+        ("candidate entries digest", subject.entries_digest.as_str()),
+        ("candidate policy digest", subject.policy_digest.as_str()),
+        ("candidate source digest", subject.source_digest.as_str()),
+    ] {
+        Digest::from_hex(value)
+            .map_err(|_| format!("{label} is not a canonical SHA-256 digest"))?;
+    }
+    if subject.base_commit != closure.base_commit {
+        return Err("archive base Commit differs from the Candidate base Commit".into());
+    }
+    if candidate_root.to_str() != Some(candidate.capture.clone_private_root.as_str()) {
+        return Err("candidate closure root does not match its compact binding".into());
+    }
+    let metadata = std::fs::symlink_metadata(candidate_root)
+        .map_err(|error| format!("candidate closure root is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("candidate closure root is not a no-follow directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.dev() != candidate.capture.storage.root_device
+            || metadata.ino() != candidate.capture.storage.root_inode
+        {
+            return Err("candidate closure root changed filesystem identity".into());
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("candidate closure root is not owner-only".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_path(change: &str, active: &str, archive: &str) -> Result<(), String> {
+    digest::validate_canonical_path(archive).map_err(|error| error.to_string())?;
+    if archive == active
+        || !archive.starts_with("openspec/changes/archive/")
+        || !archive.ends_with(&format!("-{change}"))
+    {
+        return Err("archive path is not the canonical dated change destination".into());
+    }
+    Ok(())
+}
+
+fn claim_overlay(
+    claims: &mut BTreeMap<String, String>,
+    path: &str,
+    kind: &str,
+) -> Result<(), String> {
+    digest::validate_canonical_path(path).map_err(|error| error.to_string())?;
+    if let Some(first) = claims.insert(path.to_string(), kind.to_string()) {
+        return Err(format!(
+            "closure overlay path {path:?} is claimed by both {first} and {kind}"
+        ));
+    }
+    Ok(())
+}
+
+fn postimage_entry(file: &ClosureFilePostimage) -> Result<ClosureTreeEntry, String> {
+    digest::validate_canonical_path(&file.path).map_err(|error| error.to_string())?;
+    if !matches!(file.mode, 0o100644 | 0o100755) {
+        return Err(format!(
+            "closure postimage {:?} has unsupported Git mode {:o}",
+            file.path, file.mode
+        ));
+    }
+    if file.bytes.len() as u64 > MAX_CLOSURE_FILE_BYTES {
+        return Err(format!(
+            "closure postimage {:?} exceeds its file-size cap",
+            file.path
+        ));
+    }
+    Ok(ClosureTreeEntry {
+        path: file.path.clone(),
+        mode: file.mode,
+        byte_len: file.bytes.len() as u64,
+        sha256: Digest::of_bytes(&file.bytes).to_hex(),
+    })
+}
+
+fn postimage_digest_entry(
+    label: &str,
+    file: &ClosureFilePostimage,
+) -> Result<digest::Entry, String> {
+    let entry = postimage_entry(file)?;
+    digest::Entry::file(
+        label.to_string(),
+        entry.mode,
+        entry.byte_len,
+        Digest::from_hex(&entry.sha256)?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn apply_postimage(
+    tree: &mut BTreeMap<String, ClosureTreeEntry>,
+    file: &ClosureFilePostimage,
+) -> Result<(), String> {
+    let entry = postimage_entry(file)?;
+    tree.insert(entry.path.clone(), entry);
+    Ok(())
+}
+
+fn validate_documentation_postimage(
+    manifest: &ChangeManifest,
+    active_prefix: &str,
+    archive_prefix: &str,
+    document: &ClosureFilePostimage,
+) -> Result<(), String> {
+    if document.mode != 0o100644
+        || path_is_within(active_prefix, &document.path)
+        || path_is_within(archive_prefix, &document.path)
+        || mutable_closure_process_path(&document.path)
+        || !manifest
+            .paths
+            .iter()
+            .chain(manifest.shared_paths.iter())
+            .any(|pattern| glob_match(pattern, &document.path))
+    {
+        return Err(format!(
+            "reviewed documentation postimage {:?} is not a regular declared durable-doc path",
+            document.path
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spec_postimage(spec: &ClosureFilePostimage) -> Result<(), String> {
+    let suffix = spec
+        .path
+        .strip_prefix("openspec/specs/")
+        .and_then(|path| path.strip_suffix("/spec.md"));
+    if spec.mode != 0o100644
+        || suffix.is_none_or(|capability| {
+            capability.is_empty()
+                || capability.contains('/')
+                || validate_change_name(capability).is_err()
+        })
+    {
+        return Err(format!(
+            "archive spec postimage {:?} is not a canonical regular capability spec",
+            spec.path
+        ));
+    }
+    Ok(())
+}
+
+fn validate_archive_ledger_postimage(
+    candidate: &crate::candidate::CandidateProjection,
+    closure: &ArchiveClosure,
+    ledger: &ClosureFilePostimage,
+) -> Result<(), String> {
+    let expected_path = format!(".mpd/state/{}.json", candidate.capture.subject.change);
+    if ledger.path != expected_path || ledger.mode != 0o100644 {
+        return Err(
+            "archive ledger postimage does not name the exact regular change ledger".into(),
+        );
+    }
+    if ledger.bytes.len() as u64 > MAX_CLOSURE_FILE_BYTES {
+        return Err("archive ledger postimage exceeds its file-size cap".into());
+    }
+    let parsed: crate::ledger::Ledger = serde_json::from_slice(&ledger.bytes)
+        .map_err(|_| "archive ledger postimage is malformed")?;
+    if parsed.change != candidate.capture.subject.change
+        || parsed.archive_closure.as_ref() != Some(closure)
+        || parsed
+            .gates
+            .get(&Phase::Build)
+            .and_then(|record| record.candidate.as_ref())
+            != Some(&candidate.capture)
+    {
+        return Err(
+            "archive ledger postimage does not bind the exact Candidate and archive closure".into(),
+        );
+    }
+    Ok(())
+}
+
+fn mutable_closure_process_path(path: &str) -> bool {
+    path == ".mpd/current"
+        || path == ".mpd/pending-closure"
+        || path == ".mpd/parity-observations.json"
+        || path == ".mpd/build-output"
+        || path.starts_with(".mpd/build-output/")
+        || path == ".mpd/local"
+        || path.starts_with(".mpd/local/")
+        || path == ".mpd/validation"
+        || path.starts_with(".mpd/validation/")
+        || path == ".mpd/logs"
+        || path.starts_with(".mpd/logs/")
+        || path == ".mpd/cache"
+        || path.starts_with(".mpd/cache/")
+        || path.starts_with(".git/")
+}
+
+fn rename_expected_prefix(
+    tree: &mut BTreeMap<String, ClosureTreeEntry>,
+    source: &str,
+    destination: &str,
+) -> Result<(), String> {
+    if tree.keys().any(|path| path_is_within(destination, path)) {
+        return Err("archive destination already exists in the Candidate tree".into());
+    }
+    let source_paths = tree
+        .keys()
+        .filter(|path| path_is_within(source, path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if source_paths.is_empty() {
+        return Err("Candidate tree has no active change directory to archive".into());
+    }
+    for source_path in source_paths {
+        let mut entry = tree
+            .remove(&source_path)
+            .expect("source path was collected from the same map");
+        let suffix = source_path
+            .strip_prefix(source)
+            .expect("source prefix was checked");
+        entry.path = format!("{destination}{suffix}");
+        if tree.insert(entry.path.clone(), entry).is_some() {
+            return Err("archive rename produced a path collision".into());
+        }
+    }
+    Ok(())
+}
+
+fn verify_candidate_scope_entries(
+    tree: &BTreeMap<String, ClosureTreeEntry>,
+    entries: &[crate::candidate::CandidateEntry],
+) -> Result<(), String> {
+    let mut previous: Option<&[u8]> = None;
+    for candidate in entries {
+        if previous.is_some_and(|prior| prior >= candidate.path_bytes.as_slice()) {
+            return Err("candidate scope inventory is not strictly path-sorted".into());
+        }
+        previous = Some(&candidate.path_bytes);
+        let path = std::str::from_utf8(&candidate.path_bytes)
+            .map_err(|_| "candidate closure path is not UTF-8")?;
+        match candidate.state {
+            crate::candidate::CandidatePathState::Deleted => {
+                if tree.contains_key(path) {
+                    return Err(format!(
+                        "retained Candidate tree still contains deleted path {path:?}"
+                    ));
+                }
+            }
+            crate::candidate::CandidatePathState::Present => {
+                let observed = tree
+                    .get(path)
+                    .ok_or_else(|| format!("retained Candidate tree is missing {path:?}"))?;
+                let mode = match candidate.mode {
+                    Some(crate::candidate::CandidateMode::Regular) => 0o100644,
+                    Some(crate::candidate::CandidateMode::Executable) => 0o100755,
+                    None => return Err("present Candidate entry has no mode".into()),
+                };
+                if observed.mode != mode
+                    || observed.byte_len != candidate.byte_len
+                    || candidate.sha256.as_deref() != Some(observed.sha256.as_str())
+                {
+                    return Err(format!(
+                        "retained Candidate tree differs from scoped entry {path:?}"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inventory_closure_tree(root: &Path) -> Result<BTreeMap<String, ClosureTreeEntry>, String> {
+    let mut entries = BTreeMap::new();
+    let mut remaining_entries = MAX_CLOSURE_TREE_ENTRIES;
+    let mut remaining_bytes = MAX_CLOSURE_TREE_BYTES;
+    inventory_closure_directory(
+        root,
+        root,
+        &mut entries,
+        &mut remaining_entries,
+        &mut remaining_bytes,
+    )?;
+    Ok(entries)
+}
+
+fn inventory_closure_directory(
+    root: &Path,
+    directory: &Path,
+    entries: &mut BTreeMap<String, ClosureTreeEntry>,
+    remaining_entries: &mut usize,
+    remaining_bytes: &mut u64,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|error| format!("cannot inspect closure directory: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("closure inventory encountered a non-directory root".into());
+    }
+    let mut children = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot enumerate closure directory: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate closure entry: {error}"))?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        if *remaining_entries == 0 {
+            return Err("closure tree exceeds its entry cap".into());
+        }
+        *remaining_entries -= 1;
+        let path = child.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| "closure inventory escaped its root")?
+            .to_str()
+            .ok_or("closure path is not UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        digest::validate_canonical_path(&relative).map_err(|error| error.to_string())?;
+        let before = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect closure entry: {error}"))?;
+        if before.file_type().is_symlink() {
+            return Err(format!("closure tree contains symlink {relative:?}"));
+        }
+        if before.is_dir() {
+            inventory_closure_directory(root, &path, entries, remaining_entries, remaining_bytes)?;
+            continue;
+        }
+        if !before.is_file() || before.len() > MAX_CLOSURE_FILE_BYTES {
+            return Err(format!(
+                "closure tree contains unsupported or oversized file {relative:?}"
+            ));
+        }
+        *remaining_bytes = remaining_bytes
+            .checked_sub(before.len())
+            .ok_or("closure tree exceeds its aggregate byte cap")?;
+        let content = digest::hash_file_non_following(&path).map_err(|error| error.to_string())?;
+        let after = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot restat closure entry: {error}"))?;
+        if !after.is_file() || after.len() != before.len() || content.length != before.len() {
+            return Err(format!("closure file drifted while hashing {relative:?}"));
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if before.dev() != after.dev()
+                || before.ino() != after.ino()
+                || before.mtime() != after.mtime()
+                || before.mtime_nsec() != after.mtime_nsec()
+            {
+                return Err(format!("closure file changed identity at {relative:?}"));
+            }
+            if after.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        };
+        #[cfg(not(unix))]
+        let mode = 0o100644;
+        let entry = ClosureTreeEntry {
+            path: relative.clone(),
+            mode,
+            byte_len: content.length,
+            sha256: content.digest.to_hex(),
+        };
+        if entries.insert(relative, entry).is_some() {
+            return Err("closure tree contains a duplicate canonical path".into());
+        }
+    }
+    Ok(())
+}
+
+fn closure_tree_digest(entries: &[ClosureTreeEntry]) -> Result<String, String> {
+    let mut canonical = Vec::with_capacity(entries.len());
+    for entry in entries {
+        canonical.push(
+            digest::Entry::file(
+                entry.path.clone(),
+                entry.mode,
+                entry.byte_len,
+                Digest::from_hex(&entry.sha256)?,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(digest::canonical_digest(
+        "candidate-closure-tree",
+        CANDIDATE_CLOSURE_SCHEMA,
+        canonical,
+    )
+    .map_err(|error| error.to_string())?
+    .to_hex())
+}
+
+fn validate_closure_entries(entries: &[ClosureTreeEntry]) -> Result<(), String> {
+    if entries.len() > MAX_CLOSURE_TREE_ENTRIES {
+        return Err("candidate closure plan exceeds its entry cap".into());
+    }
+    let mut previous: Option<&str> = None;
+    let mut total = 0_u64;
+    for entry in entries {
+        digest::validate_canonical_path(&entry.path).map_err(|error| error.to_string())?;
+        if previous.is_some_and(|path| path.as_bytes() >= entry.path.as_bytes()) {
+            return Err("candidate closure plan is not strictly path-sorted".into());
+        }
+        previous = Some(&entry.path);
+        if !matches!(entry.mode, 0o100644 | 0o100755)
+            || entry.byte_len > MAX_CLOSURE_FILE_BYTES
+            || Digest::from_hex(&entry.sha256).is_err()
+        {
+            return Err(format!(
+                "candidate closure entry {:?} is malformed",
+                entry.path
+            ));
+        }
+        total = total
+            .checked_add(entry.byte_len)
+            .ok_or("candidate closure byte count overflow")?;
+        if total > MAX_CLOSURE_TREE_BYTES {
+            return Err("candidate closure plan exceeds its aggregate byte cap".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_candidate_closure_plan(plan: &CandidateClosurePlan) -> Result<(), String> {
+    if plan.schema != CANDIDATE_CLOSURE_SCHEMA {
+        return Err("unsupported candidate closure plan schema".into());
+    }
+    Digest::from_hex(&plan.candidate_id)
+        .map_err(|_| "candidate closure plan has an invalid Candidate ID")?;
+    Digest::from_hex(&plan.archive_transaction_id)
+        .map_err(|_| "candidate closure plan has an invalid transaction ID")?;
+    Digest::from_hex(&plan.overlay_digest)
+        .map_err(|_| "candidate closure plan has an invalid overlay digest")?;
+    Digest::from_hex(&plan.expected_tree_digest)
+        .map_err(|_| "candidate closure plan has an invalid tree digest")?;
+    if !git::valid_oid_hex(&plan.candidate_base_commit) {
+        return Err("candidate closure plan has an invalid base Commit".into());
+    }
+    digest::validate_canonical_path(&plan.archive_path).map_err(|error| error.to_string())?;
+    validate_closure_entries(&plan.entries)?;
+    if closure_tree_digest(&plan.entries)? != plan.expected_tree_digest {
+        return Err("candidate closure plan tree digest is stale".into());
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -607,15 +1526,11 @@ pub fn load_manifest(root: &Path, change: &str) -> Result<ChangeManifest, Manife
 pub fn save_manifest(root: &Path, change: &str, manifest: &ChangeManifest) -> io::Result<()> {
     let path = manifest_path(root, change).map_err(io::Error::other)?;
     let changes_dir = root.join("openspec").join("changes");
-    assert_contained(&changes_dir, &path).map_err(io::Error::other)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let mut json = serde_json::to_string_pretty(manifest)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     json.push('\n');
-    assert_contained(&changes_dir, &path).map_err(io::Error::other)?;
-    std::fs::write(path, json)
+    openspec_core::atomic_write_contained(&changes_dir, &path, json.as_bytes())
+        .map_err(io::Error::other)
 }
 
 // =====================================================================
@@ -698,7 +1613,16 @@ impl DependencyValues {
 
     /// `key`'s currently computed digest, if the caller has one.
     pub fn get(&self, key: DependencyKey) -> Option<Digest> {
-        self.0.get(&key).copied()
+        self.0.get(&key).copied().or_else(|| match key {
+            // Test fixtures and v1 callers may still provide the old aggregate
+            // key. Schema-v2 receipts are emitted with the split keys, but this
+            // compatibility fallback keeps those inputs readable rather than
+            // reclassifying them as a different contract.
+            DependencyKey::DesignMockArtifact | DependencyKey::ArchitecturePlan => {
+                self.0.get(&DependencyKey::DesignArtifacts).copied()
+            }
+            _ => None,
+        })
     }
 }
 
@@ -794,14 +1718,18 @@ impl DependencyPolicy {
     pub fn for_phase(phase: Phase) -> &'static [DependencyKey] {
         use DependencyKey::*;
         match phase {
-            // Design/Architecture bind design artifacts and governance.
-            Phase::DesignMock | Phase::DesignReview | Phase::DesignSignoff => {
-                &[Scope, DesignArtifacts, Governance]
+            Phase::DesignMock => &[Scope, DesignMockArtifact, Governance],
+            // Risk-relevant config is represented by the versioned assessment
+            // folded into Governance below. Binding the whole Config object
+            // here would make unrelated persona tuning retroactively stale
+            // Architecture instead of the phase whose instructions changed.
+            Phase::Architecture => &[Scope, ArchitecturePlan, Governance],
+            Phase::DesignReview | Phase::DesignSignoff => {
+                &[Scope, DesignMockArtifact, ArchitecturePlan, Governance]
             }
-            Phase::Architecture => &[Scope, DesignArtifacts, Governance],
-            // Security (plan) binds Architecture's set plus source, plus the
-            // persona's effective directive (persona-tuning).
-            Phase::SecurityPlan => &[Scope, DesignArtifacts, Governance, Source, PersonaTuning],
+            // Source drift begins a fresh implementation at Build; it does not
+            // retroactively invalidate the already-approved plan review.
+            Phase::SecurityPlan => &[Scope, ArchitecturePlan, Governance, PersonaTuning],
             // Build binds source, test command, toolchain, and produced artifact
             // digests; it may additionally bind the hermetic keys under an
             // explicit project opt-in. (Build is not in the governed persona-tuning
@@ -836,7 +1764,7 @@ impl DependencyPolicy {
             // hermetic-eligible.
             Phase::SecurityCode => &[
                 Scope,
-                DesignArtifacts,
+                ArchitecturePlan,
                 Governance,
                 Source,
                 ScannerIdentity,
@@ -953,6 +1881,205 @@ pub fn evidence_validity(
     } else {
         EvidenceValidity::Stale(reasons)
     }
+}
+
+pub const RISK_CLASSIFIER_VERSION: u32 = 1;
+
+/// Derive the minimum review risk from declared scope and the small set of
+/// execution-bearing configuration signals. This deliberately classifies
+/// conservatively: an unknown path below a sensitive root is High.
+pub fn classify_effective_risk(
+    manifest: &ChangeManifest,
+    config: &crate::config::Config,
+    requested: RiskLevel,
+) -> RiskAssessment {
+    let mut reasons = Vec::new();
+    let mut paths = manifest.paths.clone();
+    paths.extend(manifest.shared_paths.clone());
+    paths.sort();
+    paths.dedup();
+
+    let categories: [(&str, &[&str]); 9] = [
+        (
+            "auth-or-credential",
+            &["auth", "credential", "secret", "token", "keychain"],
+        ),
+        (
+            "parser-or-untrusted-input",
+            &["parser", "parse", "codec", "decode", "protocol", "input"],
+        ),
+        (
+            "network",
+            &["network", "http", "socket", "client", "server"],
+        ),
+        (
+            "process-execution",
+            &["process", "exec", "command", "shell", "scripts/"],
+        ),
+        ("git-or-hooks", &[".git", "git/", "hook"]),
+        (
+            "persistence",
+            &[
+                "persist",
+                "database",
+                "sqlite",
+                "storage",
+                "migration",
+                "save",
+            ],
+        ),
+        ("sandbox", &["sandbox", "seatbelt", "bwrap"]),
+        (
+            "cryptography",
+            &["crypto", "cipher", "encrypt", "signature"],
+        ),
+        ("deployment", &["deploy", "install", "release", "package"]),
+    ];
+    let sensitive_roots = [
+        ".githooks/",
+        ".mpd/",
+        "security/",
+        "scripts/",
+        "crates/mpd/src/checks",
+        "crates/mpd/src/config",
+        "crates/mpd/src/git",
+        "crates/mpd/src/local_validation",
+        "crates/mpd/src/sandbox",
+    ];
+    for path in &paths {
+        let lower = path.to_ascii_lowercase();
+        let before = reasons.len();
+        for (category, needles) in categories {
+            if needles.iter().any(|needle| lower.contains(needle)) {
+                reasons.push(format!("{category}: {path}"));
+            }
+        }
+        if reasons.len() == before && sensitive_roots.iter().any(|root| lower.starts_with(root)) {
+            reasons.push(format!("unknown-sensitive-path: {path}"));
+        }
+    }
+    if config.deploy.is_some()
+        || config
+            .local_validation
+            .as_ref()
+            .and_then(|local| local.deploy_output.as_ref())
+            .is_some()
+    {
+        reasons.push("deployment-configured".into());
+    }
+    if config.local_validation.is_some() {
+        reasons.push("local-validation-process-hook-sandbox-policy".into());
+    }
+    reasons.sort();
+    reasons.dedup();
+    let derived = if reasons.is_empty() {
+        RiskLevel::Low
+    } else {
+        RiskLevel::High
+    };
+    let effective = requested.max(derived);
+    let signal_bytes = serde_json::to_vec(&(
+        RISK_CLASSIFIER_VERSION,
+        &paths,
+        &reasons,
+        config.deploy.is_some(),
+        config.local_validation.is_some(),
+    ))
+    .expect("risk classifier tuple is serializable");
+    RiskAssessment {
+        classifier_version: RISK_CLASSIFIER_VERSION,
+        requested,
+        derived,
+        effective,
+        reasons,
+        signal_digest: Digest::of_bytes(&signal_bytes).to_hex(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StaleEvidenceProjection {
+    pub phase: Phase,
+    pub rewind_phase: Phase,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FreshnessProjection {
+    pub stored_phase: Phase,
+    pub effective_phase: Phase,
+    pub stale: Vec<StaleEvidenceProjection>,
+}
+
+fn stale_dependency_rewind(receipt_phase: Phase, reason: &StaleReason) -> Phase {
+    match reason {
+        StaleReason::SchemaChanged { .. } => receipt_phase,
+        StaleReason::DependencyChanged(key) => match key {
+            DependencyKey::DesignMockArtifact => Phase::DesignMock,
+            DependencyKey::Scope
+            | DependencyKey::Config
+            | DependencyKey::DesignArtifacts
+            | DependencyKey::ArchitecturePlan => Phase::Architecture,
+            DependencyKey::Governance => match receipt_phase {
+                Phase::SecurityPlan | Phase::SecurityCode => Phase::SecurityPlan,
+                _ => Phase::Architecture,
+            },
+            DependencyKey::Source
+            | DependencyKey::TestCommand
+            | DependencyKey::Toolchain
+            | DependencyKey::ProducedArtifact
+            | DependencyKey::ScannerIdentity
+            | DependencyKey::AllowlistDigest
+            | DependencyKey::ShippedBehavior
+            | DependencyKey::HermeticPlatform
+            | DependencyKey::HermeticExecutable
+            | DependencyKey::HermeticEnvironment
+            | DependencyKey::HermeticInput => Phase::Build,
+            DependencyKey::Documentation => Phase::Documentation,
+            DependencyKey::DeployCommand => Phase::Deploy,
+            DependencyKey::PersonaTuning => receipt_phase,
+        },
+    }
+}
+
+/// Read-only projection of current PASS evidence. Legacy receipt absence is
+/// reported elsewhere but is not invented into a content-staleness rewind.
+pub fn freshness_projection(
+    root: &Path,
+    change: &str,
+    ledger: &crate::ledger::Ledger,
+    config: &crate::config::Config,
+) -> Result<FreshnessProjection, String> {
+    let mut stale = Vec::new();
+    for (&phase, record) in &ledger.gates {
+        if record.verdict != Verdict::Pass || record.receipt.is_none() {
+            continue;
+        }
+        let values = capture_dependency_values(root, change, ledger, config, phase)?;
+        if let EvidenceValidity::Stale(found) = evidence_validity(record.receipt.as_ref(), &values)
+        {
+            let rewind_phase = found
+                .iter()
+                .map(|reason| stale_dependency_rewind(phase, reason))
+                .min()
+                .unwrap_or(phase);
+            stale.push(StaleEvidenceProjection {
+                phase,
+                rewind_phase,
+                reasons: found.into_iter().map(|reason| reason.to_string()).collect(),
+            });
+        }
+    }
+    stale.sort_by_key(|item| (item.rewind_phase, item.phase));
+    let earliest = stale
+        .iter()
+        .map(|item| item.rewind_phase)
+        .min()
+        .unwrap_or(ledger.phase);
+    Ok(FreshnessProjection {
+        stored_phase: ledger.phase,
+        effective_phase: ledger.phase.min(earliest),
+        stale,
+    })
 }
 
 // =====================================================================
@@ -1362,21 +2489,25 @@ fn source_digest(
     // phase-causality violation design.md:398-401 forbids (Security-code
     // finding source-includes-later-phase-output). Spec deltas under the
     // change dir have no dedicated key and stay bound by Source.
-    let change_process_artifacts: [String; 4] = [
+    let change_process_artifacts: [String; 11] = [
         format!("{}/proposal.md", system.change_dir),
         format!("{}/design.md", system.change_dir),
         format!("{}/tasks.md", system.change_dir),
         format!("{}/documentation.md", system.change_dir),
+        format!("{}/design-mock.md", system.change_dir),
+        format!("{}/design-review.md", system.change_dir),
+        format!("{}/security-plan.md", system.change_dir),
+        format!("{}/security-code.md", system.change_dir),
+        format!("{}/design-signoff.md", system.change_dir),
+        format!("{}/test.md", system.change_dir),
+        format!("{}/doc-validation.md", system.change_dir),
     ];
     let mut entries = Vec::new();
     for path in paths {
         // Receipt-bearing ledgers and local caches are deliberately excluded:
         // otherwise recording a receipt would immediately mutate its own
         // Source dependency and make it stale by self-reference.
-        if path.starts_with(".mpd/state/")
-            || path == ".mpd/current"
-            || path == ".mpd/pending-closure"
-            || path == ".mpd/parity-observations.json"
+        if path.starts_with(".mpd/")
             || change_process_artifacts.contains(&path)
             || !manifest.covers(&path, system)
         {
@@ -1473,8 +2604,24 @@ pub fn capture_dependency_values(
         ],
     )?;
     let source = source_digest(root, &manifest, &system)?;
-    let design = digest_named_bytes(
-        "design-artifacts",
+    let design_mock = digest_named_bytes(
+        "design-mock-artifact",
+        &[(
+            "design-mock.md",
+            read_optional(root, &format!("openspec/changes/{change}/design-mock.md")),
+        )],
+    )?;
+    let task_bytes = match Project::new(root).task_plan(change) {
+        Ok(plan) if plan.strict => plan.normalized_progress_record().into_bytes(),
+        Ok(_) => read_optional(root, &format!("openspec/changes/{change}/tasks.md")),
+        Err(error) => {
+            return Err(format!(
+                "invalid tasks.md for Architecture receipt: {error}"
+            ))
+        }
+    };
+    let architecture_plan = digest_named_bytes(
+        "architecture-plan",
         &[
             (
                 "proposal.md",
@@ -1484,14 +2631,31 @@ pub fn capture_dependency_values(
                 "design.md",
                 read_optional(root, &format!("openspec/changes/{change}/design.md")),
             ),
-            (
-                "tasks.md",
-                read_optional(root, &format!("openspec/changes/{change}/tasks.md")),
-            ),
+            ("tasks.md-normalized", task_bytes),
         ],
     )?;
-    let governance =
-        Digest::of_bytes(&serde_json::to_vec(&ledger.governance).map_err(|e| e.to_string())?);
+    let risk = classify_effective_risk(&manifest, config, ledger.governance.risk);
+    // Reconciliations authorize another attempt; they do not change the
+    // approved threat model. Including them would make `mpd resolve` stale
+    // Architecture immediately after recording the authorization. The stable
+    // governance dependency is the requested risk, threat profile, and the
+    // current versioned classifier result.
+    let governance = match phase {
+        // Risk shapes Architecture. Threat-profile changes are independently
+        // governed by Security(plan), so do not make them masquerade as an
+        // architecture-plan change.
+        Phase::SecurityPlan | Phase::SecurityCode => Digest::of_bytes(
+            &serde_json::to_vec(&(
+                ledger.governance.risk,
+                &ledger.governance.threat_profile,
+                &risk,
+            ))
+            .map_err(|e| e.to_string())?,
+        ),
+        _ => Digest::of_bytes(
+            &serde_json::to_vec(&(ledger.governance.risk, &risk)).map_err(|e| e.to_string())?,
+        ),
+    };
     let test_command = Digest::of_bytes(config.test.as_deref().unwrap_or("").as_bytes());
     let deploy_command = Digest::of_bytes(config.deploy.as_deref().unwrap_or("").as_bytes());
     let toolchain_text = Command::new("rustc")
@@ -1518,7 +2682,9 @@ pub fn capture_dependency_values(
             DependencyKey::Config,
             Digest::of_bytes(&serde_json::to_vec(config).map_err(|e| e.to_string())?),
         )
-        .with(DependencyKey::DesignArtifacts, design)
+        .with(DependencyKey::DesignArtifacts, architecture_plan)
+        .with(DependencyKey::DesignMockArtifact, design_mock)
+        .with(DependencyKey::ArchitecturePlan, architecture_plan)
         .with(DependencyKey::TestCommand, test_command)
         .with(DependencyKey::Toolchain, toolchain)
         .with(DependencyKey::ProducedArtifact, source)
@@ -1815,6 +2981,35 @@ pub fn verify_commit_coherence(
     let digest = scoped_digest_for_patterns(root, &closure.allowed_paths)?;
     if digest != closure.post_archive_digest {
         blockers.push("current scoped content differs from the archived postimage".into());
+    }
+    if let Some(candidate_id) = &closure.candidate_id {
+        match load_candidate_closure_plan(root, &closure.transaction_id.to_hex()) {
+            Ok(plan) => {
+                if plan.candidate_id != *candidate_id
+                    || plan.candidate_base_commit != closure.base_commit
+                    || plan.archive_path != closure.archive_path
+                    || plan.archive_transaction_id != closure.transaction_id.to_hex()
+                {
+                    blockers.push(
+                        "Candidate closure plan binding differs from the archive record".into(),
+                    );
+                } else {
+                    match verify_candidate_commit_equivalence(root, &head_oid, &plan) {
+                        Ok(equivalence) if equivalence.equivalent => {}
+                        Ok(equivalence) => blockers.extend(
+                            equivalence
+                                .blockers
+                                .into_iter()
+                                .map(|blocker| format!("Candidate closure mismatch: {blocker}")),
+                        ),
+                        Err(error) => blockers.push(format!(
+                            "Candidate closure comparison is unavailable: {error}"
+                        )),
+                    }
+                }
+            }
+            Err(error) => blockers.push(format!("Candidate closure plan is unavailable: {error}")),
+        }
     }
     blockers.sort();
     blockers.dedup();
@@ -2197,6 +3392,7 @@ mod tests {
             base_commit: "a".repeat(40),
             archive_path: "openspec/changes/archive/2026-07-16-add-thing".to_string(),
             transaction_id: Digest::of_bytes(b"txn"),
+            candidate_id: None,
             allowed_paths: vec!["crates/mpd/**".to_string()],
             system_paths: vec!["openspec/changes/archive/2026-07-16-add-thing".to_string()],
             post_archive_digest: Digest::of_bytes(b"post"),
@@ -2263,6 +3459,8 @@ mod tests {
             DependencyKey::Governance,
             DependencyKey::Config,
             DependencyKey::DesignArtifacts,
+            DependencyKey::DesignMockArtifact,
+            DependencyKey::ArchitecturePlan,
             DependencyKey::TestCommand,
             DependencyKey::Toolchain,
             DependencyKey::ProducedArtifact,
@@ -2287,6 +3485,8 @@ mod tests {
                 | DependencyKey::Governance
                 | DependencyKey::Config
                 | DependencyKey::DesignArtifacts
+                | DependencyKey::DesignMockArtifact
+                | DependencyKey::ArchitecturePlan
                 | DependencyKey::TestCommand
                 | DependencyKey::Toolchain
                 | DependencyKey::ProducedArtifact
@@ -2314,6 +3514,8 @@ mod tests {
             DependencyKey::Governance,
             DependencyKey::Config,
             DependencyKey::DesignArtifacts,
+            DependencyKey::DesignMockArtifact,
+            DependencyKey::ArchitecturePlan,
             DependencyKey::TestCommand,
             DependencyKey::Toolchain,
             DependencyKey::ProducedArtifact,
@@ -2565,6 +3767,65 @@ mod system_scope_tests {
 // =====================================================================
 
 #[cfg(test)]
+mod risk_classifier_tests {
+    use super::*;
+
+    fn manifest(path: &str) -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: vec![path.into()],
+            shared_paths: vec![],
+            publish: None,
+        }
+    }
+
+    #[test]
+    fn representative_sensitive_signals_and_unknown_sensitive_paths_are_high() {
+        for path in [
+            "src/auth/token.rs",
+            "src/parser/decode.rs",
+            "src/network/client.rs",
+            "src/process/exec.rs",
+            ".githooks/pre-push",
+            "src/persistence/store.rs",
+            "src/sandbox/profile.rs",
+            "src/crypto/signature.rs",
+            "src/deploy/install.rs",
+            "security/unclassified-policy.data",
+        ] {
+            let result = classify_effective_risk(
+                &manifest(path),
+                &crate::config::Config::default(),
+                RiskLevel::Low,
+            );
+            assert_eq!(result.derived, RiskLevel::High, "{path}");
+            assert_eq!(result.effective, RiskLevel::High, "{path}");
+            assert!(!result.reasons.is_empty(), "{path}");
+            assert_eq!(result.signal_digest.len(), 64);
+        }
+    }
+
+    #[test]
+    fn candidate_config_and_deploy_signals_cannot_lower_requested_risk() {
+        let config = crate::config::Config {
+            deploy: Some("install reviewed artifact".into()),
+            ..Default::default()
+        };
+        let result =
+            classify_effective_risk(&manifest(".mpd/config.json"), &config, RiskLevel::Low);
+        assert_eq!(result.requested, RiskLevel::Low);
+        assert_eq!(result.derived, RiskLevel::High);
+        assert_eq!(result.effective, RiskLevel::High);
+    }
+
+    #[test]
+    fn source_is_not_a_security_plan_dependency() {
+        assert!(!DependencyPolicy::for_phase(Phase::SecurityPlan).contains(&DependencyKey::Source));
+        assert!(DependencyPolicy::for_phase(Phase::SecurityCode).contains(&DependencyKey::Source));
+    }
+}
+
+#[cfg(test)]
 mod dependency_policy_tests {
     use super::*;
 
@@ -2573,19 +3834,19 @@ mod dependency_policy_tests {
         use DependencyKey::*;
         assert_eq!(
             DependencyPolicy::for_phase(Phase::DesignMock),
-            &[Scope, DesignArtifacts, Governance]
+            &[Scope, DesignMockArtifact, Governance]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::Architecture),
-            &[Scope, DesignArtifacts, Governance]
+            &[Scope, ArchitecturePlan, Governance]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::DesignReview),
-            &[Scope, DesignArtifacts, Governance]
+            &[Scope, DesignMockArtifact, ArchitecturePlan, Governance]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::SecurityPlan),
-            &[Scope, DesignArtifacts, Governance, Source, PersonaTuning]
+            &[Scope, ArchitecturePlan, Governance, PersonaTuning]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::Build),
@@ -2621,7 +3882,7 @@ mod dependency_policy_tests {
             DependencyPolicy::for_phase(Phase::SecurityCode),
             &[
                 Scope,
-                DesignArtifacts,
+                ArchitecturePlan,
                 Governance,
                 Source,
                 ScannerIdentity,
@@ -2635,7 +3896,7 @@ mod dependency_policy_tests {
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::DesignSignoff),
-            &[Scope, DesignArtifacts, Governance]
+            &[Scope, DesignMockArtifact, ArchitecturePlan, Governance]
         );
         assert_eq!(
             DependencyPolicy::for_phase(Phase::Documentation),
@@ -2668,9 +3929,11 @@ mod dependency_policy_tests {
         use DependencyKey::*;
         match key {
             // Config-like / directive inputs available from the start.
-            Scope | Source | Governance | Config | DesignArtifacts | TestCommand | Toolchain
-            | DeployCommand | PersonaTuning | HermeticPlatform | HermeticExecutable
-            | HermeticEnvironment | HermeticInput => Phase::DesignMock,
+            Scope | Source | Governance | Config | DesignArtifacts | DesignMockArtifact
+            | ArchitecturePlan | TestCommand | Toolchain | DeployCommand | PersonaTuning
+            | HermeticPlatform | HermeticExecutable | HermeticEnvironment | HermeticInput => {
+                Phase::DesignMock
+            }
             ProducedArtifact => Phase::Build,
             ScannerIdentity | AllowlistDigest => Phase::SecurityCode,
             ShippedBehavior => Phase::Test,
@@ -3445,6 +4708,271 @@ mod manifest_io_tests {
     }
 }
 
+#[cfg(test)]
+mod candidate_closure_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command as StdCommand;
+
+    fn tree_entry(path: &str, mode: u32, bytes: &[u8]) -> ClosureTreeEntry {
+        ClosureTreeEntry {
+            path: path.into(),
+            mode,
+            byte_len: bytes.len() as u64,
+            sha256: Digest::of_bytes(bytes).to_hex(),
+        }
+    }
+
+    fn plan(entries: Vec<ClosureTreeEntry>, base: &str) -> CandidateClosurePlan {
+        CandidateClosurePlan {
+            schema: CANDIDATE_CLOSURE_SCHEMA,
+            candidate_id: "a".repeat(64),
+            candidate_base_commit: base.into(),
+            archive_path: "openspec/changes/archive/2026-07-19-change".into(),
+            archive_transaction_id: "b".repeat(64),
+            overlay_digest: "c".repeat(64),
+            expected_tree_digest: closure_tree_digest(&entries).unwrap(),
+            entries,
+        }
+    }
+
+    #[test]
+    fn exact_tree_keeps_candidate_and_commit_subjects_separate() {
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let proof = compare_candidate_closure_entries(
+            &plan(entries.clone(), &"1".repeat(40)),
+            &"2".repeat(40),
+            &entries,
+        )
+        .unwrap();
+        assert!(proof.equivalent, "{:?}", proof.blockers);
+        assert_eq!(proof.candidate_id, "a".repeat(64));
+        assert_eq!(proof.commit_oid, "2".repeat(40));
+        assert_ne!(proof.candidate_id, proof.commit_oid);
+    }
+
+    #[test]
+    fn full_tree_comparison_rejects_every_required_mismatch_family() {
+        let expected = vec![
+            tree_entry("config/app.json", 0o100644, b"{}\n"),
+            tree_entry("scripts/check.sh", 0o100755, b"#!/bin/sh\n"),
+            tree_entry("src/main.rs", 0o100644, b"source\n"),
+            tree_entry(
+                "openspec/changes/archive/2026-07-19-change/tasks.md",
+                0o100644,
+                b"- [x] done\n",
+            ),
+            tree_entry(
+                "openspec/changes/archive/2026-07-19-change/test.md",
+                0o100644,
+                b"fresh overlay\n",
+            ),
+        ];
+        let expected_plan = plan(expected.clone(), &"1".repeat(40));
+        let cases = [
+            (
+                "extra",
+                {
+                    let mut v = expected.clone();
+                    v.push(tree_entry("extra.txt", 0o100644, b"extra"));
+                    v.sort_by(|a, b| a.path.cmp(&b.path));
+                    v
+                },
+                "extra path",
+            ),
+            ("missing", expected[1..].to_vec(), "missing path"),
+            (
+                "source",
+                replace(&expected, "src/main.rs", 0o100644, b"changed\n"),
+                "content digest mismatch",
+            ),
+            (
+                "config",
+                replace(
+                    &expected,
+                    "config/app.json",
+                    0o100644,
+                    b"{\"lowered\":true}\n",
+                ),
+                "content digest mismatch",
+            ),
+            (
+                "script",
+                replace(
+                    &expected,
+                    "scripts/check.sh",
+                    0o100755,
+                    b"#!/bin/sh\nexit 0\n",
+                ),
+                "content digest mismatch",
+            ),
+            (
+                "task",
+                replace(
+                    &expected,
+                    "openspec/changes/archive/2026-07-19-change/tasks.md",
+                    0o100644,
+                    b"- [ ] reopened\n",
+                ),
+                "content digest mismatch",
+            ),
+            (
+                "mode",
+                replace(&expected, "scripts/check.sh", 0o100644, b"#!/bin/sh\n"),
+                "mode mismatch",
+            ),
+            (
+                "rename",
+                {
+                    let mut v = expected.clone();
+                    v.retain(|entry| entry.path != "src/main.rs");
+                    v.push(tree_entry("src/renamed.rs", 0o100644, b"source\n"));
+                    v.sort_by(|a, b| a.path.cmp(&b.path));
+                    v
+                },
+                "missing path",
+            ),
+            (
+                "deletion",
+                expected[..expected.len() - 1].to_vec(),
+                "missing path",
+            ),
+            (
+                "stale-overlay",
+                replace(
+                    &expected,
+                    "openspec/changes/archive/2026-07-19-change/test.md",
+                    0o100644,
+                    b"stale overlay\n",
+                ),
+                "content digest mismatch",
+            ),
+        ];
+        for (label, observed, blocker) in cases {
+            let proof =
+                compare_candidate_closure_entries(&expected_plan, &"2".repeat(40), &observed)
+                    .unwrap();
+            assert!(!proof.equivalent, "{label} unexpectedly passed");
+            assert!(
+                proof.blockers.iter().any(|value| value.contains(blocker)),
+                "{label}: {:?}",
+                proof.blockers
+            );
+        }
+    }
+
+    fn replace(
+        entries: &[ClosureTreeEntry],
+        path: &str,
+        mode: u32,
+        bytes: &[u8],
+    ) -> Vec<ClosureTreeEntry> {
+        entries
+            .iter()
+            .map(|entry| {
+                if entry.path == path {
+                    tree_entry(path, mode, bytes)
+                } else {
+                    entry.clone()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn direct_commit_materialization_is_compared_by_path_mode_and_sha256() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-candidate-closure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "closure"]);
+        let commit = git::head_commit(&root).unwrap().unwrap();
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let proof =
+            verify_candidate_commit_equivalence(&root, &commit, &plan(entries, &commit)).unwrap();
+        assert!(proof.equivalent, "{:?}", proof.blockers);
+        assert_eq!(proof.commit_oid, commit);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn modern_commit_coherence_requires_the_saved_candidate_closure_plan() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-candidate-coherence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "closure"]);
+
+        let entries = vec![
+            tree_entry("README.md", 0o100644, b"base\n"),
+            tree_entry("src/main.rs", 0o100644, b"fn main() {}\n"),
+        ];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let allowed_paths = vec!["**".to_string()];
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: allowed_paths.clone(),
+            system_paths: Vec::new(),
+            post_archive_digest: scoped_digest_for_patterns(&root, &allowed_paths).unwrap(),
+            archived_at: 1,
+        };
+        let coherent = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(coherent.coherent, "{:?}", coherent.blockers);
+
+        fs::remove_file(
+            candidate_closure_plan_directory(&root, false)
+                .unwrap()
+                .join(format!("{}.json", candidate_plan.archive_transaction_id)),
+        )
+        .unwrap();
+        let missing = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(!missing.coherent);
+        assert!(missing
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("plan is unavailable")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = StdCommand::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "Closure Test")
+            .env("GIT_AUTHOR_EMAIL", "closure@example.com")
+            .env("GIT_COMMITTER_NAME", "Closure Test")
+            .env("GIT_COMMITTER_EMAIL", "closure@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+}
+
 // =====================================================================
 // Commit-coherence + remote-parity tests (real Git repositories)
 // =====================================================================
@@ -3588,6 +5116,7 @@ mod remote_parity_tests {
             base_commit: base.to_string(),
             archive_path: "openspec/changes/archive/2026-01-01-test".into(),
             transaction_id: Digest::of_bytes(b"test-transaction"),
+            candidate_id: None,
             allowed_paths: allowed.iter().map(|s| s.to_string()).collect(),
             system_paths: Vec::new(),
             post_archive_digest: digest,

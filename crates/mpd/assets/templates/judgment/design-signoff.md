@@ -1,5 +1,9 @@
 # Design sign-off
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; not authenticated. -->
+
 ## Implementation vs intent
 
 <!-- The built implementation checked against the mock and the intent: it is what

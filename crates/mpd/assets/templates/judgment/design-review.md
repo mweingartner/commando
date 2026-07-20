@@ -1,5 +1,9 @@
 # Design review / revision
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; not authenticated. -->
+
 ## Intent check
 
 <!-- Does the planned implementation still realize the mock and the design

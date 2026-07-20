@@ -1,5 +1,234 @@
 {
   "test": "cargo test --workspace",
+  "local_validation": {
+    "schema": 1,
+    "required-toolchain": {
+      "rust-release": "1.91.0",
+      "host": "aarch64-apple-darwin",
+      "components": ["cargo", "rustc", "rustfmt", "cargo-clippy"]
+    },
+    "tools": {
+      "cargo": {
+        "program": "cargo",
+        "version-args": ["--version"],
+        "requirement": "required",
+        "install-hint": "Install the reviewed Rust 1.91.0 Homebrew package root recorded in security/tool-lock.json."
+      },
+      "rustc": {
+        "program": "rustc",
+        "version-args": ["--version"],
+        "requirement": "required",
+        "install-hint": "Install the reviewed Rust 1.91.0 Homebrew package root recorded in security/tool-lock.json."
+      },
+      "rustfmt": {
+        "program": "rustfmt",
+        "version-args": [
+          "--version"
+        ],
+        "requirement": "required",
+        "install-hint": "Install the reviewed Rust 1.91.0 Homebrew package root recorded in security/tool-lock.json."
+      },
+      "cargo-clippy": {
+        "program": "cargo-clippy",
+        "version-args": [
+          "--version"
+        ],
+        "requirement": "required",
+        "install-hint": "Install the reviewed Rust 1.91.0 Homebrew package root recorded in security/tool-lock.json."
+      },
+      "cargo-audit": {
+        "program": "cargo-audit",
+        "version-args": ["--version"],
+        "requirement": "required",
+        "install-hint": "Outside validation, run bash scripts/bootstrap-local-ci.sh to install the reviewed clone-private cargo-audit binary from security/tool-lock.json."
+      },
+      "gitleaks": {
+        "program": "gitleaks",
+        "version-args": ["version"],
+        "requirement": "required",
+        "install-hint": "Install the reviewed Homebrew gitleaks package root recorded in security/tool-lock.json."
+      },
+      "semgrep": {
+        "program": "semgrep",
+        "version-args": ["--version"],
+        "requirement": "required",
+        "install-hint": "Outside validation, run bash scripts/bootstrap-local-ci.sh to verify/install the reviewed Semgrep package from security/tool-lock.json."
+      },
+      "mpd-self": {
+        "program": "mpd-self",
+        "version-args": ["--version"],
+        "requirement": "required",
+        "install-hint": "Use the separately reviewed active MPD coordinator whose executable digest and local validation authority are recorded in the trusted policy."
+      }
+    },
+    "checks": {
+      "format": {
+        "kind": "format",
+        "program": "cargo",
+        "args": ["fmt", "--all", "--", "--check"],
+        "timeout-secs": 180,
+        "result-policy": "exit-zero"
+      },
+      "clippy": {
+        "kind": "lint",
+        "program": "cargo",
+        "args": ["clippy", "--workspace", "--all-targets", "--offline", "--locked", "--", "-D", "warnings"],
+        "timeout-secs": 900,
+        "result-policy": "exit-zero"
+      },
+      "workspace-tests": {
+        "kind": "test",
+        "program": "cargo",
+        "args": ["test", "--workspace", "--offline", "--locked"],
+        "timeout-secs": 1200,
+        "result-policy": "rust-test-count"
+      },
+      "release-build": {
+        "kind": "release-build",
+        "program": "cargo",
+        "args": ["build", "--workspace", "--release", "--offline", "--locked"],
+        "timeout-secs": 1200,
+        "result-policy": "exit-zero"
+      },
+      "dependency-audit": {
+        "kind": "dependency-audit",
+        "program": "cargo-audit",
+        "args": ["audit", "--no-fetch", "--db", "${MPD_ADVISORY_DB}"],
+        "timeout-secs": 300,
+        "result-policy": "exit-zero"
+      },
+      "gitleaks": {
+        "kind": "secret-scan",
+        "program": "gitleaks",
+        "args": ["dir", "--no-banner", "--redact", "--exit-code", "1", "."],
+        "timeout-secs": 300,
+        "result-policy": "exit-zero"
+      },
+      "semgrep": {
+        "kind": "sast",
+        "program": "semgrep",
+        "args": ["--config", "security/semgrep/local-ci.yml", "--error", "--metrics=off", "--disable-version-check", "--no-trace", "."],
+        "timeout-secs": 600,
+        "result-policy": "exit-zero"
+      },
+      "policy-static": {
+        "kind": "self-check",
+        "program": "mpd-self",
+        "args": ["__mpd-static-policy-check"],
+        "timeout-secs": 180,
+        "result-policy": "exit-zero"
+      },
+      "phase-model-tests": {
+        "kind": "nonfunctional",
+        "program": "cargo",
+        "args": ["test", "-p", "mpd", "ledger::tests", "--offline", "--locked"],
+        "timeout-secs": 600,
+        "result-policy": "rust-test-count"
+      },
+      "scoped-digest-throughput": {
+        "kind": "nonfunctional",
+        "program": "cargo",
+        "args": ["test", "--release", "-p", "mpd", "scoped_digest_throughput_over_10k_paths_100mb", "--offline", "--locked", "--", "--ignored", "--nocapture"],
+        "timeout-secs": 1800,
+        "result-policy": "rust-test-count"
+      }
+    },
+    "profiles": {
+      "build": {
+        "checks": ["format", "clippy", "workspace-tests", "release-build"]
+      },
+      "security-code": {
+        "checks": ["policy-static", "dependency-audit", "gitleaks", "semgrep"]
+      },
+      "test": {
+        "checks": ["format", "clippy", "workspace-tests", "release-build", "dependency-audit", "gitleaks", "semgrep", "policy-static"]
+      },
+      "pre-push": {
+        "includes": ["test"],
+        "checks": []
+      },
+      "high-risk-test": {
+        "includes": ["test"],
+        "checks": ["phase-model-tests", "scoped-digest-throughput"]
+      }
+    },
+    "gates": {
+      "build": "build",
+      "security-code": "security-code",
+      "test": "test",
+      "pre-push": "pre-push",
+      "high-risk-test": "high-risk-test"
+    },
+    "hooks": {
+      "path": ".githooks",
+      "require-bundled": true
+    },
+    "receipts": {
+      "log-count-cap": 64,
+      "log-byte-cap": 1048576
+    },
+    "offline": {
+      "cargo-lock": "Cargo.lock",
+      "cargo-target": "aarch64-apple-darwin",
+      "advisory-db-path": "mpd/advisory-db",
+      "advisory-revision": "b5fc89b8be99e96f79194d8a6f11e9b4143b99f0",
+      "advisory-tree": "c943a47fee3f2b9767f664fd26c2cb6f0447b23d",
+      "advisory-max-age-days": 30
+    },
+    "sandbox": {
+      "contract-version": 1,
+      "network-adapter": "platform-mandatory",
+      "environment-allowlist": [
+        "CARGO_HOME",
+        "CARGO_INCREMENTAL",
+        "CARGO_NET_OFFLINE",
+        "CARGO_TARGET_DIR",
+        "CARGO_TERM_COLOR",
+        "DEVELOPER_DIR",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_PAGER",
+        "GIT_TERMINAL_PROMPT",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "MPD_SANDBOXED",
+        "PAGER",
+        "PATH",
+        "RUSTC",
+        "SEMGREP_SEND_METRICS",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TMPDIR",
+        "TZ"
+      ]
+    },
+    "limits": {
+      "checks-per-profile": 64,
+      "aggregate-secs": 7200,
+      "output-bytes": 8388608,
+      "log-bytes": 1048576,
+      "worktree-bytes": 1073741824,
+      "child-processes": 512,
+      "child-open-files": 256,
+      "child-file-bytes": 1073741824
+    },
+    "build-output": {
+      "name": "mpd-release",
+      "path": ".mpd/build-output/mpd",
+      "max-bytes": 268435456,
+      "required-mode": 493
+    },
+    "deploy-output": {
+      "mode": "execute",
+      "artifact": "mpd-release",
+      "install": { "kind": "exact-copy" },
+      "installed-path": ".mpd/local/bin/mpd",
+      "target": "local-mpd-bin"
+    }
+  },
   "models": {
     "codex": {
       "Architect": "sol",

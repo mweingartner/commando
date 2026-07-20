@@ -1,4 +1,6 @@
 /current
 /tmp/
+/build-output/
+/local/
 /pending-closure
 /parity-observations.json

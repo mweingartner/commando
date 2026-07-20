@@ -66,8 +66,8 @@ impl Allowlist {
         }
         self.allow.iter().any(|e| {
             glob_match(&e.path, rel_path)
-                && e.rule.as_deref().map_or(true, |r| r == rule)
-                && e.line.map_or(true, |l| l == line)
+                && e.rule.as_deref().is_none_or(|r| r == rule)
+                && e.line.is_none_or(|l| l == line)
         })
     }
 

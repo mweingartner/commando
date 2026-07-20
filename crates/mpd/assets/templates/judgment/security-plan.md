@@ -1,5 +1,9 @@
 # Security (plan) review
 
+## Actor
+
+<!-- Exact cooperative actor label passed to `mpd gate`; not authenticated. -->
+
 ## Threat model
 
 <!-- The trust boundaries, attacker capabilities, and credential/egress surfaces

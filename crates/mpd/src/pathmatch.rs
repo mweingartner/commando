@@ -21,6 +21,50 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     match_segments(&pat, &txt)
 }
 
+/// Whether at least one strict descendant of `prefix` can match `pattern`.
+///
+/// Candidate capture uses this to prune unrelated worktree directories before
+/// enumeration.  The computation is a small NFA over path segments: `**` may
+/// consume a segment or advance without one, while every other segment must
+/// match exactly once.  A reachable non-terminal state after consuming the
+/// prefix means some additional segment sequence can complete the pattern.
+pub fn glob_may_match_descendant(pattern: &str, prefix: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('/').collect();
+    let txt: Vec<&str> = prefix.split('/').collect();
+    let mut states = vec![false; pat.len() + 1];
+    states[0] = true;
+    epsilon_close(&pat, &mut states);
+
+    for segment in txt {
+        let mut next = vec![false; pat.len() + 1];
+        for (index, reachable) in states.iter().copied().enumerate().take(pat.len()) {
+            if !reachable {
+                continue;
+            }
+            if pat[index] == "**" {
+                next[index] = true;
+            } else if segment_match(pat[index], segment) {
+                next[index + 1] = true;
+            }
+        }
+        epsilon_close(&pat, &mut next);
+        states = next;
+        if !states.iter().any(|reachable| *reachable) {
+            return false;
+        }
+    }
+
+    states[..pat.len()].iter().any(|reachable| *reachable)
+}
+
+fn epsilon_close(pattern: &[&str], states: &mut [bool]) {
+    for index in 0..pattern.len() {
+        if states[index] && pattern[index] == "**" {
+            states[index + 1] = true;
+        }
+    }
+}
+
 fn match_segments(pat: &[&str], txt: &[&str]) -> bool {
     let (mut pi, mut ti) = (0usize, 0usize);
     // The most recent `**` position, and where in `txt` it started matching.
@@ -96,6 +140,18 @@ mod tests {
         assert!(!glob_match("src/*.rs", "src/a/main.rs"));
         assert!(glob_match("a/**/c", "a/c"));
         assert!(glob_match("a/**/c", "a/b/x/c"));
+    }
+
+    #[test]
+    fn descendant_feasibility_prunes_only_impossible_subtrees() {
+        assert!(glob_may_match_descendant("src/**", "src"));
+        assert!(glob_may_match_descendant("src/**", "src/nested"));
+        assert!(!glob_may_match_descendant("src/**", "target"));
+        assert!(glob_may_match_descendant("src/*.rs", "src"));
+        assert!(!glob_may_match_descendant("src/*.rs", "src/nested"));
+        assert!(glob_may_match_descendant("**/spec.md", "target"));
+        assert!(glob_may_match_descendant("a/**/c", "a/b"));
+        assert!(!glob_may_match_descendant("README.md", "README.md"));
     }
 
     #[test]

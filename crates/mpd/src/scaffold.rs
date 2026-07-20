@@ -23,6 +23,7 @@ const T_DOCUMENTATION: &str = include_str!("../assets/templates/documentation.md
 // so an unfilled stub fails `check_sections` until a persona authors it.
 const T_JUDGMENT_SECURITY_PLAN: &str =
     include_str!("../assets/templates/judgment/security-plan.md");
+const T_JUDGMENT_DESIGN_MOCK: &str = include_str!("../assets/templates/judgment/design-mock.md");
 const T_JUDGMENT_SECURITY_CODE: &str =
     include_str!("../assets/templates/judgment/security-code.md");
 const T_JUDGMENT_DESIGN_REVIEW: &str =
@@ -41,47 +42,37 @@ const T_JUDGMENT_DOC_VALIDATION: &str =
 pub const TRANSIENT_GITIGNORE_ENTRIES: &[&str] = &[
     "/current",
     "/tmp/",
+    "/build-output/",
+    "/local/",
     "/pending-closure",
     "/parity-observations.json",
 ];
 
 const PROJECT_MD: &str = "# Project Context\n\n\
 <!-- Project-specific context for humans and agents. -->\n";
-const AGENTS_MD: &str = "# Agent Instructions\n\n\
-This project uses mpd (Model-Paired Development) over the OpenSpec format.\n\
-Run `mpd status` to see the current phase and `mpd next` for the next step.\n\
-Declare change scope in `manifest.json`; do not mix unrelated staged work.\n\
-After archive, commit and push normally, then run `mpd publish --verify`.\n\n\
-## Two ways to drive mpd\n\n\
-**Humans — manual verbs.** Drive the pipeline by hand with full control: \
-`mpd next` for the next step, `mpd gate <phase> --pass` to record a verdict, \
-`mpd status` to inspect. Only the objective gates (build/test pass count, secret \
-scan, doc structure, deploy) are enforced; judgment artifacts are not demanded. \
-The flow is byte-identical to the classic one.\n\n\
-**Model harnesses — `mpd conduct <name>`.** Start the change under the strict \
-tier, then follow the printed call-loop over the *unchanged* verbs:\n\n\
-```\n\
-loop:\n\
-  brief=$(mpd next --harness claude-code --context --json)  # slice + persona + model + artifact_path + gate_command\n\
-  break if brief.phase == \"done\"\n\
-  # spawn the persona at brief.model, fill brief.artifact_path, do the work\n\
-  mpd gate <phase> --pass --evidence <artifact_path>        # strict checks auto-apply from ledger.strict\n\
-mpd archive --yes\n\
-```\n\n\
-Strict is a durable per-change bit: every judgment gate demands its own non-stub \
-artifact (security-plan.md, security-code.md, test.md, …), `--evidence` must \
-resolve to that phase's own artifact, and archive re-checks that the artifacts \
-survived. A dropped call degrades loudly, not silently.\n\n\
-**Both tiers share the escape verbs** — no strict requirement is a dead-end:\n\
-- `mpd brief <phase>` — scaffold a phase's judgment-artifact stub to author.\n\
-- `mpd gate <phase> --pass --waive-artifact \"reason\"` — waive the artifact \
-check (audited, loud WAIVED banner; never bypasses an objective gate or a FAIL).\n\
-- `mpd use <change>` — restore `.mpd/current` after it was cleared.\n\
-- `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent).\n\
-- `mpd strict <change>` — promote an already-begun non-strict change to the \
-strict tier (monotonic, idempotent).\n\n\
-Strict is set at `conduct`/`begin --strict`, or later with `mpd strict <change>`, \
-and is write-once (no path sets it back to false) — a harness opts in once.\n";
+const AGENTS_MD: &str = r#"# Agent Instructions
+
+This project uses local-only MPD over OpenSpec and Git. Hosted CI is not validation
+authority. Start non-trivial work with `mpd conduct <change> --harness codex`, then
+repeat `mpd next --harness codex --context`, perform exactly the current role, and
+record `mpd gate <phase> --pass --by <actor> --evidence <artifact>`.
+
+The ordered gates are Design Mock, Architecture, Design Review, Security(plan), Build,
+Security(code), Design Sign-off, Test, Documentation, Doc Validation, and Deploy. Only
+Design phases may be N/A with a written rationale. Strict judgment artifacts require
+one exact Actor and canonical Verdict; actors differ from the latest upstream gate.
+There is no artifact waiver.
+
+Declare scope in `manifest.json`. Build, Security(code), and Test use one immutable
+exact Candidate; Candidate and Commit receipts are different. Stale causal inputs rewind
+before effects. Keep worktree, gates, validation, archive, commit, push authorization,
+transfer, parity, readiness, and installation separate in every report.
+
+Authoritative checks are local, typed, pinned, offline, resource-bounded, and network
+denied. Never add a shell-string, ambient-PATH, hosted, unsandboxed, broad-read, or
+weaker-platform fallback. After Done: `mpd archive --yes`, commit and push normally
+through the local hooks, then `mpd publish --verify`.
+"#;
 
 /// Outcome of an `init`.
 #[derive(Debug, Default)]
@@ -163,6 +154,7 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
         hermetic_reuse: None,
         closure: None,
         personas: std::collections::BTreeMap::new(),
+        local_validation: None,
     };
     let cfg_path = crate::config::config_path(root);
     if !cfg_path.exists() {
@@ -262,6 +254,7 @@ pub fn begin(
 /// at `begin`, so it reuses the design template (re-seeding is a no-op).
 fn judgment_template(phase: Phase) -> Option<&'static str> {
     Some(match phase {
+        Phase::DesignMock => T_JUDGMENT_DESIGN_MOCK,
         Phase::SecurityPlan => T_JUDGMENT_SECURITY_PLAN,
         Phase::SecurityCode => T_JUDGMENT_SECURITY_CODE,
         Phase::DesignReview => T_JUDGMENT_DESIGN_REVIEW,
@@ -409,6 +402,12 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mpd-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
         init(&root, Some("cargo test".into())).unwrap();
         super::begin(
             &root,
@@ -457,6 +456,12 @@ mod tests {
             gi.lines().any(|l| l.trim() == "/current"),
             "init must gitignore the transient current-change pointer: {gi:?}"
         );
+        for entry in ["/build-output/", "/local/"] {
+            assert!(
+                gi.lines().any(|line| line.trim() == entry),
+                "init must gitignore typed deployment artifact {entry}: {gi:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }

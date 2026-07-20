@@ -17,6 +17,10 @@ that every feature has proper and elegant representation.
   to fit? Revise the mock or send the plan back before any code is written.
 - **Sign-off:** inspect the actual built surface and representative states
   against the contract. No sign-off, no Test.
+- For CLI/process work, the actual surface includes help, human and JSON output,
+  PASS/FAIL/BLOCKED, missing-tool, offline, dirty, stale/corrupt receipt, direct and
+  nested-tag, scoped-doctor, Deploy, and owner-bypass states. Inspect real output;
+  prose alone is not sign-off.
 - Flag naming/pattern/visual drift the way you'd flag a false cognate.
 
 As a **Doc Validation** reviewer: verify the documentation conveys the purpose,

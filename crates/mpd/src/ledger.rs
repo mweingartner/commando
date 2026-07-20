@@ -5,11 +5,16 @@
 //! `.mpd/state/<change>.json` so it survives session death — the piece the
 //! in-session pipeline lacked.
 
+use crate::candidate::CandidateCapture;
 use crate::closure::{ArchiveClosure, EvidenceReceipt};
 use crate::phase::{Applicability, Phase};
-use openspec_core::validate_change_name;
+use openspec_core::{
+    atomic_write_contained_classified, validate_change_name, AtomicWriteOutcome, TaskEntry,
+    TaskPlan,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -179,6 +184,13 @@ impl RiskLevel {
             Self::High => 2,
         }
     }
+    pub fn max(self, other: RiskLevel) -> RiskLevel {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
     pub fn page_limit(self) -> Option<usize> {
         match self {
             Self::Low => Some(2),
@@ -186,6 +198,31 @@ impl RiskLevel {
             Self::High => None,
         }
     }
+}
+
+/// Versioned, content-bound risk classification for the current change inputs.
+/// `Governance::risk` remains the requested value for backward compatibility;
+/// all enforcement uses `effective` once an assessment has been computed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskAssessment {
+    pub classifier_version: u32,
+    pub requested: RiskLevel,
+    pub derived: RiskLevel,
+    pub effective: RiskLevel,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub signal_digest: String,
+}
+
+/// One append-only record that stale current evidence forced a causal rewind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreshnessInvalidationEvent {
+    pub schema: u32,
+    pub stored_phase: Phase,
+    pub rewind_phase: Phase,
+    pub stale_phases: Vec<Phase>,
+    pub reasons: Vec<String>,
+    pub at_epoch_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,14 +286,9 @@ pub struct Reconciliation {
     pub consumed: bool,
 }
 
-/// A recorded escape from a strict-tier judgment-artifact gate: the persona
-/// signed off but the structural artifact check was waived with a reason. A
-/// waiver never bypasses an objective gate and never converts a FAIL (design.md
-/// D5). It is **attempt-scoped** (mirroring [`Reconciliation`]): it applies only
-/// to the attempt it was recorded for, so a stale attempt-1 waiver cannot
-/// silently suppress the artifact gate on a re-run under a changed threat
-/// profile (design.md D7 / B1). `invalidate_from_security` drops waivers for the
-/// rewound phases, exactly as it drops their gate records.
+/// Legacy decoding shape for artifact waivers produced by older MPD releases.
+/// Current Commando policy never creates or honors these records; their presence
+/// on a strict ledger is a blocker until the affected gates are rewound and rerun.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Waiver {
     /// The judgment phase whose artifact check was waived.
@@ -287,30 +319,88 @@ pub fn bounded_text(value: &str, field: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+#[allow(dead_code)] // exercised by the reserved, non-CLI restart state below
+fn validate_full_oid(value: &str, field: &str) -> Result<(), String> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{field} must be a full lowercase object id"));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // exercised by the reserved, non-CLI restart state below
+fn validate_sha256(value: &str, field: &str) -> Result<(), String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{field} must be a lowercase sha256 digest"));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // exercised by the reserved, non-CLI restart state below
+fn validate_first_adoption_restart(event: &FirstAdoptionRestartV1) -> Result<(), String> {
+    if event.schema != 1 {
+        return Err(format!(
+            "unsupported first-adoption restart schema {}",
+            event.schema
+        ));
+    }
+    validate_full_oid(&event.superseded_checkpoint_oid, "superseded checkpoint")?;
+    if let Some(proof) = &event.superseded_proof_digest {
+        validate_sha256(proof, "superseded proof digest")?;
+    }
+    if let Some(replacement) = &event.replacement_tip_oid {
+        validate_full_oid(replacement, "replacement tip")?;
+        if replacement == &event.superseded_checkpoint_oid {
+            return Err("replacement tip must differ from superseded checkpoint".into());
+        }
+    } else if matches!(event.stage, FirstAdoptionRestartStage::Pretrust) {
+        return Err("pretrust restart requires a replacement checkpoint tip".into());
+    }
+    validate_sha256(&event.evidence_digest, "restart evidence digest")?;
+    for (field, value) in [
+        ("restart actor", &event.actor),
+        ("restart reason", &event.reason),
+    ] {
+        if value.chars().any(char::is_control) || bounded_text(value, field)? != *value {
+            return Err(format!("{field} must be trimmed and terminal-safe"));
+        }
+    }
+    if event.at_epoch_secs == 0 {
+        return Err("first-adoption restart timestamp must be nonzero".into());
+    }
+    Ok(())
+}
+
 fn invalid(e: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, e)
 }
 
-/// The kind of change, which governs whether the Documentation phases run.
-/// Only a feature (a change that alters functional behavior) is documented;
-/// defect fixes and non-functional chores skip the Documentation and Doc
-/// Validation phases.
+/// The kind of change. It informs review depth and reporting, but never skips
+/// Documentation or Doc Validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ChangeKind {
     /// A feature or enhancement that changes functional behavior. Documented.
     #[default]
     Feature,
-    /// A defect fix. Not documented.
+    /// A defect fix.
     Fix,
-    /// A non-functional change (refactor, tooling, perf, deps). Not documented.
+    /// A non-functional change (refactor, tooling, perf, deps).
     Chore,
 }
 
 impl ChangeKind {
-    /// Whether a change of this kind runs the Documentation phases.
+    /// Whether a change of this kind runs the Documentation phases. All kinds
+    /// do; retained as an API boundary for older callers.
     pub fn documents(self) -> bool {
-        matches!(self, ChangeKind::Feature)
+        true
     }
 
     /// A short human label.
@@ -336,9 +426,18 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// The canonical artifact token for this verdict.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::ConditionalPass => "CONDITIONAL PASS",
+            Self::Fail => "FAIL",
+        }
+    }
+
     /// Whether this verdict permits advancing to the next phase.
     pub fn advances(self) -> bool {
-        matches!(self, Verdict::Pass | Verdict::ConditionalPass)
+        matches!(self, Verdict::Pass)
     }
 }
 
@@ -399,6 +498,72 @@ pub struct GateRecord {
     /// indistinguishable in the ledger from a full-rigor PASS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona_tuning: Option<PersonaTuningRecord>,
+    /// Exact worktree candidate used by an objective candidate gate. Legacy,
+    /// planning, Commit-validation, and manual records intentionally decode as
+    /// absent rather than being mistaken for candidate evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<CandidateCapture>,
+    /// The only artifact identity allowed to flow from an objective Build to
+    /// Deploy. Legacy/provisional Build attempts intentionally have no value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_output: Option<BuildOutputV1>,
+    /// Truth produced by a typed Deploy.  Legacy/manual deployment keeps this
+    /// absent and therefore cannot masquerade as verified local installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_result: Option<DeployResultV1>,
+    /// Bounded structured-validation receipt for an exact Candidate gate.
+    /// It carries result metadata and digests, never raw child output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_receipt: Option<crate::local_validation::ValidationReceiptV1>,
+}
+
+/// Versioned identity of one release file observed through an opened,
+/// no-follow regular file. It is data, not an executable recipe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildOutputV1 {
+    pub schema: u32,
+    /// Named contract selected by the Build profile. Empty is legacy data and
+    /// cannot satisfy a strict Deploy configuration.
+    #[serde(default)]
+    pub name: String,
+    pub path: String,
+    /// Build contract limits copied into the receipt so Deploy can reapply them
+    /// before its first install effect.
+    #[serde(default)]
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub required_mode: u32,
+    pub size: u64,
+    pub mode: u32,
+    /// Opened-file identity at Build time. Legacy/non-Unix records decode as
+    /// zero and cannot satisfy strict Deploy revalidation.
+    #[serde(default)]
+    pub device: u64,
+    #[serde(default)]
+    pub inode: u64,
+    pub sha256: String,
+    /// Candidate identity whose read-only projection produced these bytes.
+    /// Legacy/manual Build outputs remain explicitly unbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+}
+
+/// Bounded Deploy evidence. Definition and result digests preserve what was
+/// copied and parent-verified without persisting artifact bytes. `probe_executed`
+/// is an explicit negative assertion for execute and readiness modes: production
+/// Deploy must never launch the installed candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployResultV1 {
+    pub schema: u32,
+    pub mode: String,
+    pub target: String,
+    pub definition_digest: String,
+    pub result_digest: String,
+    pub install_executed: bool,
+    pub probe_executed: bool,
+    pub verified: bool,
 }
 
 impl GateRecord {
@@ -408,15 +573,126 @@ impl GateRecord {
     }
 }
 
-/// An open condition from a CONDITIONAL PASS that blocks archive until closed.
+/// A condition event is append-only evidence about one condition's lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ConditionEvent {
+    Opened {
+        by: String,
+        at_epoch_secs: u64,
+        evidence: String,
+        evidence_digest: String,
+    },
+    Resolved {
+        by: String,
+        at_epoch_secs: u64,
+        evidence: String,
+        evidence_digest: String,
+    },
+    Reopened {
+        at_epoch_secs: u64,
+        reason: String,
+        rewind_phase: Phase,
+    },
+}
+
+/// An evidence-bearing obligation opened by a CONDITIONAL PASS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Condition {
+    /// Stable display identifier, assigned at creation and never reused.
+    #[serde(default)]
+    pub id: String,
+    /// The phase/attempt that opened this obligation.
+    #[serde(default = "legacy_condition_phase")]
+    pub phase: Phase,
+    #[serde(default)]
+    pub attempt: usize,
     /// What must be done.
     pub text: String,
     /// Who owns closing it.
     pub owner: String,
-    /// Whether it has been closed.
+    /// Legacy boolean state.  New records derive closure from `events`; retaining
+    /// this field makes old ledgers readable so they can be explicitly repaired.
     pub closed: bool,
+    #[serde(default)]
+    pub opened_at_epoch_secs: u64,
+    #[serde(default)]
+    pub events: Vec<ConditionEvent>,
+}
+
+impl Condition {
+    pub fn is_open(&self) -> bool {
+        if self.events.is_empty() {
+            return !self.closed;
+        }
+        !matches!(self.events.last(), Some(ConditionEvent::Resolved { .. }))
+    }
+}
+
+/// Append-only disposition history for an explicitly deferred Builder task.
+/// The task's ID alone is never an authority: each event is bound to the
+/// normalized full-record digest from the current task plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum TaskDeferralEvent {
+    Deferred {
+        owner: String,
+        reason: String,
+        evidence: String,
+        evidence_digest: String,
+        at_epoch_secs: u64,
+    },
+    Revoked {
+        reason: String,
+        at_epoch_secs: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDeferral {
+    pub task_id: String,
+    pub record_digest: String,
+    #[serde(default)]
+    pub events: Vec<TaskDeferralEvent>,
+}
+
+impl TaskDeferral {
+    fn is_active(&self) -> bool {
+        matches!(self.events.last(), Some(TaskDeferralEvent::Deferred { .. }))
+    }
+}
+
+/// A compatibility repair is an append-only reconciliation, never a fabricated
+/// PASS or an archive rewrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyRepairEvent {
+    pub reason: String,
+    pub rewind_phase: Phase,
+    /// Exact ledger image observed before the repair was applied.
+    #[serde(default)]
+    pub ledger_before_digest: String,
+    pub at_epoch_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskAccounting {
+    pub done: usize,
+    pub deferred: usize,
+    pub open: Vec<String>,
+    pub stale: Vec<String>,
+    pub total: usize,
+}
+
+impl TaskAccounting {
+    pub fn accounted(&self) -> bool {
+        self.open.is_empty() && self.stale.is_empty() && self.done + self.deferred == self.total
+    }
+}
+
+fn legacy_condition_phase() -> Phase {
+    // Old condition records did not carry a source phase.  They remain readable,
+    // but higher-level migration/strict checks can surface that ambiguity.
+    Phase::Architecture
 }
 
 /// One recorded gate verdict, preserved in the append-only history. The `gates`
@@ -450,6 +726,10 @@ pub struct Ledger {
     /// Open/closed conditions from conditional passes.
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// Append-only task deferral/revocation history.  An event with a stale
+    /// record digest is visible as stale and cannot account for a current task.
+    #[serde(default)]
+    pub task_deferrals: Vec<TaskDeferral>,
     /// Append-only log of every gate verdict ever recorded, in order. Preserves
     /// the full audit trail (incl. a FAIL that was later re-recorded PASS) that
     /// the latest-per-phase `gates` map would otherwise overwrite. Additive and
@@ -458,6 +738,10 @@ pub struct Ledger {
     pub history: Vec<GateEvent>,
     #[serde(default)]
     pub governance: Governance,
+    /// Most recent mutating-command risk assessment. Status recomputes a
+    /// read-only projection and never trusts this cache as current authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_assessment: Option<RiskAssessment>,
     /// Whether this change runs under the strict (self-enforcing) tier. Write-once
     /// and monotonic: set true by `conduct`/`begin --strict` via
     /// [`Ledger::set_strict`] and NEVER reset to false by any code path (design.md
@@ -466,10 +750,8 @@ pub struct Ledger {
     /// — the manual tier, byte-identical to today.
     #[serde(default)]
     pub strict: bool,
-    /// Append-only, attempt-scoped waivers of the strict judgment-artifact gate.
-    /// A waiver is surfaced loudly in status and counted in the archive audit
-    /// summary; it never bypasses an objective gate or converts a FAIL (design.md
-    /// D5/D7). Additive and `#[serde(default)]` so a legacy ledger loads with none.
+    /// Legacy artifact-waiver records. Additive/defaulted for compatibility;
+    /// current strict ledgers block when this collection is nonempty.
     #[serde(default)]
     pub waivers: Vec<Waiver>,
     #[serde(default)]
@@ -487,6 +769,97 @@ pub struct Ledger {
     /// Additive + `#[serde(default)]`; inert to every digest.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub brief_tuning: BTreeMap<Phase, BriefTuning>,
+    /// One-time adoption events are append-only and intentionally distinct
+    /// from generic governance reconciliation. They preserve provisional Build
+    /// history while making it ineligible for readiness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_adoption_reconciliations: Vec<FirstAdoptionReconciliationV1>,
+    /// Append-only corrections around the one-time trust transition. These
+    /// records never manufacture a gate result; they only supersede checkpoint
+    /// eligibility while preserving the old checkpoint as chain history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_adoption_restarts: Vec<FirstAdoptionRestartV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_repairs: Vec<LegacyRepairEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub freshness_invalidations: Vec<FreshnessInvalidationEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstAdoptionReconciliationV1 {
+    pub schema: u32,
+    pub checkpoint_oid: String,
+    pub policy_object_oid: String,
+    pub pretrust_proof_digest: String,
+    pub security_evidence: String,
+    pub reason: String,
+    pub at_epoch_secs: u64,
+    /// Immutable posttrust bindings retained with the one Build rewind. Empty
+    /// values are readable only for ledgers written before this schema addition.
+    #[serde(default)]
+    pub checkpoint_scope_digest: String,
+    #[serde(default)]
+    pub security_evidence_digest: String,
+    #[serde(default)]
+    pub bootstrap_nonce_digest: String,
+    #[serde(default)]
+    pub trusted_policy_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirstAdoptionRestartStage {
+    Pretrust,
+    Posttrust,
+}
+
+/// A bounded, append-only correction to first-adoption checkpoint eligibility.
+/// `replacement_tip_oid` is mandatory before trust exists; after trust exists,
+/// an activation-only recovery may retain the same source tip by leaving it
+/// absent. The event invalidates, rather than upgrades, an older proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstAdoptionRestartV1 {
+    pub schema: u32,
+    pub stage: FirstAdoptionRestartStage,
+    pub superseded_checkpoint_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_proof_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_tip_oid: Option<String>,
+    pub actor: String,
+    pub reason: String,
+    pub evidence_digest: String,
+    pub at_epoch_secs: u64,
+}
+
+impl FirstAdoptionRestartV1 {
+    fn same_intent(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.stage == other.stage
+            && self.superseded_checkpoint_oid == other.superseded_checkpoint_oid
+            && self.superseded_proof_digest == other.superseded_proof_digest
+            && self.replacement_tip_oid == other.replacement_tip_oid
+            && self.actor == other.actor
+            && self.reason == other.reason
+            && self.evidence_digest == other.evidence_digest
+    }
+}
+
+/// Derived state used by reconciliation/final gates to bind the last eligible
+/// checkpoint and current evidence without rewriting any earlier event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // persisted codec is implemented before a mutation CLI is authorized
+pub struct FirstAdoptionEligibilityV1 {
+    pub schema: u32,
+    pub latest_eligible_checkpoint_oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_eligible_proof_digest: Option<String>,
+    pub latest_evidence_digest: String,
+    pub checkpoint_chain_digest: String,
+    pub restart_count: usize,
 }
 
 impl Ledger {
@@ -520,14 +893,69 @@ impl Ledger {
             phase: Phase::first(applicability),
             gates: BTreeMap::new(),
             conditions: Vec::new(),
+            task_deferrals: Vec::new(),
             history: Vec::new(),
             governance,
+            risk_assessment: None,
             strict: false,
             waivers: Vec::new(),
             phase_started_at_epoch_secs: now_epoch_secs(),
             archive_closure: None,
             brief_tuning: BTreeMap::new(),
+            first_adoption_reconciliations: Vec::new(),
+            first_adoption_restarts: Vec::new(),
+            legacy_repairs: Vec::new(),
+            freshness_invalidations: Vec::new(),
         }
+    }
+
+    pub fn effective_risk(&self) -> RiskLevel {
+        self.risk_assessment
+            .as_ref()
+            .map(|assessment| assessment.effective)
+            .unwrap_or(self.governance.risk)
+    }
+
+    /// Apply one causal freshness rewind. Latest downstream approvals stop
+    /// driving state, while the append-only verdict history and conditions are
+    /// retained. Closed downstream obligations are explicitly reopened.
+    pub fn invalidate_for_freshness(
+        &mut self,
+        rewind_phase: Phase,
+        stale_phases: Vec<Phase>,
+        reasons: Vec<String>,
+    ) -> Result<(), String> {
+        if self.archive_closure.is_some() {
+            return Err("freshness rewind refuses archived state".into());
+        }
+        if rewind_phase >= self.phase {
+            return Err(format!(
+                "freshness rewind target {} is not earlier than stored phase {}",
+                rewind_phase.label(),
+                self.phase.label()
+            ));
+        }
+        let stored_phase = self.phase;
+        for phase in Phase::applicable(self.applicability()) {
+            if phase >= rewind_phase {
+                self.gates.remove(&phase);
+                self.brief_tuning.remove(&phase);
+            }
+        }
+        self.waivers.retain(|waiver| waiver.phase < rewind_phase);
+        self.reopen_conditions_from(rewind_phase, "stale evidence rewind");
+        self.phase = rewind_phase;
+        self.phase_started_at_epoch_secs = now_epoch_secs();
+        self.freshness_invalidations
+            .push(FreshnessInvalidationEvent {
+                schema: 1,
+                stored_phase,
+                rewind_phase,
+                stale_phases,
+                reasons,
+                at_epoch_secs: now_epoch_secs(),
+            });
+        Ok(())
     }
 
     /// Record the brief-time tuning `next` computed for `phase` at `attempt`,
@@ -581,7 +1009,7 @@ impl Ledger {
     }
     pub fn attempt_authorized(&self, phase: Phase) -> bool {
         let next = self.next_attempt(phase);
-        next <= self.governance.risk.attempt_limit()
+        next <= self.effective_risk().attempt_limit()
             || self
                 .governance
                 .reconciliations
@@ -592,7 +1020,7 @@ impl Ledger {
     /// The one-shot reconciliation authorizing the next excess attempt, if any.
     pub fn attempt_authorization(&self, phase: Phase) -> Option<&Reconciliation> {
         let next = self.next_attempt(phase);
-        (next > self.governance.risk.attempt_limit())
+        (next > self.effective_risk().attempt_limit())
             .then(|| {
                 self.governance
                     .reconciliations
@@ -662,6 +1090,7 @@ impl Ledger {
         // prior attempt must not silently suppress the artifact gate on the
         // re-run under the changed threat profile (design.md D7 / B1).
         self.waivers.retain(|w| w.phase < Phase::SecurityPlan);
+        self.reopen_conditions_from(Phase::SecurityPlan, "governance rewind");
         // Rewind-only, never advance: a governance change while the change is still
         // BEFORE Security (e.g. at Architecture) must stay put — jumping forward to
         // SecurityPlan would skip the ungated intervening phase(s). Downstream
@@ -672,6 +1101,159 @@ impl Ledger {
         }
     }
 
+    /// Record the sole posttrust adoption transition and rewind to Build
+    /// without erasing any provisional gate events. An exact replay is a no-op;
+    /// a conflicting transition is refused rather than laundering history.
+    #[cfg(test)]
+    pub fn reconcile_first_adoption(
+        &mut self,
+        event: FirstAdoptionReconciliationV1,
+    ) -> Result<bool, String> {
+        if let Some(existing) = self.first_adoption_reconciliations.first() {
+            if existing == &event {
+                return Ok(false);
+            }
+            return Err("conflicting first-adoption reconciliation already exists".into());
+        }
+        self.first_adoption_reconciliations.push(event);
+        for phase in Phase::applicable(self.applicability()) {
+            if phase >= Phase::Build {
+                self.gates.remove(&phase);
+            }
+        }
+        self.waivers.retain(|w| w.phase < Phase::Build);
+        self.reopen_conditions_from(Phase::Build, "first-adoption reconciliation rewind");
+        if self.phase > Phase::Build {
+            self.phase = Phase::Build;
+            self.phase_started_at_epoch_secs = now_epoch_secs();
+        }
+        Ok(true)
+    }
+
+    /// Append a first-adoption correction without deleting or editing any
+    /// earlier checkpoint/proof record. An exact response-loss replay is a
+    /// no-op; every other attempt to supersede an already-consumed checkpoint
+    /// is a conflict.
+    #[allow(dead_code)] // no live mutation command is authorized in this slice
+    pub fn append_first_adoption_restart(
+        &mut self,
+        event: FirstAdoptionRestartV1,
+    ) -> Result<bool, String> {
+        validate_first_adoption_restart(&event)?;
+        let reconciled = !self.first_adoption_reconciliations.is_empty();
+        match event.stage {
+            FirstAdoptionRestartStage::Pretrust if reconciled => {
+                return Err("pretrust restart refused after first-adoption reconciliation".into());
+            }
+            FirstAdoptionRestartStage::Posttrust if !reconciled => {
+                return Err("posttrust restart requires first-adoption reconciliation".into());
+            }
+            _ => {}
+        }
+        if self
+            .first_adoption_restarts
+            .iter()
+            .any(|prior| prior.same_intent(&event))
+        {
+            return Ok(false);
+        }
+        if self.first_adoption_restarts.len() >= 64 {
+            return Err("first-adoption restart history exceeds 64 events".into());
+        }
+        if self
+            .first_adoption_restarts
+            .iter()
+            .any(|prior| prior.superseded_checkpoint_oid == event.superseded_checkpoint_oid)
+        {
+            return Err("first-adoption checkpoint was already superseded".into());
+        }
+        if let Some(previous) = self.first_adoption_restarts.last() {
+            let latest = previous
+                .replacement_tip_oid
+                .as_deref()
+                .unwrap_or(&previous.superseded_checkpoint_oid);
+            if event.superseded_checkpoint_oid != latest {
+                return Err(
+                    "first-adoption restart does not extend the latest eligible checkpoint".into(),
+                );
+            }
+        } else if matches!(event.stage, FirstAdoptionRestartStage::Posttrust) {
+            let checkpoint = &self.first_adoption_reconciliations[0].checkpoint_oid;
+            if event.superseded_checkpoint_oid != *checkpoint {
+                return Err(
+                    "posttrust restart does not supersede the reconciled checkpoint".into(),
+                );
+            }
+        }
+        self.first_adoption_restarts.push(event);
+        Ok(true)
+    }
+
+    /// Fold restart history into the single checkpoint/evidence state eligible
+    /// for reconciliation and final gates. Any restart invalidates the proof
+    /// bound to its superseded checkpoint; a fresh proof must therefore be
+    /// supplied and verified separately for the replacement tip.
+    #[allow(dead_code)] // consumed by tests and the future reviewed restart command
+    pub fn first_adoption_eligibility(
+        &self,
+        initial_checkpoint_oid: &str,
+        initial_proof_digest: Option<&str>,
+        initial_evidence_digest: &str,
+    ) -> Result<FirstAdoptionEligibilityV1, String> {
+        validate_full_oid(initial_checkpoint_oid, "initial checkpoint")?;
+        if let Some(proof) = initial_proof_digest {
+            validate_sha256(proof, "initial proof digest")?;
+        }
+        validate_sha256(initial_evidence_digest, "initial evidence digest")?;
+
+        let mut latest = initial_checkpoint_oid.to_string();
+        let mut proof = initial_proof_digest.map(str::to_string);
+        let mut evidence = initial_evidence_digest.to_string();
+        let mut chain = format!("mpd:first-adoption-checkpoint-chain:v1\0{latest}\0{evidence}");
+        for event in &self.first_adoption_restarts {
+            validate_first_adoption_restart(event)?;
+            if event.superseded_checkpoint_oid != latest {
+                return Err(
+                    "first-adoption restart history is not a contiguous checkpoint chain".into(),
+                );
+            }
+            if let (Some(expected), Some(superseded)) =
+                (proof.as_deref(), event.superseded_proof_digest.as_deref())
+            {
+                if superseded != expected {
+                    return Err("first-adoption restart supersedes a different proof".into());
+                }
+            }
+            latest = event
+                .replacement_tip_oid
+                .clone()
+                .unwrap_or_else(|| event.superseded_checkpoint_oid.clone());
+            proof = None;
+            evidence.clone_from(&event.evidence_digest);
+            chain.push('\0');
+            chain.push_str(match event.stage {
+                FirstAdoptionRestartStage::Pretrust => "pretrust",
+                FirstAdoptionRestartStage::Posttrust => "posttrust",
+            });
+            chain.push('\0');
+            chain.push_str(&event.superseded_checkpoint_oid);
+            chain.push('\0');
+            chain.push_str(event.superseded_proof_digest.as_deref().unwrap_or("-"));
+            chain.push('\0');
+            chain.push_str(event.replacement_tip_oid.as_deref().unwrap_or("-"));
+            chain.push('\0');
+            chain.push_str(&event.evidence_digest);
+        }
+        Ok(FirstAdoptionEligibilityV1 {
+            schema: 1,
+            latest_eligible_checkpoint_oid: latest,
+            latest_eligible_proof_digest: proof,
+            latest_evidence_digest: evidence,
+            checkpoint_chain_digest: crate::digest::Digest::of_bytes(chain.as_bytes()).to_hex(),
+            restart_count: self.first_adoption_restarts.len(),
+        })
+    }
+
     /// The change's phase applicability (which optional phase groups run).
     pub fn applicability(&self) -> Applicability {
         Applicability {
@@ -680,9 +1262,40 @@ impl Ledger {
         }
     }
 
+    fn reopen_conditions_from(&mut self, rewind_phase: Phase, reason: &str) {
+        let at_epoch_secs = now_epoch_secs();
+        for condition in &mut self.conditions {
+            if condition.phase >= rewind_phase {
+                condition.events.push(ConditionEvent::Reopened {
+                    at_epoch_secs,
+                    reason: reason.to_string(),
+                    rewind_phase,
+                });
+                condition.closed = false;
+            }
+        }
+    }
+
     /// Record a verdict for `phase`. If it advances and is the current phase,
     /// move to the next applicable phase.
-    pub fn record(&mut self, phase: Phase, record: GateRecord) {
+    pub fn record(&mut self, phase: Phase, record: GateRecord) -> Result<(), String> {
+        if self.phase == Phase::Done {
+            return Err("all phases are complete; no further gate can be recorded".into());
+        }
+        if !phase.is_active(self.applicability()) {
+            return Err(format!(
+                "{} is not applicable to this change",
+                phase.label()
+            ));
+        }
+        if phase != self.phase {
+            return Err(format!(
+                "cannot record {} while current phase is {}; run `mpd gate {}`",
+                phase.label(),
+                self.phase.label(),
+                self.phase.slug()
+            ));
+        }
         let advances = record.verdict.advances();
         // Preserve the full audit trail: a later PASS must not erase an earlier
         // FAIL/CONDITIONAL for the same phase. `gates` keeps the latest verdict
@@ -704,29 +1317,50 @@ impl Ledger {
             self.phase = phase.next(self.applicability());
             self.phase_started_at_epoch_secs = now_epoch_secs();
         }
+        Ok(())
     }
 
     /// Reasons the change cannot be archived yet (empty ⇒ ready). Every
-    /// applicable phase before Deploy must have a non-Fail verdict, and no
-    /// condition may remain open.
+    /// applicable phase must have an unconditional PASS, the terminal phase must
+    /// be Done, and no evidence-bearing condition may remain open.
     pub fn blocking_reasons(&self) -> Vec<String> {
         let mut reasons = Vec::new();
-        for phase in Phase::applicable(self.applicability()) {
-            if phase == Phase::Deploy {
-                continue;
+        if self.strict {
+            reasons.extend(self.integrity_blockers());
+            if !self.waivers.is_empty() {
+                reasons.push(
+                    "legacy artifact waivers are present; current Commando policy denies waivers"
+                        .into(),
+                );
             }
+        }
+        for phase in Phase::applicable(self.applicability()) {
             match self.gates.get(&phase) {
                 None => reasons.push(format!("{} gate not recorded", phase.label())),
-                Some(rec) if rec.verdict == Verdict::Fail => {
-                    reasons.push(format!("{} gate is FAIL", phase.label()));
+                Some(rec) if rec.verdict != Verdict::Pass => {
+                    reasons.push(format!(
+                        "{} gate is not an unconditional PASS",
+                        phase.label()
+                    ));
                 }
                 Some(_) => {}
             }
         }
         for (i, cond) in self.conditions.iter().enumerate() {
-            if !cond.closed {
-                reasons.push(format!("open condition #{}: {}", i + 1, cond.text));
+            if cond.is_open() {
+                reasons.push(format!(
+                    "open condition {}: {}",
+                    if cond.id.is_empty() {
+                        (i + 1).to_string()
+                    } else {
+                        cond.id.clone()
+                    },
+                    cond.text
+                ));
             }
+        }
+        if self.phase != Phase::Done {
+            reasons.push(format!("current phase is {}, not Done", self.phase.label()));
         }
         reasons
     }
@@ -736,9 +1370,200 @@ impl Ledger {
         self.blocking_reasons().is_empty()
     }
 
+    /// Return the active deferral for this exact normalized task record. A
+    /// matching ID with another digest is deliberately *not* reused: editing a
+    /// task contract makes its previous deferral stale rather than retargeting
+    /// it to new work.
+    pub fn active_task_deferral(&self, task: &TaskEntry) -> Option<&TaskDeferral> {
+        self.task_deferrals.iter().rev().find(|deferral| {
+            deferral.task_id == task.id
+                && deferral.record_digest == task.record_digest
+                && deferral.is_active()
+        })
+    }
+
+    /// Deterministic Builder-task accounting for Test/archive. `done` and a
+    /// current evidence-backed deferral are distinct truths; stale deferrals
+    /// are blockers, never silent waivers.
+    pub fn task_accounting(&self, plan: &TaskPlan) -> TaskAccounting {
+        let mut accounting = TaskAccounting {
+            total: plan.entries.len(),
+            ..TaskAccounting::default()
+        };
+        for task in &plan.entries {
+            if task.done {
+                accounting.done += 1;
+            } else if self.active_task_deferral(task).is_some() {
+                accounting.deferred += 1;
+            } else {
+                accounting.open.push(task.id.clone());
+            }
+        }
+        for deferral in &self.task_deferrals {
+            if !deferral.is_active() {
+                continue;
+            }
+            if plan.entries.iter().any(|task| {
+                task.id == deferral.task_id && task.record_digest != deferral.record_digest
+            }) || !plan.entries.iter().any(|task| task.id == deferral.task_id)
+            {
+                accounting.stale.push(deferral.task_id.clone());
+            }
+        }
+        accounting.stale.sort();
+        accounting.stale.dedup();
+        accounting
+    }
+
+    pub fn defer_task(
+        &mut self,
+        task: &TaskEntry,
+        owner: &str,
+        reason: &str,
+        evidence: String,
+        evidence_digest: String,
+    ) -> Result<(), String> {
+        let owner = bounded_text(owner, "task deferral owner")?;
+        let reason = bounded_text(reason, "task deferral reason")?;
+        if task.done {
+            return Err(format!("task {} is already checked", task.id));
+        }
+        let event = TaskDeferralEvent::Deferred {
+            owner,
+            reason,
+            evidence,
+            evidence_digest,
+            at_epoch_secs: now_epoch_secs(),
+        };
+        if let Some(existing) = self.task_deferrals.iter_mut().rev().find(|deferral| {
+            deferral.task_id == task.id && deferral.record_digest == task.record_digest
+        }) {
+            existing.events.push(event);
+        } else {
+            self.task_deferrals.push(TaskDeferral {
+                task_id: task.id.clone(),
+                record_digest: task.record_digest.clone(),
+                events: vec![event],
+            });
+        }
+        Ok(())
+    }
+
+    pub fn revoke_task_deferral(&mut self, task: &TaskEntry, reason: &str) -> Result<(), String> {
+        let reason = bounded_text(reason, "task deferral revocation reason")?;
+        let Some(existing) = self.task_deferrals.iter_mut().rev().find(|deferral| {
+            deferral.task_id == task.id
+                && deferral.record_digest == task.record_digest
+                && deferral.is_active()
+        }) else {
+            return Err(format!("task {} has no current deferral", task.id));
+        };
+        existing.events.push(TaskDeferralEvent::Revoked {
+            reason,
+            at_epoch_secs: now_epoch_secs(),
+        });
+        Ok(())
+    }
+
+    /// Validate a requested compatibility rewind without mutating the ledger.
+    /// Returns `true` when the exact rewind already exists and is the current
+    /// state, making command replay idempotent.
+    pub fn repair_state_preview(&self, rewind: Phase, reason: &str) -> Result<bool, String> {
+        let reason = bounded_text(reason, "repair reason")?;
+        if self.archive_closure.is_some() {
+            return Err("repair-state refuses archived state; archives are immutable".into());
+        }
+        if rewind == Phase::Done {
+            return Err("repair-state --to must name a pipeline phase, not done".into());
+        }
+        let already_exists = self.phase == rewind
+            && self
+                .legacy_repairs
+                .last()
+                .is_some_and(|event| event.rewind_phase == rewind && event.reason == reason);
+        if already_exists {
+            return Ok(true);
+        }
+        if rewind >= self.phase {
+            return Err(format!(
+                "repair-state only rewinds: {} is not earlier than current phase {}",
+                rewind.label(),
+                self.phase.label()
+            ));
+        }
+        Ok(false)
+    }
+
+    /// Compatibility repair can only rewind and append an explicit event. It
+    /// removes current downstream approvals while retaining the complete gate
+    /// history, and cannot synthesize PASS or edit archive history. Returns
+    /// `false` for an idempotent replay that was already applied.
+    pub fn repair_state_to(
+        &mut self,
+        rewind: Phase,
+        reason: &str,
+        ledger_before_digest: &str,
+    ) -> Result<bool, String> {
+        if self.repair_state_preview(rewind, reason)? {
+            return Ok(false);
+        }
+        let reason = bounded_text(reason, "repair reason")?;
+        if ledger_before_digest.len() != 64
+            || !ledger_before_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("observed ledger digest must be a 64-character hex digest".into());
+        }
+        for phase in Phase::applicable(self.applicability()) {
+            if phase >= rewind {
+                self.gates.remove(&phase);
+                self.brief_tuning.remove(&phase);
+            }
+        }
+        for condition in &mut self.conditions {
+            if condition.phase >= rewind && !condition.is_open() {
+                condition.events.push(ConditionEvent::Reopened {
+                    at_epoch_secs: now_epoch_secs(),
+                    reason: reason.clone(),
+                    rewind_phase: rewind,
+                });
+                condition.closed = false;
+            }
+        }
+        self.phase = rewind;
+        self.phase_started_at_epoch_secs = now_epoch_secs();
+        self.legacy_repairs.push(LegacyRepairEvent {
+            reason,
+            rewind_phase: rewind,
+            ledger_before_digest: ledger_before_digest.to_ascii_lowercase(),
+            at_epoch_secs: now_epoch_secs(),
+        });
+        Ok(true)
+    }
+
+    /// Strict ledger integrity blockers. Legacy state stays readable but does
+    /// not become archive-ready merely because an old boolean happened to be
+    /// true.
+    pub fn integrity_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        for condition in &self.conditions {
+            if condition.events.is_empty() {
+                blockers.push(format!("condition {} is legacy-unscoped", condition.id));
+            }
+        }
+        blockers
+    }
+
     /// Close the 1-based condition (as numbered by `blocking_reasons` /
     /// `mpd status`). Errors if the index is out of range.
-    pub fn close_condition(&mut self, index_1based: usize) -> Result<(), String> {
+    pub fn close_condition(
+        &mut self,
+        index_1based: usize,
+        by: &str,
+        evidence: String,
+        evidence_digest: String,
+    ) -> Result<(), String> {
         let i = index_1based
             .checked_sub(1)
             .ok_or_else(|| "condition numbers are 1-based".to_string())?;
@@ -750,20 +1575,39 @@ impl Ledger {
                 len
             )
         })?;
+        let by = bounded_text(by, "condition closer")?;
+        cond.events.push(ConditionEvent::Resolved {
+            by,
+            at_epoch_secs: now_epoch_secs(),
+            evidence,
+            evidence_digest,
+        });
         cond.closed = true;
         Ok(())
     }
 
     /// Close every open condition; returns how many were newly closed.
-    pub fn close_all_conditions(&mut self) -> usize {
+    pub fn close_all_conditions(
+        &mut self,
+        by: &str,
+        evidence: String,
+        evidence_digest: String,
+    ) -> Result<usize, String> {
+        let by = bounded_text(by, "condition closer")?;
         let mut n = 0;
         for c in self.conditions.iter_mut() {
-            if !c.closed {
+            if c.is_open() {
+                c.events.push(ConditionEvent::Resolved {
+                    by: by.clone(),
+                    at_epoch_secs: now_epoch_secs(),
+                    evidence: evidence.clone(),
+                    evidence_digest: evidence_digest.clone(),
+                });
                 c.closed = true;
                 n += 1;
             }
         }
-        n
+        Ok(n)
     }
 }
 
@@ -789,28 +1633,284 @@ pub fn current_path(root: &Path) -> PathBuf {
 /// Load a change's ledger.
 pub fn load(root: &Path, change: &str) -> io::Result<Ledger> {
     validate_change_name(change).map_err(invalid)?;
-    let text = std::fs::read_to_string(state_path(root, change))?;
+    let path = state_path(root, change);
+    let text = openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Load a ledger together with the digest of the exact observed file image.
+pub fn load_observed(root: &Path, change: &str) -> io::Result<(Ledger, String)> {
+    let (ledger, observed) = load_observed_exact(root, change)?;
+    Ok((ledger, observed.digest))
+}
+
+/// Exact file image paired with a parsed ledger for compare-and-swap writes.
+#[derive(Debug, Clone)]
+pub struct LedgerObservation {
+    exact: String,
+    digest: String,
+}
+
+impl LedgerObservation {
+    /// Digest used by audit records and human-readable previews.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// Load a ledger together with the exact bytes required by a later CAS save.
+pub fn load_observed_exact(root: &Path, change: &str) -> io::Result<(Ledger, LedgerObservation)> {
+    validate_change_name(change).map_err(invalid)?;
+    let path = state_path(root, change);
+    let text = openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let digest = openspec_core::digest::Digest::of_bytes(text.as_bytes()).to_hex();
+    let ledger =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok((
+        ledger,
+        LedgerObservation {
+            exact: text,
+            digest,
+        },
+    ))
 }
 
 /// Persist a change's ledger (pretty JSON, trailing newline).
 pub fn save(root: &Path, ledger: &Ledger) -> io::Result<()> {
     validate_change_name(&ledger.change).map_err(invalid)?;
+    let _lock = acquire_ledger_lock(root, &ledger.change)?;
     let path = state_path(root, &ledger.change);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let json = serialized_ledger(ledger)?;
+    classified_into_io(atomic_write_contained_classified(
+        root,
+        &path,
+        json.as_bytes(),
+    ))
+}
+
+/// Persist only if the ledger still has the exact image observed by the caller.
+/// The final replacement uses the same contained atomic writer as [`save`].
+pub fn save_if_observed(root: &Path, ledger: &Ledger, observed: &str) -> io::Result<()> {
+    validate_change_name(&ledger.change).map_err(invalid)?;
+    let _lock = acquire_ledger_lock(root, &ledger.change)?;
+    let path = state_path(root, &ledger.change);
+    let current =
+        openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let current_digest = openspec_core::digest::Digest::of_bytes(current.as_bytes()).to_hex();
+    if current_digest != observed {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "ledger changed after preview; refusing stale repair",
+        ));
     }
+    let json = serialized_ledger(ledger)?;
+    classified_into_io(atomic_write_contained_classified(
+        root,
+        &path,
+        json.as_bytes(),
+    ))
+}
+
+/// Exact CAS result for a ledger mutation that may transfer external resource
+/// ownership after the durable binding wins.
+#[derive(Debug)]
+pub enum ExactSaveOutcome {
+    /// Rename and parent-directory sync completed normally.
+    Committed,
+    /// Rename installed the exact expected bytes, but a later sync/reporting
+    /// operation failed. Exact readback under the ledger lock confirmed the win.
+    CommittedAfterRename { error: String },
+    /// This invocation did not replace the ledger.
+    NotCommitted(io::Error),
+    /// Rename occurred, but exact readback could not confirm the expected bytes.
+    UncertainAfterRename(io::Error),
+}
+
+/// Persist one exact observed-ledger mutation while serializing every MPD
+/// ledger writer through the same descriptor-held advisory lock.
+pub fn save_exact_observed(
+    root: &Path,
+    ledger: &Ledger,
+    observed: &LedgerObservation,
+) -> ExactSaveOutcome {
+    save_exact_observed_with(root, ledger, observed, |root, path, bytes| {
+        atomic_write_contained_classified(root, path, bytes)
+    })
+}
+
+fn save_exact_observed_with<F>(
+    root: &Path,
+    ledger: &Ledger,
+    observed: &LedgerObservation,
+    writer: F,
+) -> ExactSaveOutcome
+where
+    F: FnOnce(&Path, &Path, &[u8]) -> AtomicWriteOutcome,
+{
+    if let Err(error) = validate_change_name(&ledger.change).map_err(invalid) {
+        return ExactSaveOutcome::NotCommitted(error);
+    }
+    let _lock = match acquire_ledger_lock(root, &ledger.change) {
+        Ok(lock) => lock,
+        Err(error) => return ExactSaveOutcome::NotCommitted(error),
+    };
+    let path = state_path(root, &ledger.change);
+    let current =
+        match openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES) {
+            Ok(current) => current,
+            Err(error) => {
+                return ExactSaveOutcome::NotCommitted(io::Error::other(error.to_string()))
+            }
+        };
+    if current != observed.exact {
+        return ExactSaveOutcome::NotCommitted(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "ledger changed after observation; refusing stale gate write",
+        ));
+    }
+    let expected = match serialized_ledger(ledger) {
+        Ok(expected) => expected,
+        Err(error) => return ExactSaveOutcome::NotCommitted(error),
+    };
+    match writer(root, &path, expected.as_bytes()) {
+        AtomicWriteOutcome::Committed => ExactSaveOutcome::Committed,
+        AtomicWriteOutcome::FailedBeforeRename(error) => {
+            ExactSaveOutcome::NotCommitted(io::Error::other(error.to_string()))
+        }
+        AtomicWriteOutcome::FailedAfterRename(error) => {
+            let readback =
+                openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES);
+            match readback {
+                Ok(current) if current == expected => ExactSaveOutcome::CommittedAfterRename {
+                    error: error.to_string(),
+                },
+                Ok(_) => ExactSaveOutcome::UncertainAfterRename(io::Error::other(format!(
+                    "ledger replacement reported a post-rename failure and exact readback differed: {error}"
+                ))),
+                Err(readback) => ExactSaveOutcome::UncertainAfterRename(io::Error::other(format!(
+                    "ledger replacement reported a post-rename failure and exact readback failed: {error}; {readback}"
+                ))),
+            }
+        }
+    }
+}
+
+fn serialized_ledger(ledger: &Ledger) -> io::Result<String> {
     let mut json = serde_json::to_string_pretty(ledger)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     json.push('\n');
-    std::fs::write(path, json)
+    Ok(json)
+}
+
+fn classified_into_io(outcome: AtomicWriteOutcome) -> io::Result<()> {
+    match outcome {
+        AtomicWriteOutcome::Committed => Ok(()),
+        AtomicWriteOutcome::FailedBeforeRename(error)
+        | AtomicWriteOutcome::FailedAfterRename(error) => Err(io::Error::other(error.to_string())),
+    }
+}
+
+struct LedgerFileLock {
+    _file: File,
+}
+
+fn acquire_ledger_lock(root: &Path, change: &str) -> io::Result<LedgerFileLock> {
+    validate_change_name(change).map_err(invalid)?;
+    // The lock is process authority, not product state. Keeping a persistent
+    // lock beside the manifest-visible ledger made an otherwise clean archive
+    // dirty and let pre-commit mistake the lock for candidate content. Resolve
+    // it below Git's clone-private common directory instead; linked worktrees
+    // therefore serialize on the same lock without adding a worktree path.
+    let common = crate::local_validation::git_common_dir(root).map_err(io::Error::other)?;
+    let private = common.join("mpd");
+    let locks = private.join("ledger-locks");
+    ensure_owner_private_lock_dir(&private)?;
+    ensure_owner_private_lock_dir(&locks)?;
+    let path = locks.join(format!("{change}.lock"));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
+    }
+    let file = options.open(&path)?;
+    file.lock()?;
+    let descriptor = file.metadata()?;
+    let named = fs::symlink_metadata(&path)?;
+    if descriptor.file_type().is_symlink()
+        || !descriptor.is_file()
+        || named.file_type().is_symlink()
+        || !named.is_file()
+    {
+        return Err(io::Error::other("ledger lock is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = fs::metadata(root)?.uid();
+        if descriptor.dev() != named.dev()
+            || descriptor.ino() != named.ino()
+            || descriptor.nlink() != 1
+            || descriptor.uid() != owner
+            || descriptor.mode() & 0o077 != 0
+            || descriptor.mode() & 0o600 != 0o600
+        {
+            return Err(io::Error::other(
+                "ledger lock identity or owner-only permissions are invalid",
+            ));
+        }
+    }
+    Ok(LedgerFileLock { _file: file })
+}
+
+fn ensure_owner_private_lock_dir(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::other(
+            "ledger lock directory is not a no-follow directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = fs::metadata(
+            path.ancestors()
+                .find(|ancestor| ancestor.file_name().is_some_and(|name| name == ".git"))
+                .unwrap_or(path),
+        )?
+        .uid();
+        if metadata.uid() != owner || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::other(
+                "ledger lock directory is not owner-private",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Read the current-change pointer, if set. A value that is not a valid change
 /// name (e.g. a tampered, git-tracked `.mpd/current` carrying `../../`) is
 /// treated as unset rather than trusted into a path.
 pub fn current(root: &Path) -> Option<String> {
-    std::fs::read_to_string(current_path(root))
+    openspec_core::read_contained_capped(root, &current_path(root), 1024)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -821,16 +1921,24 @@ pub fn current(root: &Path) -> Option<String> {
 pub fn set_current(root: &Path, change: &str) -> io::Result<()> {
     validate_change_name(change).map_err(invalid)?;
     let path = current_path(root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{change}\n"))
+    openspec_core::atomic_write_contained(root, &path, format!("{change}\n").as_bytes())
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn init_locking_fixture(root: &Path) {
+        std::fs::create_dir_all(root.join(".mpd/state")).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+    }
 
     fn pass(by: &str) -> GateRecord {
         GateRecord {
@@ -846,10 +1954,14 @@ mod tests {
             completed_at_epoch_secs: 0,
             receipt: None,
             persona_tuning: None,
+            candidate: None,
+            build_output: None,
+            deploy_result: None,
+            validation_receipt: None,
         }
     }
 
-    /// Walk the execution phases common to every change (design/doc skipped).
+    /// Walk the execution phases through Test, before mandatory documentation.
     fn walk_core(l: &mut Ledger) {
         for phase in [
             Phase::Architecture,
@@ -858,16 +1970,158 @@ mod tests {
             Phase::SecurityCode,
             Phase::Test,
         ] {
-            l.record(phase, pass(phase.persona().name));
+            l.record(phase, pass(phase.persona().name)).unwrap();
         }
+    }
+
+    fn walk_to_deploy(l: &mut Ledger) {
+        walk_core(l);
+        l.record(Phase::Documentation, pass("Documenter")).unwrap();
+        l.record(Phase::DocValidation, pass("Architect & Designer"))
+            .unwrap();
     }
 
     #[test]
     fn passing_current_phase_advances() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Feature);
         assert_eq!(l.phase, Phase::Architecture);
-        l.record(Phase::Architecture, pass("Architect"));
+        l.record(Phase::Architecture, pass("Architect")).unwrap();
         assert_eq!(l.phase, Phase::SecurityPlan);
+    }
+
+    #[test]
+    fn documentation_doctrine_covers_feature_fix_and_all_chore_subtypes() {
+        for kind in [ChangeKind::Feature, ChangeKind::Fix, ChangeKind::Chore] {
+            assert!(kind.documents(), "{} must run documentation", kind.label());
+            let ledger = Ledger::new("doctrine", "mpd", false, kind);
+            let phases = Phase::applicable(ledger.applicability());
+            assert!(phases.contains(&Phase::Documentation));
+            assert!(phases.contains(&Phase::DocValidation));
+            assert_eq!(phases.last(), Some(&Phase::Deploy));
+        }
+        // Configuration, dependency, and tooling changes are represented by
+        // Chore and therefore follow the same mandatory phase matrix.
+    }
+
+    #[test]
+    fn first_adoption_reconciliation_preserves_history_and_rewinds_build_once() {
+        let mut l = Ledger::new("adoption", "mpd", false, ChangeKind::Feature);
+        for phase in [
+            Phase::Architecture,
+            Phase::SecurityPlan,
+            Phase::Build,
+            Phase::SecurityCode,
+        ] {
+            l.record(phase, pass("tester")).unwrap();
+        }
+        let event = FirstAdoptionReconciliationV1 {
+            schema: 1,
+            checkpoint_oid: "a".repeat(40),
+            policy_object_oid: "b".repeat(40),
+            pretrust_proof_digest: "c".repeat(64),
+            security_evidence: "security-code.md".into(),
+            reason: "reviewed transition".into(),
+            at_epoch_secs: 1,
+            checkpoint_scope_digest: "d".repeat(64),
+            security_evidence_digest: "e".repeat(64),
+            bootstrap_nonce_digest: "f".repeat(64),
+            trusted_policy_digest: "0".repeat(64),
+        };
+        assert!(l.reconcile_first_adoption(event.clone()).unwrap());
+        assert_eq!(l.phase, Phase::Build);
+        assert!(!l.gates.contains_key(&Phase::Build));
+        assert_eq!(
+            l.history.iter().filter(|e| e.phase == Phase::Build).count(),
+            1
+        );
+        assert!(!l.reconcile_first_adoption(event).unwrap());
+        let mut conflicting_replay = l.first_adoption_reconciliations[0].clone();
+        conflicting_replay.bootstrap_nonce_digest = "1".repeat(64);
+        assert!(l.reconcile_first_adoption(conflicting_replay).is_err());
+        assert_eq!(l.first_adoption_reconciliations.len(), 1);
+        assert_eq!(l.phase, Phase::Build);
+        assert_eq!(
+            l.history.iter().filter(|e| e.phase == Phase::Build).count(),
+            1
+        );
+    }
+
+    fn pretrust_restart(
+        superseded: char,
+        replacement: char,
+        evidence: char,
+    ) -> FirstAdoptionRestartV1 {
+        FirstAdoptionRestartV1 {
+            schema: 1,
+            stage: FirstAdoptionRestartStage::Pretrust,
+            superseded_checkpoint_oid: superseded.to_string().repeat(40),
+            superseded_proof_digest: Some("c".repeat(64)),
+            replacement_tip_oid: Some(replacement.to_string().repeat(40)),
+            actor: "independent Security reviewer".into(),
+            reason: "material correction retained as a descendant".into(),
+            evidence_digest: evidence.to_string().repeat(64),
+            at_epoch_secs: 1,
+        }
+    }
+
+    #[test]
+    fn first_adoption_restart_is_bounded_append_only_and_derives_latest_eligibility() {
+        let mut ledger = Ledger::new("adoption", "mpd", false, ChangeKind::Feature);
+        let history_before = ledger.history.clone();
+        let first = pretrust_restart('a', 'b', 'd');
+        assert!(ledger.append_first_adoption_restart(first.clone()).unwrap());
+        assert!(!ledger.append_first_adoption_restart(first).unwrap());
+        assert_eq!(
+            ledger.history, history_before,
+            "restart must not create PASS"
+        );
+
+        let eligibility = ledger
+            .first_adoption_eligibility(&"a".repeat(40), Some(&"c".repeat(64)), &"e".repeat(64))
+            .unwrap();
+        assert_eq!(eligibility.latest_eligible_checkpoint_oid, "b".repeat(40));
+        assert_eq!(eligibility.latest_eligible_proof_digest, None);
+        assert_eq!(eligibility.latest_evidence_digest, "d".repeat(64));
+        assert_eq!(eligibility.restart_count, 1);
+        assert_eq!(eligibility.checkpoint_chain_digest.len(), 64);
+
+        let mut conflicting = pretrust_restart('a', 'f', 'e');
+        conflicting.reason = "different correction".into();
+        assert!(ledger.append_first_adoption_restart(conflicting).is_err());
+        assert_eq!(ledger.first_adoption_restarts.len(), 1);
+
+        let second = pretrust_restart('b', 'f', 'e');
+        assert!(ledger.append_first_adoption_restart(second).unwrap());
+        let eligibility = ledger
+            .first_adoption_eligibility(&"a".repeat(40), Some(&"c".repeat(64)), &"e".repeat(64))
+            .unwrap();
+        assert_eq!(eligibility.latest_eligible_checkpoint_oid, "f".repeat(40));
+        assert_eq!(eligibility.latest_evidence_digest, "e".repeat(64));
+        assert_eq!(eligibility.restart_count, 2);
+    }
+
+    #[test]
+    fn first_adoption_restart_rejects_wrong_stage_malformed_codec_and_non_chain_event() {
+        let mut ledger = Ledger::new("adoption", "mpd", false, ChangeKind::Feature);
+        let mut posttrust = pretrust_restart('a', 'b', 'd');
+        posttrust.stage = FirstAdoptionRestartStage::Posttrust;
+        assert!(ledger.append_first_adoption_restart(posttrust).is_err());
+
+        let mut malformed = pretrust_restart('a', 'b', 'd');
+        malformed.actor = "unsafe\nactor".into();
+        assert!(ledger.append_first_adoption_restart(malformed).is_err());
+        assert!(serde_json::from_str::<FirstAdoptionRestartV1>(
+            r#"{"schema":1,"stage":"pretrust","superseded_checkpoint_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","replacement_tip_oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","actor":"reviewer","reason":"fix","evidence_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","at_epoch_secs":1,"unknown":true}"#
+        )
+        .is_err());
+
+        assert!(ledger
+            .append_first_adoption_restart(pretrust_restart('a', 'b', 'd'))
+            .unwrap());
+        assert!(ledger
+            .append_first_adoption_restart(pretrust_restart('f', '0', 'e'))
+            .is_err());
+        assert_eq!(ledger.first_adoption_restarts.len(), 1);
     }
 
     #[test]
@@ -875,7 +2129,7 @@ mod tests {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Feature);
         let mut rec = pass("Security");
         rec.verdict = Verdict::Fail;
-        l.record(Phase::Architecture, rec);
+        l.record(Phase::Architecture, rec).unwrap();
         assert_eq!(l.phase, Phase::Architecture);
         assert!(!l.ready_to_archive());
     }
@@ -883,15 +2137,15 @@ mod tests {
     #[test]
     fn record_preserves_verdict_history() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
-        l.record(Phase::Architecture, pass("Architect"));
-        l.record(Phase::SecurityPlan, pass("Security"));
-        l.record(Phase::Build, pass("Builder"));
+        l.record(Phase::Architecture, pass("Architect")).unwrap();
+        l.record(Phase::SecurityPlan, pass("Security")).unwrap();
+        l.record(Phase::Build, pass("Builder")).unwrap();
         // Security (code) FAILs, then is fixed and re-recorded PASS.
         let mut fail = pass("Security");
         fail.verdict = Verdict::Fail;
-        l.record(Phase::SecurityCode, fail);
+        l.record(Phase::SecurityCode, fail).unwrap();
         assert_eq!(l.phase, Phase::SecurityCode, "FAIL does not advance");
-        l.record(Phase::SecurityCode, pass("Security"));
+        l.record(Phase::SecurityCode, pass("Security")).unwrap();
         // Latest-per-phase shows PASS (and advances); history keeps FAIL *and* PASS.
         assert_eq!(l.gates[&Phase::SecurityCode].verdict, Verdict::Pass);
         assert_eq!(l.phase, Phase::Test);
@@ -943,10 +2197,12 @@ mod tests {
         let l: Ledger = serde_json::from_str(json).unwrap();
         assert_eq!(l.archive_closure, None);
         assert_eq!(l.gates[&Phase::Architecture].receipt, None);
+        assert_eq!(l.gates[&Phase::Architecture].candidate, None);
         // Round-trips forward without inventing either field.
         let json_out = serde_json::to_string(&l).unwrap();
         assert!(!json_out.contains("receipt"));
         assert!(!json_out.contains("archive_closure"));
+        assert!(!json_out.contains("\"candidate\""));
         let back: Ledger = serde_json::from_str(&json_out).unwrap();
         assert_eq!(l, back);
     }
@@ -981,23 +2237,23 @@ mod tests {
         failed.verdict = Verdict::Fail;
         failed.failure_class = Some(FailureClass::Product);
         failed.attempt = 1;
-        l.record(Phase::Architecture, failed);
+        l.record(Phase::Architecture, failed).unwrap();
         assert!(!l.attempt_authorized(Phase::Architecture));
         l.reconcile(ReconciliationKind::Continue, "fix is ready".into(), None)
             .unwrap();
         assert!(l.attempt_authorized(Phase::Architecture));
         let mut retried = pass("Architect");
         retried.attempt = 2;
-        l.record(Phase::Architecture, retried);
+        l.record(Phase::Architecture, retried).unwrap();
         assert!(l.governance.reconciliations[0].consumed);
     }
 
     #[test]
     fn governance_change_retains_history_and_rewinds_only_security_and_downstream() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
-        l.record(Phase::Architecture, pass("Architect"));
-        l.record(Phase::SecurityPlan, pass("Security"));
-        l.record(Phase::Build, pass("Builder"));
+        l.record(Phase::Architecture, pass("Architect")).unwrap();
+        l.record(Phase::SecurityPlan, pass("Security")).unwrap();
+        l.record(Phase::Build, pass("Builder")).unwrap();
         let history_len = l.history.len();
         l.reconcile(
             ReconciliationKind::ThreatProfile,
@@ -1031,72 +2287,365 @@ mod tests {
     }
 
     #[test]
-    fn fix_ready_after_core_gates_skipping_docs() {
-        // A fix skips the Documentation phases: Test → Deploy → ready.
+    fn fix_requires_documentation_validation_then_final_deploy() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
         walk_core(&mut l);
+        assert_eq!(l.phase, Phase::Documentation);
+        l.record(Phase::Documentation, pass("Documenter")).unwrap();
+        assert_eq!(l.phase, Phase::DocValidation);
+        l.record(Phase::DocValidation, pass("Architect & Designer"))
+            .unwrap();
         assert_eq!(l.phase, Phase::Deploy);
+        assert!(!l.ready_to_archive(), "{:?}", l.blocking_reasons());
+        assert_eq!(l.phase, Phase::Deploy);
+        l.record(Phase::Deploy, pass("main-session")).unwrap();
         assert!(l.ready_to_archive(), "{:?}", l.blocking_reasons());
     }
 
     #[test]
-    fn feature_requires_documentation_and_validation() {
+    fn feature_requires_documentation_validation_then_final_deploy() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Feature);
         walk_core(&mut l);
         // Documentation is required before archive.
         assert_eq!(l.phase, Phase::Documentation);
         assert!(!l.ready_to_archive());
-        l.record(Phase::Documentation, pass("Documenter"));
-        assert_eq!(l.phase, Phase::Deploy);
-        // Doc Validation (after Deploy) is still required.
-        assert!(!l.ready_to_archive());
-        l.record(Phase::Deploy, pass("main-session"));
+        l.record(Phase::Documentation, pass("Documenter")).unwrap();
         assert_eq!(l.phase, Phase::DocValidation);
+        // Doc Validation is required before final Deploy.
         assert!(!l.ready_to_archive());
-        l.record(Phase::DocValidation, pass("Architect & Designer"));
+        l.record(Phase::DocValidation, pass("Architect & Designer"))
+            .unwrap();
+        assert_eq!(l.phase, Phase::Deploy);
+        assert!(!l.ready_to_archive());
+        l.record(Phase::Deploy, pass("main-session")).unwrap();
         assert!(l.ready_to_archive(), "{:?}", l.blocking_reasons());
     }
 
     #[test]
     fn open_condition_blocks_archive() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
-        walk_core(&mut l);
+        walk_to_deploy(&mut l);
         l.conditions.push(Condition {
+            id: "security-code.1".into(),
+            phase: Phase::SecurityCode,
+            attempt: 1,
             text: "close the audit item".into(),
             owner: "Security".into(),
             closed: false,
+            opened_at_epoch_secs: 0,
+            events: Vec::new(),
         });
         assert!(!l.ready_to_archive());
         l.conditions[0].closed = true;
+        l.record(Phase::Deploy, pass("main-session")).unwrap();
         assert!(l.ready_to_archive());
     }
 
     #[test]
     fn close_condition_by_index_and_all() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
-        walk_core(&mut l);
+        walk_to_deploy(&mut l);
         for t in ["a", "b"] {
             l.conditions.push(Condition {
+                id: format!("security-code.{t}"),
+                phase: Phase::SecurityCode,
+                attempt: 1,
                 text: t.into(),
                 owner: "Security".into(),
                 closed: false,
+                opened_at_epoch_secs: 0,
+                events: Vec::new(),
             });
         }
-        assert!(l.close_condition(3).is_err()); // out of range
-        assert!(l.close_condition(0).is_err()); // not 1-based
-        l.close_condition(1).unwrap();
+        assert!(l
+            .close_condition(3, "Security", "test.md".into(), "digest".into())
+            .is_err()); // out of range
+        assert!(l
+            .close_condition(0, "Security", "test.md".into(), "digest".into())
+            .is_err()); // not 1-based
+        l.close_condition(1, "Security", "test.md".into(), "digest".into())
+            .unwrap();
         assert!(!l.ready_to_archive()); // #2 still open
-        assert_eq!(l.close_all_conditions(), 1); // only #2 remained
+        assert_eq!(
+            l.close_all_conditions("Security", "test.md".into(), "digest".into())
+                .unwrap(),
+            1
+        ); // only #2 remained
+        l.record(Phase::Deploy, pass("main-session")).unwrap();
         assert!(l.ready_to_archive());
+    }
+
+    #[test]
+    fn explicit_repair_rewinds_only_and_is_idempotent_without_fabricating_verdicts() {
+        let mut l = Ledger::new("legacy", "mpd", false, ChangeKind::Fix);
+        l.set_strict();
+        l.record(Phase::Architecture, pass("Architect")).unwrap();
+        l.record(Phase::SecurityPlan, pass("Security")).unwrap();
+        let history_before = l.history.clone();
+        l.conditions.push(Condition {
+            id: "security-plan.1".into(),
+            phase: Phase::SecurityPlan,
+            attempt: 1,
+            text: "legacy unscoped condition".into(),
+            owner: "Security".into(),
+            // This is the exact legacy ambiguity: a closed boolean but no
+            // evidence-bearing event history.
+            closed: true,
+            opened_at_epoch_secs: 0,
+            events: Vec::new(),
+        });
+
+        assert!(l.integrity_blockers()[0].contains("legacy-unscoped"));
+        assert!(!l
+            .repair_state_preview(Phase::SecurityPlan, "explicit migration")
+            .unwrap());
+        assert!(l
+            .repair_state_to(Phase::SecurityPlan, "explicit migration", &"a".repeat(64))
+            .unwrap());
+
+        assert_eq!(l.phase, Phase::SecurityPlan);
+        assert_eq!(
+            l.history, history_before,
+            "repair must not synthesize a PASS"
+        );
+        assert!(!l.gates.contains_key(&Phase::SecurityPlan));
+        assert!(
+            l.archive_closure.is_none(),
+            "repair must not rewrite/archive state"
+        );
+        assert!(matches!(
+            l.conditions[0].events.as_slice(),
+            [ConditionEvent::Reopened {
+                rewind_phase: Phase::SecurityPlan,
+                ..
+            }]
+        ));
+        assert!(l.conditions[0].is_open());
+        assert_eq!(l.legacy_repairs.len(), 1);
+        assert_eq!(l.legacy_repairs[0].ledger_before_digest, "a".repeat(64));
+        assert!(l
+            .repair_state_preview(Phase::SecurityPlan, "explicit migration")
+            .unwrap());
+        assert!(!l
+            .repair_state_to(Phase::SecurityPlan, "explicit migration", &"b".repeat(64))
+            .unwrap());
+        assert_eq!(l.legacy_repairs.len(), 1, "replay must be a no-op");
+        assert!(l
+            .repair_state_preview(Phase::Build, "wrong direction")
+            .is_err());
+
+        l.archive_closure = Some(ArchiveClosure {
+            base_commit: "0".repeat(40),
+            archive_path: "openspec/changes/archive/legacy".into(),
+            transaction_id: crate::digest::Digest::of_bytes(b"transaction"),
+            candidate_id: None,
+            allowed_paths: vec![],
+            system_paths: vec![],
+            post_archive_digest: crate::digest::Digest::of_bytes(b"postimage"),
+            archived_at: 1,
+        });
+        let archived = l
+            .repair_state_preview(Phase::Architecture, "immutable archive")
+            .unwrap_err();
+        assert!(archived.contains("archives are immutable"));
+    }
+
+    #[test]
+    fn repair_save_refuses_a_concurrently_changed_observed_ledger() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-repair-observed-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        init_locking_fixture(&root);
+        let mut ledger = Ledger::new("repair-race", "mpd", false, ChangeKind::Fix);
+        ledger
+            .record(Phase::Architecture, pass("Architect"))
+            .unwrap();
+        save(&root, &ledger).unwrap();
+
+        let (mut loaded, observed) = load_observed(&root, "repair-race").unwrap();
+        loaded
+            .repair_state_to(Phase::Architecture, "operator rewind", &observed)
+            .unwrap();
+
+        let path = state_path(&root, "repair-race");
+        let mut concurrent = std::fs::read(&path).unwrap();
+        concurrent.extend_from_slice(b" ");
+        std::fs::write(&path, &concurrent).unwrap();
+        let error = save_if_observed(&root, &loaded, &observed).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_observed_saves_serialize_and_only_one_concurrent_writer_wins() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-cas-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_locking_fixture(&root);
+        let ledger = Ledger::new("cas-race", "mpd", false, ChangeKind::Fix);
+        save(&root, &ledger).unwrap();
+        let (observed_ledger, observation) = load_observed_exact(&root, "cas-race").unwrap();
+        let mut first = observed_ledger.clone();
+        first.phase_started_at_epoch_secs = 11;
+        let mut second = observed_ledger;
+        second.phase_started_at_epoch_secs = 22;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |proposed: Ledger| {
+            let root = root.clone();
+            let observation = observation.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                save_exact_observed(&root, &proposed, &observation)
+            })
+        };
+        let left = spawn(first.clone());
+        let right = spawn(second.clone());
+        let outcomes = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ExactSaveOutcome::Committed))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    ExactSaveOutcome::NotCommitted(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                ))
+                .count(),
+            1
+        );
+        let durable = load(&root, "cas-race").unwrap();
+        assert!(durable == first || durable == second);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_save_resolves_post_rename_failure_by_exact_readback() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-post-rename-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_locking_fixture(&root);
+        let ledger = Ledger::new("post-rename", "mpd", false, ChangeKind::Fix);
+        save(&root, &ledger).unwrap();
+        let (mut proposed, observation) = load_observed_exact(&root, "post-rename").unwrap();
+        proposed.phase_started_at_epoch_secs = 99;
+
+        let outcome =
+            save_exact_observed_with(&root, &proposed, &observation, |root, path, bytes| {
+                openspec_core::atomic_write_contained(root, path, bytes).unwrap();
+                AtomicWriteOutcome::FailedAfterRename(openspec_core::CoreError::Io(
+                    "injected parent-directory sync failure".into(),
+                ))
+            });
+        assert!(matches!(
+            outcome,
+            ExactSaveOutcome::CommittedAfterRename { ref error }
+                if error.contains("injected parent-directory sync failure")
+        ));
+        assert_eq!(load(&root, "post-rename").unwrap(), proposed);
+
+        let (mut stale, second_observation) = load_observed_exact(&root, "post-rename").unwrap();
+        stale.phase_started_at_epoch_secs = 100;
+        let prior = second_observation.exact.clone();
+        let outcome =
+            save_exact_observed_with(&root, &stale, &second_observation, |root, path, _| {
+                openspec_core::atomic_write_contained(root, path, prior.as_bytes()).unwrap();
+                AtomicWriteOutcome::FailedAfterRename(openspec_core::CoreError::Io(
+                    "injected post-rename replacement".into(),
+                ))
+            });
+        assert!(matches!(outcome, ExactSaveOutcome::UncertainAfterRename(_)));
+        assert_eq!(load(&root, "post-rename").unwrap(), proposed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn roundtrips_through_json() {
         let mut l = Ledger::new("c", "mpd", true, ChangeKind::Feature);
-        l.record(Phase::DesignMock, pass("Designer"));
+        l.record(Phase::DesignMock, pass("Designer")).unwrap();
         let json = serde_json::to_string(&l).unwrap();
         let back: Ledger = serde_json::from_str(&json).unwrap();
         assert_eq!(l, back);
+    }
+
+    #[test]
+    fn candidate_gate_and_build_output_codecs_are_compact_and_legacy_safe() {
+        let capture = crate::candidate::CandidateCapture {
+            subject: crate::candidate::CandidateSubject {
+                version: 1,
+                change: "c".into(),
+                base_commit: "a".repeat(40),
+                base_tree: "b".repeat(40),
+                manifest_digest: "c".repeat(64),
+                entries_digest: "d".repeat(64),
+                policy_digest: "e".repeat(64),
+                source_digest: "f".repeat(64),
+                id: "1".repeat(64),
+            },
+            clone_private_root: "/private/candidate".into(),
+            storage: crate::candidate::CandidateStorageBinding {
+                record_path: "/private/record.json".into(),
+                record_sha256: "2".repeat(64),
+                root_device: 1,
+                root_inode: 2,
+                record_device: 1,
+                record_inode: 3,
+            },
+            counts: crate::candidate::CandidateCounts {
+                entries: 100_000,
+                included_dirty: 2,
+                deleted: 1,
+                untracked: 1,
+                executable: 1,
+                excluded_dirty: 100_000,
+            },
+            excluded_dirty_digest: "3".repeat(64),
+            excluded_dirty_sample: Vec::new(),
+            declared_status_digest: "4".repeat(64),
+            captured_at_epoch_secs: 1,
+        };
+        let mut ledger = Ledger::new("c", "mpd", false, ChangeKind::Fix);
+        let mut record = pass("Architect");
+        record.candidate = Some(capture.clone());
+        ledger.record(Phase::Architecture, record).unwrap();
+        let encoded = serde_json::to_string(&ledger).unwrap();
+        let encoded_value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert!(encoded_value["gates"]["architecture"]["candidate"]
+            .get("entries")
+            .is_none());
+        let decoded: Ledger = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.gates[&Phase::Architecture].candidate, Some(capture));
+
+        let legacy = r#"{"schema":1,"name":"mpd","path":"out/mpd","max_bytes":10,"required_mode":493,"size":5,"mode":493,"device":1,"inode":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let legacy: BuildOutputV1 = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy.candidate_id, None);
+        let mut bound = legacy;
+        bound.candidate_id = Some("b".repeat(64));
+        let roundtrip: BuildOutputV1 =
+            serde_json::from_str(&serde_json::to_string(&bound).unwrap()).unwrap();
+        assert_eq!(roundtrip, bound);
     }
 
     #[test]
@@ -1276,9 +2825,9 @@ mod tests {
         // the re-run (design.md D7 / B1). An upstream (Architecture) waiver
         // survives, since that phase is not rewound.
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
-        l.record(Phase::Architecture, pass("Architect"));
-        l.record(Phase::SecurityPlan, pass("Security"));
-        l.record(Phase::Build, pass("Builder"));
+        l.record(Phase::Architecture, pass("Architect")).unwrap();
+        l.record(Phase::SecurityPlan, pass("Security")).unwrap();
+        l.record(Phase::Build, pass("Builder")).unwrap();
         l.waivers.push(Waiver {
             phase: Phase::Architecture,
             reason: "design.md already carries the conditions".into(),
@@ -1353,6 +2902,141 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn effective_risk_max_law(requested in 0u8..3, derived in 0u8..3) {
+            let levels = [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High];
+            let requested = levels[requested as usize];
+            let derived = levels[derived as usize];
+            let effective = requested.max(derived);
+            prop_assert!(effective.rank() >= requested.rank());
+            prop_assert!(effective.rank() >= derived.rank());
+            prop_assert_eq!(effective.rank(), requested.rank().max(derived.rank()));
+        }
+
+        /// Independent small reference model for the phase transition kernel.
+        /// It deliberately does not call `Ledger::record` to compute the
+        /// expected state: arbitrary seeded action sequences must not advance
+        /// on FAIL/CONDITIONAL, accept a future phase, or become archive-ready
+        /// without Deploy and Done.
+        #[test]
+        fn seeded_phase_reference_model_preserves_gate_truth(actions in proptest::collection::vec(any::<u8>(), 1..240)) {
+            let mut ledger = Ledger::new("model", "mpd", false, ChangeKind::Fix);
+            let mut reference = ledger.phase;
+            let mut condition_phase: Option<Phase> = None;
+            let mut condition_open = false;
+            let mut task = TaskEntry {
+                id: "1.1".into(),
+                done: false,
+                text: "model task".into(),
+                normalized_record: "- [ ] 1.1 model task".into(),
+                record_digest: "a".repeat(64),
+                source_line: 1,
+            };
+            let mut task_state = 0u8; // 0=open, 1=deferred, 2=done, 3=stale
+            let mut deferred_record_digest: Option<String> = None;
+            for action in actions {
+                match action % 10 {
+                    0 if reference != Phase::Done => {
+                        let phase = reference;
+                        ledger.record(phase, pass("reference")).unwrap();
+                        reference = phase.next(ledger.applicability());
+                    }
+                    1 if reference != Phase::Done => {
+                        let phase = reference;
+                        let mut record = pass("reference");
+                        record.verdict = Verdict::Fail;
+                        ledger.record(phase, record).unwrap();
+                    }
+                    2 if reference != Phase::Done => {
+                        let phase = reference;
+                        let mut record = pass("reference");
+                        record.verdict = Verdict::ConditionalPass;
+                        ledger.record(phase, record).unwrap();
+                        // CLI owns opening, but the model exercises the same
+                        // append-only ledger shape independently of CLI parsing.
+                        if condition_phase.is_none() && phase >= Phase::SecurityPlan {
+                            ledger.conditions.push(Condition {
+                                id: format!("{}.1", phase.slug()),
+                                phase,
+                                attempt: 1,
+                                text: "model obligation".into(),
+                                owner: "Security".into(),
+                                closed: false,
+                                opened_at_epoch_secs: 1,
+                                events: vec![ConditionEvent::Opened {
+                                    by: "Security".into(),
+                                    at_epoch_secs: 1,
+                                    evidence: "security-plan.md".into(),
+                                    evidence_digest: "e".repeat(64),
+                                }],
+                            });
+                            condition_phase = Some(phase);
+                            condition_open = true;
+                        }
+                    }
+                    3 if reference != Phase::Done => {
+                        let future = if reference == Phase::Deploy { Phase::Architecture } else { Phase::Deploy };
+                        prop_assert!(ledger.record(future, pass("future")).is_err());
+                    }
+                    4 if reference > Phase::SecurityPlan => {
+                        ledger.reconcile(ReconciliationKind::Risk, "seeded rewind".into(), Some("high".into())).unwrap();
+                        reference = Phase::SecurityPlan;
+                        if condition_phase.is_some_and(|phase| phase >= Phase::SecurityPlan) {
+                            condition_open = true;
+                        }
+                    }
+                    5 if condition_open => {
+                        ledger.close_all_conditions("Security", "security-plan.md".into(), "d".repeat(64)).unwrap();
+                        condition_open = false;
+                    }
+                    6 if task_state == 0 => {
+                        ledger.defer_task(&task, "Builder", "bounded model deferral", "tasks.md".into(), "f".repeat(64)).unwrap();
+                        deferred_record_digest = Some(task.record_digest.clone());
+                        task_state = 1;
+                    }
+                    7 if task_state == 1 => {
+                        ledger.revoke_task_deferral(&task, "model revoke").unwrap();
+                        deferred_record_digest = None;
+                        task_state = 0;
+                    }
+                    8 if matches!(task_state, 0 | 1) => {
+                        task.done = true;
+                        task_state = 2;
+                    }
+                    9 if task_state != 2 => {
+                        task.record_digest = if task.record_digest.starts_with('a') { "b".repeat(64) } else { "a".repeat(64) };
+                        if matches!(task_state, 1 | 3) {
+                            task_state = if deferred_record_digest.as_deref() == Some(&task.record_digest) {
+                                1
+                            } else {
+                                3
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+                prop_assert_eq!(ledger.phase, reference);
+                prop_assert_eq!(ledger.conditions.iter().any(Condition::is_open), condition_open);
+                let plan = TaskPlan { strict: true, entries: vec![task.clone()] };
+                let accounting = ledger.task_accounting(&plan);
+                match task_state {
+                    0 => prop_assert_eq!(&accounting.open, &vec!["1.1".to_string()]),
+                    1 => prop_assert_eq!(accounting.deferred, 1),
+                    2 => prop_assert_eq!(accounting.done, 1),
+                    3 => prop_assert_eq!(&accounting.stale, &vec!["1.1".to_string()]),
+                    _ => unreachable!(),
+                }
+                let archive_ready = ledger.ready_to_archive() && accounting.accounted();
+                if condition_open || matches!(task_state, 0 | 3) {
+                    prop_assert!(!archive_ready, "open/reopened conditions and open/stale tasks block archive");
+                }
+                if archive_ready {
+                    prop_assert_eq!(ledger.phase, Phase::Done);
+                    prop_assert_eq!(ledger.gates.get(&Phase::Deploy).map(|r| r.verdict), Some(Verdict::Pass));
+                }
+            }
+        }
+
         /// `merge_weakest_seen` is monotone in every field, for arbitrary record
         /// pairs: each boolean can only ever become MORE true (OR, never AND or
         /// overwrite), and each ordinal can only ever rise to the max of the two

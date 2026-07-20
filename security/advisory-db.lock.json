@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/RustSec/advisory-db",
+  "commit": "b5fc89b8be99e96f79194d8a6f11e9b4143b99f0",
+  "git_tree_oid": "c943a47fee3f2b9767f664fd26c2cb6f0447b23d",
+  "tree_listing_sha256": "520549ccc6e60f4b713ff8a32ede54a4a79f85fe49eccbad81c6de70b349c642",
+  "commit_time": "2026-07-17T17:52:38+02:00",
+  "max_age_days": 30,
+  "install_root": "mpd/advisory-db"
+}

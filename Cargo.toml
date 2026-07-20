@@ -7,8 +7,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Michael Weingarten"]
-repository = "https://github.com/mweingart/commando"
-rust-version = "1.74"
+repository = "https://github.com/mweingartner/commando"
+rust-version = "1.91"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +17,7 @@ serde_yaml_ng = "0.10"
 clap = { version = "4", features = ["derive"] }
 proptest = "1"
 sha2 = "0.10"
+nix = { version = "0.30", features = ["fs", "process", "resource", "signal"] }
 
 [profile.release]
 strip = true

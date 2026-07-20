@@ -56,24 +56,14 @@ const PLACEHOLDERS: &[&str] = &[
 /// bounding the prefix keeps the repeated pattern scans linear against an
 /// adversarial multi-megabyte single line (scanner DoS defense).
 const MAX_SCAN_LINE: usize = 4096;
+const SCAN_WINDOW_OVERLAP: usize = 256;
 
 /// Scan a single file's text for secret patterns.
 pub fn scan_text(path: &str, text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     for (i, line) in text.split('\n').enumerate() {
         let line_no = i + 1;
-        // Bound work per line at a UTF-8 char boundary (portable; avoids the
-        // 1.91-only `floor_char_boundary`).
-        let scanned = if line.len() > MAX_SCAN_LINE {
-            let mut end = MAX_SCAN_LINE;
-            while end > 0 && !line.is_char_boundary(end) {
-                end -= 1;
-            }
-            &line[..end]
-        } else {
-            line
-        };
-        if let Some(rule) = scan_line(scanned) {
+        if let Some(rule) = scan_line_windows(line) {
             findings.push(Finding {
                 path: path.to_string(),
                 line: line_no,
@@ -82,6 +72,34 @@ pub fn scan_text(path: &str, text: &str) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// Scan the entire line in overlapping bounded windows. This retains linear
+/// work and bounded per-pattern input without the former first-4096-byte blind
+/// spot. The overlap is longer than every fixed token prefix and curated token
+/// minimum, so a credential split at a window boundary is still observed.
+fn scan_line_windows(line: &str) -> Option<&'static str> {
+    if line.len() <= MAX_SCAN_LINE {
+        return scan_line(line);
+    }
+    let mut start = 0;
+    while start < line.len() {
+        while start < line.len() && !line.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = (start + MAX_SCAN_LINE).min(line.len());
+        while end > start && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Some(rule) = scan_line(&line[start..end]) {
+            return Some(rule);
+        }
+        if end == line.len() {
+            break;
+        }
+        start = end.saturating_sub(SCAN_WINDOW_OVERLAP);
+    }
+    None
 }
 
 /// Inspect one line, returning the first matching rule.
@@ -161,7 +179,7 @@ fn has_aws_access_key(line: &str) -> bool {
             {
                 // Ensure it isn't part of a longer alnum run beyond 16.
                 let after = bytes.get(start + 16).copied();
-                if after.map_or(true, |b| !(b.is_ascii_alphanumeric())) {
+                if after.is_none_or(|b| !(b.is_ascii_alphanumeric())) {
                     return true;
                 }
             }
@@ -254,11 +272,13 @@ fn extract_unquoted_value(line: &str) -> Option<&str> {
 /// blobs, binaries) are skipped for content but still get filename rules —
 /// bounds memory of `mpd check` / the pre-commit hook.
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SCAN_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Scan a set of files on disk. Filename rules apply even when a file cannot be
 /// read as UTF-8; content rules apply to readable text under the size cap.
 pub fn scan_paths(paths: &[PathBuf]) -> io::Result<Vec<Finding>> {
     let mut findings = Vec::new();
+    let mut aggregate = 0_u64;
     for path in paths {
         if let Some(rule) = suspicious_filename(path) {
             findings.push(Finding {
@@ -267,13 +287,31 @@ pub fn scan_paths(paths: &[PathBuf]) -> io::Result<Vec<Finding>> {
                 rule,
             });
         }
-        // Skip content scanning for oversized files (filename rule already ran).
-        if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
-            continue;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::other(format!(
+                "secret scanner refuses unsafe non-regular path {}",
+                path.display()
+            )));
         }
-        if let Ok(text) = std::fs::read_to_string(path) {
-            findings.extend(scan_text(&path.display().to_string(), &text));
+        if metadata.len() > MAX_FILE_BYTES {
+            return Err(io::Error::other(format!(
+                "secret scanner file exceeds {} byte cap: {}",
+                MAX_FILE_BYTES,
+                path.display()
+            )));
         }
+        aggregate = aggregate
+            .checked_add(metadata.len())
+            .ok_or_else(|| io::Error::other("secret scanner aggregate size overflow"))?;
+        if aggregate > MAX_SCAN_TOTAL_BYTES {
+            return Err(io::Error::other(
+                "secret scanner aggregate input exceeds its cap",
+            ));
+        }
+        let bytes = std::fs::read(path)?;
+        let text = String::from_utf8_lossy(&bytes);
+        findings.extend(scan_text(&path.display().to_string(), &text));
     }
     Ok(findings)
 }
@@ -344,11 +382,12 @@ mod tests {
 
     #[test]
     fn long_line_is_bounded() {
-        // A pathological long line must not hang the scanner.
-        let mut s = String::from("api_key = \"");
-        s.push_str(&"A1".repeat(2_000_000));
-        s.push('"');
-        let _ = scan_text("big", &s); // completes quickly due to MAX_SCAN_LINE
+        // A pathological long line is scanned in bounded windows all the way
+        // to the end, rather than silently trusting bytes after the first one.
+        let mut s = "x".repeat(1_000_000);
+        s.push_str(&format!(" token=ghp_{}", "a1".repeat(20)));
+        let findings = scan_text("big", &s);
+        assert_eq!(findings[0].rule, "github-token");
     }
 
     #[test]

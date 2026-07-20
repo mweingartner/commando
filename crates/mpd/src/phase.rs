@@ -1,18 +1,17 @@
 //! The Model-Paired Development phase state machine.
 //!
 //! The pipeline is a fixed sequence of adversarial-persona phases. Two axes of
-//! [`Applicability`] gate which phases run: the **Design** phases (Mock, Review,
-//! Sign-off) run only for UI/UX changes, and the **Documentation** phases
-//! (Documentation, Doc Validation) run only for feature changes that alter
-//! functional behavior (defect fixes and non-functional chores skip them).
-//! Everything else is mandatory. This module is pure — no I/O — so the ordering
+//! [`Applicability`] gate which phases run: only the **Design** phases (Mock,
+//! Review, Sign-off) may be inapplicable, when a change has no UI/UX impact.
+//! Documentation, Doc Validation, and every other phase are mandatory for every
+//! change kind. This module is pure — no I/O — so the ordering
 //! and skip rules are unit-testable in isolation.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A pipeline phase. Ordering follows the canonical Model-Paired Development
-/// sequence; [`Phase::Done`] is the terminal state after Doc Validation.
+/// sequence; [`Phase::Done`] is the terminal state after Deploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Phase {
@@ -32,12 +31,12 @@ pub enum Phase {
     DesignSignoff,
     /// Tester runs functional + non-functional + fuzz/property passes.
     Test,
-    /// Documenter synthesizes the durable doc (feature changes only).
+    /// Documenter synthesizes the durable documentation.
     Documentation,
-    /// Deploy / readiness gate.
-    Deploy,
-    /// Architect + Designer validate the doc for accuracy (feature changes only).
+    /// Architect + Designer validate the documentation for accuracy.
     DocValidation,
+    /// Final deploy / readiness gate.
+    Deploy,
     /// All phases complete.
     Done,
 }
@@ -55,8 +54,8 @@ pub const PIPELINE: [Phase; 11] = [
     DesignSignoff,
     Test,
     Documentation,
-    Deploy,
     DocValidation,
+    Deploy,
 ];
 
 /// Which optional phase groups apply to a change. Derived from the change's
@@ -65,8 +64,8 @@ pub const PIPELINE: [Phase; 11] = [
 pub struct Applicability {
     /// The change has a UI/UX surface → the Design phases run.
     pub ui: bool,
-    /// The change alters functional behavior worth documenting → the
-    /// Documentation phases run.
+    /// Legacy compatibility field. Documentation phases are always mandatory;
+    /// callers should set this true.
     pub docs: bool,
 }
 
@@ -90,7 +89,6 @@ impl Phase {
     pub fn is_active(self, a: Applicability) -> bool {
         match self {
             DesignMock | DesignReview | DesignSignoff => a.ui,
-            Documentation | DocValidation => a.docs,
             _ => true,
         }
     }
@@ -116,7 +114,7 @@ impl Phase {
     /// record would otherwise evaporate maps to its own durable artifact; every
     /// non-judgment phase returns `None` (design.md D4/D6). Architecture is a
     /// special case: it keeps the core `design.md` artifact, and the strict check
-    /// only requires the `Conditions for Builder` section be present. The
+    /// requires its actor plus `Conditions for Builder`. The
     /// high-risk Security (code) additions (`Independent review`, `Refutation`)
     /// are layered on at the gate, not here.
     // Consumed by the strict gate + archive re-check (later stages); exercised
@@ -124,26 +122,30 @@ impl Phase {
     #[allow(dead_code)]
     pub fn judgment_artifact(self) -> Option<(&'static str, &'static [&'static str])> {
         match self {
+            DesignMock => Some((
+                "design-mock.md",
+                &["Actor", "Purpose and boundary", "Verdict"],
+            )),
             SecurityPlan => Some((
                 "security-plan.md",
-                &["Threat model", "Conditions for Builder", "Verdict"],
+                &["Actor", "Threat model", "Conditions for Builder", "Verdict"],
             )),
             SecurityCode => Some((
                 "security-code.md",
-                &["Findings", "Conditions verified", "Verdict"],
+                &["Actor", "Findings", "Conditions verified", "Verdict"],
             )),
-            DesignReview => Some(("design-review.md", &["Intent check", "Verdict"])),
+            DesignReview => Some(("design-review.md", &["Actor", "Intent check", "Verdict"])),
             DesignSignoff => Some((
                 "design-signoff.md",
-                &["Implementation vs intent", "Verdict"],
+                &["Actor", "Implementation vs intent", "Verdict"],
             )),
-            Test => Some(("test.md", &["Coverage", "Results", "Verdict"])),
+            Test => Some(("test.md", &["Actor", "Coverage", "Results", "Verdict"])),
             DocValidation => Some((
                 "doc-validation.md",
-                &["Architect lens", "Designer lens", "Verdict"],
+                &["Actor", "Architect lens", "Designer lens", "Verdict"],
             )),
-            // design.md is a core artifact; strict only demands the Conditions.
-            Architecture => Some(("design.md", &["Conditions for Builder"])),
+            // design.md is a core artifact; strict demands actor and conditions.
+            Architecture => Some(("design.md", &["Actor", "Conditions for Builder"])),
             _ => None,
         }
     }
@@ -176,8 +178,10 @@ impl Phase {
             Documentation => &[Architecture, Test],
             // The Architect + Designer validate the doc.
             DocValidation => &[Documentation],
+            // Final Deploy consumes the validated documentation record.
+            Deploy => &[DocValidation],
             // No upstream artifact is needed.
-            DesignMock | Deploy | Done => &[],
+            DesignMock | Done => &[],
         }
     }
 
@@ -353,11 +357,11 @@ mod tests {
         assert_eq!(Build.next(FEATURE), SecurityCode);
         // Security (code) skips Design Sign-off straight to Test.
         assert_eq!(SecurityCode.next(FEATURE), Test);
-        // Test → Documentation → Deploy → Doc Validation → Done.
+        // Test → Documentation → Doc Validation → final Deploy → Done.
         assert_eq!(Test.next(FEATURE), Documentation);
-        assert_eq!(Documentation.next(FEATURE), Deploy);
-        assert_eq!(Deploy.next(FEATURE), DocValidation);
-        assert_eq!(DocValidation.next(FEATURE), Done);
+        assert_eq!(Documentation.next(FEATURE), DocValidation);
+        assert_eq!(DocValidation.next(FEATURE), Deploy);
+        assert_eq!(Deploy.next(FEATURE), Done);
         let applicable = Phase::applicable(FEATURE);
         assert!(!applicable.contains(&DesignMock) && !applicable.contains(&DesignReview));
         assert!(applicable.contains(&Documentation));
@@ -373,14 +377,15 @@ mod tests {
     }
 
     #[test]
-    fn fix_skips_documentation_phases() {
+    fn every_change_kind_runs_documentation_validation_and_final_deploy() {
         assert_eq!(Phase::first(FIX), Architecture);
-        // Test → Deploy (Documentation skipped) → Done (Doc Validation skipped).
-        assert_eq!(Test.next(FIX), Deploy);
+        assert_eq!(Test.next(FIX), Documentation);
+        assert_eq!(Documentation.next(FIX), DocValidation);
+        assert_eq!(DocValidation.next(FIX), Deploy);
         assert_eq!(Deploy.next(FIX), Done);
         let applicable = Phase::applicable(FIX);
-        assert!(!applicable.contains(&Documentation) && !applicable.contains(&DocValidation));
-        assert_eq!(applicable.len(), 6);
+        assert!(applicable.contains(&Documentation) && applicable.contains(&DocValidation));
+        assert_eq!(applicable.len(), 8);
     }
 
     #[test]
@@ -391,11 +396,14 @@ mod tests {
         assert_eq!(file, "security-plan.md");
         assert_eq!(
             secs,
-            &["Threat model", "Conditions for Builder", "Verdict"][..]
+            &["Actor", "Threat model", "Conditions for Builder", "Verdict"][..]
         );
         let (file, secs) = SecurityCode.judgment_artifact().unwrap();
         assert_eq!(file, "security-code.md");
-        assert_eq!(secs, &["Findings", "Conditions verified", "Verdict"][..]);
+        assert_eq!(
+            secs,
+            &["Actor", "Findings", "Conditions verified", "Verdict"][..]
+        );
         assert_eq!(
             DesignReview.judgment_artifact().unwrap().0,
             "design-review.md"
@@ -409,13 +417,14 @@ mod tests {
             DocValidation.judgment_artifact().unwrap().0,
             "doc-validation.md"
         );
-        // Architecture keeps the core design.md, with only Conditions required.
+        // Design Mock and Architecture keep their core artifacts and actors.
+        assert_eq!(DesignMock.judgment_artifact().unwrap().0, "design-mock.md");
         assert_eq!(
             Architecture.judgment_artifact(),
-            Some(("design.md", &["Conditions for Builder"][..]))
+            Some(("design.md", &["Actor", "Conditions for Builder"][..]))
         );
         // Non-judgment phases carry no artifact requirement.
-        for p in [DesignMock, Build, Documentation, Deploy, Done] {
+        for p in [Build, Documentation, Deploy, Done] {
             assert!(p.judgment_artifact().is_none(), "{p:?} should be None");
         }
     }
@@ -425,8 +434,8 @@ mod tests {
         assert_eq!(SecurityPlan.upstream_context(), &[Architecture][..]);
         assert_eq!(Build.upstream_context(), &[Architecture, SecurityPlan][..]);
         assert_eq!(DocValidation.upstream_context(), &[Documentation][..]);
+        assert_eq!(Deploy.upstream_context(), &[DocValidation][..]);
         assert!(DesignMock.upstream_context().is_empty());
-        assert!(Deploy.upstream_context().is_empty());
         // Every referenced upstream phase strictly precedes the phase itself.
         for &p in PIPELINE.iter().chain(std::iter::once(&Done)) {
             for &up in p.upstream_context() {

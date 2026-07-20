@@ -1,228 +1,47 @@
-# Model-Paired Development — Protocol Doctrine
+# MPD Protocol
 
-This is the canonical doctrine mpd enforces. mpd installs it into every project
-it initializes (`.mpd/directives/protocol.md`); edit that copy to adapt it. The
-per-persona directives live alongside it in `.mpd/directives/personas/`.
+MPD is a local-only, gate-driven overlay over OpenSpec and Git. Hosted CI is neither required nor accepted as validation authority. The trust boundary is a cooperative repository owner; actor/model/session labels are recorded provenance, not authenticated identity.
 
-## The idea
+## Required phase order
 
-Model-Paired Development pairs a fixed sequence of **adversarial personas** —
-each with a distinct lens and its own model — against every non-trivial change,
-and backs the human-fallible parts with **deterministic, machine-enforced
-gates**. The goal is *correct* code, not merely *working* code. mpd is the
-harness-agnostic engine: it orders the phases, names the persona and model for
-each, and refuses to advance on an unmet gate.
+`Design Mock -> Architecture -> Design Review -> Security(plan) -> Build -> Security(code) -> Design Sign-off -> Test -> Documentation -> Doc Validation -> Deploy`
 
-## The pipeline
+Only Design phases may be N/A with a written no-human-visible-impact rationale. Every other phase runs with depth proportional to semantic risk. FAIL blocks; unresolved conditions block archive; material changes return to the earliest affected phase.
 
-```
-Design Mock → Architecture → Design Review → Security (plan) → Build →
-Security (code) → Design Sign-off → Test → Documentation → Deploy → Doc Validation
-```
+## Written intent and roles
 
-A phase is skipped only when it genuinely has no bearing on the change — never to
-save time:
+Read project-shaping docs and affected files before acting. Architecture is a written contract with exact files/APIs, dependency order, edge cases, risk-to-test mapping, and Conditions for Builder. Builder implements only that plan. Security reviews plan and code separately. Tester reads the real implementation and maps risks to empirical evidence. Documenter updates durable guidance and verifies every path, flag, and command.
 
-- **Design** phases (Mock, Review, Sign-off) run only for changes with a UI/UX
-  surface (`mpd begin --ui`).
-- **Documentation** phases (Documentation, Doc Validation) run only for feature
-  changes that alter functional behavior; defect fixes (`--fix`) and
-  non-functional chores (`--chore`) skip them.
-- Everything else is mandatory. Small or docs-only changes use concise,
-  proportionate artifacts; size or familiarity never bypasses a gate.
+Strict judgment artifacts contain exactly one `## Actor` and `## Verdict`; the first nonblank verdict line is exactly `PASS`, `CONDITIONAL PASS`, or `FAIL`. Artifact Actor matches `--by` and differs from the latest applicable upstream actor. Commando has no artifact waiver.
 
-## Two ways to drive mpd
+## Candidate, freshness, and risk
 
-mpd exposes one code path under two tiers, selected per change by a durable
-`strict` bit. A dropped call in a strict run degrades loudly, not silently — the
-exact hole through which an adversarial record can otherwise evaporate.
+Planning gates use base HEAD and report Candidate NOT CAPTURED. Build creates one immutable manifest-scoped Candidate from HEAD plus staged/unstaged tracked postimages, declared untracked files, deletions, and modes. Build, Security(code), and Test reopen and rehash that same Candidate. Candidate and Commit receipts are different subjects.
 
-**Humans — manual verbs.** Drive the pipeline by hand with full control: `mpd
-next` for the next step, `mpd gate <phase> --pass` to record a verdict, `mpd
-status` to inspect. Only the objective gates (build/test pass count, secret scan,
-`documentation.md` structure, deploy, closure coherence) are enforced; judgment
-artifacts are not demanded. This tier is byte-identical to the classic flow.
+Before every downstream brief or effect, MPD recomputes causal dependencies and effective risk. Stale evidence appends the earliest rewind without deleting history. Effective risk is the maximum of requested and derived risk and cannot be configuration-lowered.
 
-**Model harnesses — `mpd conduct <name>`.** `conduct` (or `begin --strict`)
-begins the change, sets `strict=true`, seeds the first phase's judgment stub, and
-prints the call-loop contract. The motion stays the *unchanged* `next → spawn
-persona → gate` verbs — there is no forked driver:
+## Local validation
 
-```
-mpd conduct <name> --risk high
-loop:
-  brief=$(mpd next --harness claude-code --context --json)  # slice + persona + model + artifact_path + gate_command
-  break if brief.phase == "done"
-  # spawn the persona at brief.model, fill brief.artifact_path, do the work
-  mpd gate <phase> --pass --evidence <artifact_path>        # strict checks auto-apply from ledger.strict
-mpd archive --yes
-```
+Authoritative checks use a reviewed structured policy, typed program/argv, pinned tools and offline inputs, private HOME/Git/Cargo/XDG/temp/log state, bounded output/resources/process trees, and a mandatory network-denying platform adapter. Roots never come from argv, environment, or candidate configuration. Missing identity, drift, timeout, truncation, leak, failed canary, or cleanup ambiguity is BLOCKED. There is no hosted, shell, broad-read, unsandboxed, or weaker platform fallback.
 
-Under strict, every judgment gate demands its own non-stub artifact
-(security-plan.md, security-code.md, design-review.md, design-signoff.md,
-test.md, doc-validation.md), `--evidence` must resolve to *that phase's own*
-artifact (not a basename alias), high-risk security-code additionally requires
-`Independent review` + `Refutation` sections, and archive re-checks that every
-applicable artifact survived post-gate. `strict` is write-once and survives
-session death, so a resumed harness gets the same strictness.
+This release certifies only macOS 27.0 build `26A5378n`, Apple silicon, `aarch64-apple-darwin`, using the compiled deprecated/undocumented exact-host compatibility adapter. The certified claim covers accepted-root content reads, one private-root plus `/dev/null` writes, and network denial. It does not claim global path-metadata/literal-root-entry confidentiality or same-user process isolation. Every other host is NOT CERTIFIED.
 
-**Both tiers share the escape verbs** — every strict requirement has a
-one-command escape, so a refusal is never a dead-end:
+A compiler process-tree probe is feasibility evidence only. Full certification requires the complete high-risk profile and all per-run host/ABI/profile/root/canary attestations.
 
-- `mpd brief <phase>` — scaffold a phase's judgment-artifact stub to author.
-- `mpd gate <phase> --pass --waive-artifact "reason"` — waive the artifact check
-  with a bounded, append-only, audited reason (loud WAIVED banner; never bypasses
-  an objective gate and never converts a FAIL). Waivers are attempt-scoped; a
-  reconcile rewind drops them so a re-run demands the artifact again.
-- `mpd use <change>` — restore `.mpd/current` after it was cleared.
-- `mpd doctor --fix` — heal a missing `.mpd/.gitignore` (add-only, idempotent,
-  fail-closed).
-- `mpd strict <change>` — promote an already-begun non-strict change to the
-  strict tier (monotonic, idempotent) so its judgment gates enforce their
-  artifacts.
+## Git-local authority
 
-Strict is set at `conduct`/`begin --strict`, or later with `mpd strict <change>`,
-and is monotonic (no path sets it back to false) — a harness opts in once.
+The sole activation route is `mpd policy activate` bound to an immutable reviewed commit, canonical policy digest, absolute coordinator digest, and tracked `.githooks`. It creates owner-only clone-private launchers. There is no legacy trust-bootstrap route.
 
-## Proportional governance
+Pre-commit performs bounded staged secret and artifact/task checks. Pre-push parses authentic Git input, scans every outgoing commit/tag/message/blob, validates the exact Commit profile, and issues one invocation-local authorization bound to the remote, baseline, rows, objects, policy, result, and nonce. Deletion-only still runs policy/ref checks and non-main deletion requires exact one-use approval. MPD never transports; normal Git pushes.
 
-Every change declares a risk level (`low`, `medium`, or `high`) and a credible
-threat profile. `mpd next` carries that contract into every persona brief.
-Security may block only on a concrete exploit path within or into the declared
-profile: attacker, prerequisite capability, crossed boundary, concrete harm,
-and exact fix. Out-of-profile defense in depth is advisory.
+## Status, closure, and Deploy
 
-Canonical `proposal.md`, `design.md`, and `tasks.md` describe the current
-approved contract. Move superseded drafts to `history/`. Artifact page guidance
-is advisory; review-attempt limits require an explicit `mpd reconcile` decision
-before expansion, but reconciliation never converts or bypasses a FAIL. If the
-human rejects a criterion, reconcile immediately instead of manufacturing more
-review prose.
+Human and JSON output derive from one typed state and use the seven outcomes PASS, FAIL, BLOCKED, CONDITIONAL, STALE, IN PROGRESS, and NOT RUN. They keep worktree, Candidate, gate freshness, local validation, archive, commit, push authorization, transfer, remote parity, install, and containment layers separate. JSON emits one stdout document; hostile terminal bytes are escaped; PASS appears only after durable state commits.
 
-## Gates are machine-enforced, not self-reported
+Archive compares the final commit tree with the exact Candidate plus allowed canonical overlays. `mpd publish --verify` separately observes remote parity and never repairs missing authorization.
 
-Every gate ends **PASS**, **CONDITIONAL PASS**, or **FAIL**. Every FAIL is
-classified as product, test, infrastructure, environment, or policy. A conditional pass
-records open conditions (owner + closing evidence) that block archive until
-resolved (`mpd resolve`). A FAIL blocks; a material change returns to the
-earliest affected phase and invalidates downstream approvals.
+**Deploy** consumes the current typed Build-output receipt. Execute Deploy copies already-tested bytes through an exclusive temporary, syncs/atomically replaces, reopens, and checks mode/length/SHA. It never rebuilds or executes the installed candidate for identity. Readiness-only is not installation.
 
-Prefer the machine over the persona's word:
+## Verification
 
-- **Build/Test** gates re-run the configured test command and require a real,
-  non-zero pass count. A clean result from an unverified runner is a red flag.
-- **Security (code)** runs secret scanning (built-in floor; gitleaks/Semgrep when
-  present) and refuses on any finding.
-- **Documentation** structurally checks the doc (all sections, no placeholders).
-- **Deploy** runs the configured deploy command and refuses on failure.
-- **Archive** refuses on any non-PASS gate or open condition, and previews the
-  spec + doc merge before applying.
-
-## Content-addressed closure
-
-Declare the change's repository scope and optional publication branch in
-`manifest.json`; never guess scope from whichever files happen to be staged.
-Architecture cannot pass with an empty or invalid manifest. Mixed staged work
-blocks closure without MPD changing the index.
-
-Every executed PASS receives a receipt bound to that phase's exact content and
-governing inputs. Treat `valid`, `stale`, and `absent` as evidence states, not
-gate verdicts. Reuse is explicit, append-only, and only from an exact valid
-executed receipt. CONDITIONAL PASS is rerun fresh; Build, Test, and Security
-(code) run fresh unless a complete hermetic policy is configured; Deploy always
-runs fresh.
-
-Archive is a completion-only journaled transaction: it stages and syncs exact
-postimages before replacing repository targets, retains no rollback preimages,
-and never claims filesystem-independent atomicity. Recover previews by default;
-only `closure recover --yes` may roll forward exact preimages, and any third
-state refuses before another write.
-
-After archive, commit and push through normal Git. `mpd publish --verify` is a
-fresh, non-fetching observation that requires a coherent linear closure commit
-and exact configured-branch OID parity. It never stages, commits, pushes,
-force-pushes, fetches, deploys, or invents a publication target.
-
-Parsers, interpreters, serializers, codecs, and wire protocols get
-property/fuzz/metamorphic tests (seeded + reproducible), not just example tests.
-Performance/size claims need before+after numbers, median of several runs, same
-build, command shown. **Verify your verification** — confirm the test command
-actually executed tests.
-
-## Rigor escalation — novel threat surface
-
-When a change involves auth/credentials, network egress, file I/O on untrusted
-input, dynamic code execution, sandboxing, cryptography, or a feature with no
-analog already shipped: run the security phases at full depth (explicit threat
-model at plan stage, deep code audit at code stage) and do **not** fix findings
-inline — re-run Security (code) after every fix. Code cannot reach Test without a
-passing Security (code).
-
-## Persona models
-
-Each persona runs under a model resolved per harness. mpd carries built-in tier
-defaults — the judgment/creative planning and validation phases (Design,
-Architecture, Doc Validation) get the strongest model; the execution/synthesis/
-review phases (Security, Build, Test, Documentation) get the standard model — and
-lets you override per persona in `.mpd/config.json` (`models`, `model_fallbacks`)
-as models evolve. `mpd next --harness <h>` prints the resolved model per phase.
-
-## Persona tuning (behavior, not just model)
-
-Beyond the model, each persona's behavior is tunable in `.mpd/config.json`
-(`personas`), and mpd carries the resolved tuning into the `mpd next` brief. The
-knobs are strengthen-only: `rigor` (`standard|deep|paranoid`) raises reasoning
-effort + reviewers; `depth` (`examples|property|fuzz`, Tester only) adds test
-emphasis; `directive_append` overlays a project instruction AFTER the bundled
-directive (never replacing it). At `risk=high` the adversarial set
-(Security/Tester/Doc-Validation) is floored to deep effort regardless of any pin.
-
-**Harness contract (apply the BRIEF, never re-read config):**
-- The brief's `model` is resolved FOR you — mpd has already composed the tier
-  table, the high-risk floor, this project's config, and any persona tuning. Spawn
-  each persona subagent on the brief's `model` at its `effort` with that many
-  `reviewers`; do NOT substitute a model or effort of your own (e.g. from a generic
-  model table you carry). The brief is the authority for this project.
-- For **novel or risky surface** — auth, credentials, network egress, file I/O on
-  untrusted input, crypto, or a feature with no analog already shipped — start the
-  change at `--risk high`. It floors Security and Tester to the deep model + max
-  reasoning effort (and grants a third attempt), so the brief itself directs a
-  full-depth review rather than you escalating by hand.
-- Apply the brief's `effort`, `reviewers`, and `directive_append` fields as
-  emitted by `mpd next`. Do NOT re-read `.mpd/config.json` yourself — mpd has
-  already sanitized (`terminal_safe` + length cap) and floored the values; a raw
-  re-read bypasses those guards.
-- `directive_append` (and a locally-modified base directive) is *un-rankable* —
-  mpd cannot prove it rigor-preserving, so it is RECORDED (`weakened` on the brief
-  and on every gate receipt), never blocked. When a brief is `weakened`, treat the
-  gate as a human-review point; the record is the audit tooth.
-- **Record the gate BEFORE any `mpd persona set`/`reset`** within a change. mpd
-  stamps a gate from the brief it recorded for the current `(phase, attempt)`; a
-  tune-down mid-phase is recorded, but the honest order keeps the audit trail clean.
-
-**The interview (any harness, any time the user asks to tune personas):** loop the
-tunable personas and, for each, read `mpd persona show <persona> --json` (it
-returns each field's current value, allowed range, baseline, and a `dangerous`
-flag). Ask the user, surfacing the current value and the range, and a clear ⚠ when
-they choose the un-rankable `directive-append`. Record each answer with
-`mpd persona set <persona> <field> <value>` (which validates the name + term and
-warns on the dangerous knob) — or `mpd persona reset <persona> [field]`. The
-danger classification and the write both live in mpd, so an interview-set value and
-a hand-edited one are guarded identically.
-
-## Working principles (apply proportionately)
-
-- **Speak the domain's language.** Use the user's exact terms in code, specs,
-  and commits. Reconcile "false cognates" before writing code.
-- **Promote implicit rules into named concepts.** A buried guard clause the user
-  would describe in a sentence is a missing concept — name it.
-- **Bounded contexts at every seam.** Translate at boundaries with external
-  systems; don't import their types into the core.
-- **Refactor toward deeper insight.** The first model is usually wrong; friction
-  is a signal, not just nuisance.
-- **Supple design.** Intention-revealing names; side-effect-free functions where
-  possible; assertions for invariants; factor along the domain's natural seams.
-
-DDD-grade modeling is a tax that pays back in complex domains and bankrupts
-simple ones. Default to lighter approaches; reach for the heavy patterns only
-when complexity demands it.
+Verification is empirical. Report commands, exit status, counts, timing, and omissions. Run the full workspace/all-target suite, warning-denied Clippy, release build, security scanners, documentation checks, and the explicit ignored 10k-path/100MB workload. Verify the verifier: zero tests is not a passing test claim.

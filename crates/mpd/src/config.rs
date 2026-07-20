@@ -124,6 +124,741 @@ pub struct Config {
     /// `"DocValidation"`). Absent/empty ⇒ the baseline (byte-identical brief).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub personas: BTreeMap<String, PersonaTuning>,
+    /// Versioned local-only validation graph. Absent legacy configuration stays
+    /// readable; enforcement reports a migration blocker instead of guessing lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_validation: Option<LocalValidationConfig>,
+}
+
+/// Data-only schema for local validation policy. Execution code validates this
+/// graph before resolving a program or starting a process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct LocalValidationConfig {
+    pub schema: u32,
+    pub required_toolchain: RequiredToolchainConfig,
+    #[serde(default)]
+    pub tools: BTreeMap<String, ToolConfig>,
+    #[serde(default)]
+    pub checks: BTreeMap<String, CheckConfig>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileConfig>,
+    pub gates: GateProfiles,
+    pub hooks: HookPolicyConfig,
+    pub receipts: ReceiptLimits,
+    pub offline: OfflinePolicyConfig,
+    pub sandbox: SandboxPolicyConfig,
+    pub limits: ResourceLimitsConfig,
+    /// The release artifact produced by Build.  This is deliberately separate
+    /// from a check argv: a check may compile, but only this named regular file
+    /// is allowed to cross the Build → Deploy boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_output: Option<BuildOutputConfig>,
+    /// Optional exact-copy deployment contract.  Legacy string `deploy` remains
+    /// readable, but strict artifact deployment uses this tagged data contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_output: Option<DeployOutputConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BuildOutputConfig {
+    /// Stable policy name used to bind the Build receipt to the Deploy request.
+    #[serde(default)]
+    pub name: String,
+    /// Repository-relative release artifact path.
+    pub path: String,
+    /// Maximum artifact bytes accepted by the Build → Deploy boundary.
+    #[serde(default)]
+    pub max_bytes: u64,
+    /// Exact Unix mode expected from the release artifact (for example 0o755).
+    #[serde(default)]
+    pub required_mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "mode",
+    rename_all = "kebab-case",
+    rename_all_fields = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum DeployOutputConfig {
+    /// Install exactly the named Build receipt through a typed copy operation,
+    /// then reopen and verify the installed bytes without executing them.
+    Execute {
+        artifact: String,
+        install: ExactCopyInstallConfig,
+        installed_path: String,
+        target: String,
+    },
+    /// A consciously non-installing Deploy mode. Its contained evidence pointer
+    /// is recorded, not executed; legacy string `deploy` is still manual only.
+    Readiness { evidence: String, target: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExactCopyInstallConfig {
+    pub kind: ExactCopyInstallKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExactCopyInstallKind {
+    ExactCopy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ToolConfig {
+    pub program: String,
+    #[serde(default)]
+    pub version_args: Vec<String>,
+    pub requirement: ToolRequirement,
+    pub install_hint: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolRequirement {
+    Required,
+    Optional,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CheckConfig {
+    pub kind: CheckKind,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_secs: u64,
+    pub result_policy: ResultPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<CheckOutputConfig>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckKind {
+    Format,
+    Lint,
+    Test,
+    ReleaseBuild,
+    DependencyAudit,
+    SecretScan,
+    Sast,
+    Nonfunctional,
+    SelfCheck,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResultPolicy {
+    ExitZero,
+    RustTestCount,
+    MpdDoctor,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ProfileConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GateProfiles {
+    pub build: String,
+    pub security_code: String,
+    pub test: String,
+    pub pre_push: String,
+    pub high_risk_test: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ReceiptLimits {
+    pub log_count_cap: usize,
+    pub log_byte_cap: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RequiredToolchainConfig {
+    pub rust_release: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub components: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HookPolicyConfig {
+    pub path: String,
+    pub require_bundled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct OfflinePolicyConfig {
+    pub cargo_lock: String,
+    pub cargo_target: String,
+    pub advisory_db_path: String,
+    pub advisory_revision: String,
+    pub advisory_tree: String,
+    pub advisory_max_age_days: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SandboxPolicyConfig {
+    pub contract_version: u32,
+    pub network_adapter: NetworkAdapter,
+    pub environment_allowlist: EnvironmentAllowlist,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkAdapter {
+    PlatformMandatory,
+}
+
+/// A deny-default set of environment keys passed to validation children. The
+/// transparent codec keeps the schema's array shape while making it impossible
+/// to confuse an allowlist with arbitrary environment values in Rust code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EnvironmentAllowlist(pub Vec<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ResourceLimitsConfig {
+    pub checks_per_profile: usize,
+    pub aggregate_secs: u64,
+    pub output_bytes: usize,
+    pub log_bytes: usize,
+    pub worktree_bytes: u64,
+    pub child_processes: u64,
+    pub child_open_files: u64,
+    pub child_file_bytes: u64,
+}
+
+/// Optional presentation-only metadata. Argument bytes remain in `args` and in
+/// receipt digests; only configured indices are replaced in human displays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CheckOutputConfig {
+    #[serde(default)]
+    pub sensitive_args: Vec<usize>,
+}
+
+pub struct SensitiveArgvDisplay<'a> {
+    args: &'a [String],
+    sensitive: &'a [usize],
+}
+
+impl<'a> SensitiveArgvDisplay<'a> {
+    pub fn new(args: &'a [String], output: Option<&'a CheckOutputConfig>) -> Self {
+        Self {
+            args,
+            sensitive: output.map_or(&[], |value| value.sensitive_args.as_slice()),
+        }
+    }
+}
+
+impl std::fmt::Display for SensitiveArgvDisplay<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, argument) in self.args.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(" ")?;
+            }
+            if self.sensitive.contains(&index) {
+                formatter.write_str("[REDACTED]")?;
+            } else {
+                write!(formatter, "{argument:?}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LocalValidationConfig {
+    /// Validate shape and graph invariants without executing candidate policy.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 1 {
+            return Err(format!(
+                "unsupported local-validation schema {}",
+                self.schema
+            ));
+        }
+        validate_release(&self.required_toolchain.rust_release)?;
+        if let Some(host) = &self.required_toolchain.host {
+            validate_platform_token(host, "required_toolchain.host")?;
+            if host != &self.offline.cargo_target {
+                return Err("offline.cargo_target must match required_toolchain.host".into());
+            }
+        }
+        if self.required_toolchain.components.is_empty()
+            || self.required_toolchain.components.len() > 16
+        {
+            return Err("required_toolchain.components must contain 1..=16 entries".into());
+        }
+        validate_unique_identifiers(
+            &self.required_toolchain.components,
+            "required_toolchain.components",
+        )?;
+        validate_repo_path(&self.hooks.path, "hooks.path")?;
+        validate_repo_path(&self.offline.cargo_lock, "offline.cargo_lock")?;
+        validate_repo_path(&self.offline.advisory_db_path, "offline.advisory_db_path")?;
+        validate_platform_token(&self.offline.cargo_target, "offline.cargo_target")?;
+        validate_oid(&self.offline.advisory_revision, "offline.advisory_revision")?;
+        validate_oid(&self.offline.advisory_tree, "offline.advisory_tree")?;
+        if !(1..=90).contains(&self.offline.advisory_max_age_days) {
+            return Err("offline.advisory_max_age_days must be in 1..=90".into());
+        }
+        if self.sandbox.contract_version != 1 {
+            return Err(format!(
+                "unsupported sandbox contract version {}",
+                self.sandbox.contract_version
+            ));
+        }
+        validate_environment_allowlist(&self.sandbox.environment_allowlist)?;
+        self.validate_limits()?;
+        if self.receipts.log_count_cap == 0 || self.receipts.log_count_cap > 256 {
+            return Err("receipt log_count_cap must be in 1..=256".into());
+        }
+        if self.receipts.log_byte_cap == 0 || self.receipts.log_byte_cap > 16 * 1024 * 1024 {
+            return Err("receipt log_byte_cap must be in 1..=16777216".into());
+        }
+        if self.receipts.log_count_cap < self.limits.checks_per_profile
+            || self.receipts.log_byte_cap < self.limits.log_bytes as u64
+        {
+            return Err("receipt caps must cover configured profile/log limits".into());
+        }
+        for (name, tool) in &self.tools {
+            validate_identifier(name)?;
+            validate_program(&tool.program)?;
+            validate_tokens(&tool.version_args)?;
+            if tool.install_hint.trim().is_empty() || tool.install_hint.len() > 512 {
+                return Err(format!("tool {name:?} must have a bounded install_hint"));
+            }
+        }
+        for component in &self.required_toolchain.components {
+            if !self.tools.contains_key(component) {
+                return Err(format!(
+                    "required toolchain component {component:?} is not a declared tool"
+                ));
+            }
+        }
+        for (name, check) in &self.checks {
+            validate_identifier(name)?;
+            validate_program(&check.program)?;
+            if !self.tools.contains_key(&check.program) {
+                return Err(format!(
+                    "check {name:?} references undeclared locked tool {:?}",
+                    check.program
+                ));
+            }
+            validate_tokens(&check.args)?;
+            if !(1..=1800).contains(&check.timeout_secs) {
+                return Err(format!("check {name:?} timeout_secs must be in 1..=1800"));
+            }
+            if let Some(output) = &check.output {
+                if output
+                    .sensitive_args
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                    || output
+                        .sensitive_args
+                        .iter()
+                        .any(|index| *index >= check.args.len())
+                {
+                    return Err(format!(
+                        "check {name:?} sensitive_args must be sorted, unique, and index args"
+                    ));
+                }
+            }
+        }
+        for (name, profile) in &self.profiles {
+            validate_identifier(name)?;
+            let mut seen = std::collections::BTreeSet::new();
+            for include in &profile.includes {
+                validate_identifier(include)?;
+                if !seen.insert(include) {
+                    return Err(format!("profile {name:?} duplicates include {include:?}"));
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for check in &profile.checks {
+                validate_identifier(check)?;
+                if !seen.insert(check) {
+                    return Err(format!("profile {name:?} duplicates check {check:?}"));
+                }
+                if !self.checks.contains_key(check) {
+                    return Err(format!(
+                        "profile {name:?} references unknown check {check:?}"
+                    ));
+                }
+            }
+        }
+        for name in self.profiles.keys() {
+            let effective = self.effective_checks(name)?;
+            if effective.is_empty()
+                || effective.len() > self.limits.checks_per_profile
+                || effective.len() > 64
+                || effective.len() > self.receipts.log_count_cap
+            {
+                return Err(format!(
+                    "profile {name:?} effective checks must contain 1..={} entries and fit receipt caps",
+                    self.limits.checks_per_profile.min(64)
+                ));
+            }
+        }
+        for (gate, profile) in [
+            ("build", &self.gates.build),
+            ("security-code", &self.gates.security_code),
+            ("test", &self.gates.test),
+            ("pre-push", &self.gates.pre_push),
+            ("high-risk-test", &self.gates.high_risk_test),
+        ] {
+            validate_identifier(profile)?;
+            if !self.profiles.contains_key(profile) {
+                return Err(format!(
+                    "gate {gate:?} references unknown profile {profile:?}"
+                ));
+            }
+        }
+        if let Some(output) = &self.build_output {
+            validate_identifier(&output.name)?;
+            validate_repo_path(&output.path, "build_output.path")?;
+            if output.max_bytes == 0 || output.max_bytes > 8 * 1024 * 1024 * 1024 {
+                return Err("build_output.max_bytes must be in 1..=8589934592".into());
+            }
+            if output.required_mode == 0 || output.required_mode > 0o7777 {
+                return Err("build_output.required_mode must be a nonzero Unix mode".into());
+            }
+        }
+        if let Some(deploy) = &self.deploy_output {
+            match deploy {
+                DeployOutputConfig::Execute {
+                    artifact,
+                    installed_path,
+                    target,
+                    ..
+                } => {
+                    validate_identifier(artifact)?;
+                    validate_repo_path(installed_path, "deploy_output.installed_path")?;
+                    validate_deploy_label(target, "deploy_output.target")?;
+                    let output = self
+                        .build_output
+                        .as_ref()
+                        .ok_or("deploy_output execute requires build_output")?;
+                    if artifact != &output.name {
+                        return Err("deploy_output artifact must name build_output.name".into());
+                    }
+                }
+                DeployOutputConfig::Readiness { evidence, target } => {
+                    validate_repo_path(evidence, "deploy_output.evidence")?;
+                    validate_deploy_label(target, "deploy_output.target")?;
+                }
+            }
+        }
+        self.validate_required_lane_coverage()?;
+        Ok(())
+    }
+
+    pub fn effective_checks(&self, profile: &str) -> Result<Vec<String>, String> {
+        fn visit(
+            config: &LocalValidationConfig,
+            profile: &str,
+            stack: &mut Vec<String>,
+            expanded: &mut std::collections::BTreeSet<String>,
+            seen_checks: &mut std::collections::BTreeSet<String>,
+            output: &mut Vec<String>,
+        ) -> Result<(), String> {
+            if stack.iter().any(|entry| entry == profile) {
+                stack.push(profile.to_string());
+                return Err(format!(
+                    "cyclic profile composition: {}",
+                    stack.join(" -> ")
+                ));
+            }
+            if expanded.contains(profile) {
+                return Ok(());
+            }
+            let configured = config
+                .profiles
+                .get(profile)
+                .ok_or_else(|| format!("profile references unknown profile {profile:?}"))?;
+            stack.push(profile.to_string());
+            for include in &configured.includes {
+                visit(config, include, stack, expanded, seen_checks, output)?;
+            }
+            stack.pop();
+            for check in &configured.checks {
+                if seen_checks.insert(check.clone()) {
+                    output.push(check.clone());
+                }
+            }
+            expanded.insert(profile.to_string());
+            Ok(())
+        }
+
+        validate_identifier(profile)?;
+        let mut output = Vec::new();
+        visit(
+            self,
+            profile,
+            &mut Vec::new(),
+            &mut std::collections::BTreeSet::new(),
+            &mut std::collections::BTreeSet::new(),
+            &mut output,
+        )?;
+        Ok(output)
+    }
+
+    fn validate_limits(&self) -> Result<(), String> {
+        let limits = &self.limits;
+        if limits.checks_per_profile == 0 || limits.checks_per_profile > 64 {
+            return Err("limits.checks_per_profile must be in 1..=64".into());
+        }
+        if limits.aggregate_secs == 0 || limits.aggregate_secs > 7_200 {
+            return Err("limits.aggregate_secs must be in 1..=7200".into());
+        }
+        if limits.output_bytes == 0 || limits.output_bytes > 16 * 1024 * 1024 {
+            return Err("limits.output_bytes must be in 1..=16777216".into());
+        }
+        if limits.log_bytes == 0 || limits.log_bytes > 16 * 1024 * 1024 {
+            return Err("limits.log_bytes must be in 1..=16777216".into());
+        }
+        if limits.worktree_bytes == 0 || limits.worktree_bytes > 1024 * 1024 * 1024 {
+            return Err("limits.worktree_bytes must be in 1..=1073741824".into());
+        }
+        if limits.child_processes == 0 || limits.child_processes > 4_096 {
+            return Err("limits.child_processes must be in 1..=4096".into());
+        }
+        if limits.child_open_files < 3 || limits.child_open_files > 4_096 {
+            return Err("limits.child_open_files must be in 3..=4096".into());
+        }
+        if limits.child_file_bytes == 0 || limits.child_file_bytes > 1024 * 1024 * 1024 {
+            return Err("limits.child_file_bytes must be in 1..=1073741824".into());
+        }
+        Ok(())
+    }
+
+    fn validate_required_lane_coverage(&self) -> Result<(), String> {
+        use CheckKind::*;
+        let requirements: [(&str, &str, &[CheckKind]); 5] = [
+            (
+                "build",
+                &self.gates.build,
+                &[Format, Lint, Test, ReleaseBuild],
+            ),
+            (
+                "security-code",
+                &self.gates.security_code,
+                &[SelfCheck, DependencyAudit, SecretScan, Sast],
+            ),
+            (
+                "test",
+                &self.gates.test,
+                &[
+                    Format,
+                    Lint,
+                    Test,
+                    ReleaseBuild,
+                    DependencyAudit,
+                    SecretScan,
+                    Sast,
+                    SelfCheck,
+                ],
+            ),
+            (
+                "pre-push",
+                &self.gates.pre_push,
+                &[
+                    Format,
+                    Lint,
+                    Test,
+                    ReleaseBuild,
+                    DependencyAudit,
+                    SecretScan,
+                    Sast,
+                    SelfCheck,
+                ],
+            ),
+            (
+                "high-risk-test",
+                &self.gates.high_risk_test,
+                &[
+                    Format,
+                    Lint,
+                    Test,
+                    ReleaseBuild,
+                    DependencyAudit,
+                    SecretScan,
+                    Sast,
+                    SelfCheck,
+                    Nonfunctional,
+                ],
+            ),
+        ];
+        for (gate, profile_name, required) in requirements {
+            let effective = self.effective_checks(profile_name)?;
+            let kinds = effective
+                .iter()
+                .map(|name| self.checks[name].kind)
+                .collect::<Vec<_>>();
+            for kind in required {
+                if !kinds.contains(kind) {
+                    return Err(format!(
+                        "gate {gate:?} profile {profile_name:?} omits required lane {kind:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_repo_path(value: &str, label: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.len() > 512
+        || value.chars().any(char::is_control)
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!("unsafe {label} {value:?}"));
+    }
+    Ok(())
+}
+
+fn validate_deploy_label(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.chars().any(char::is_control)
+        || value.trim() != value
+    {
+        return Err(format!("unsafe {label} {value:?}"));
+    }
+    Ok(())
+}
+
+fn validate_identifier(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || value.contains("--")
+    {
+        return Err(format!("invalid local-validation identifier {value:?}"));
+    }
+    Ok(())
+}
+fn validate_program(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 512
+        || value.starts_with('/')
+        || value.contains("..")
+        || value.chars().any(|c| c.is_control())
+    {
+        return Err(format!("unsafe local-validation program {value:?}"));
+    }
+    Ok(())
+}
+fn validate_tokens(tokens: &[String]) -> Result<(), String> {
+    if tokens.len() > 64
+        || tokens
+            .iter()
+            .any(|s| s.len() > 4096 || s.chars().any(|c| c.is_control()))
+    {
+        return Err(
+            "local-validation arguments contain too many, oversized, or control tokens".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_release(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 64
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.split('.').any(|part| {
+            part.is_empty() || part.len() > 8 || !part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err("required_toolchain.rust_release is not a bounded numeric release".into());
+    }
+    Ok(())
+}
+
+fn validate_platform_token(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.starts_with('-')
+        || value.starts_with('_')
+        || value.ends_with('-')
+        || value.ends_with('_')
+        || value.contains("--")
+        || value.contains("__")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+    {
+        return Err(format!("invalid {label} {value:?}"));
+    }
+    Ok(())
+}
+
+fn validate_oid(value: &str, label: &str) -> Result<(), String> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("invalid full {label} object id"));
+    }
+    Ok(())
+}
+
+fn validate_unique_identifiers(values: &[String], label: &str) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for value in values {
+        validate_identifier(value)?;
+        if !seen.insert(value) {
+            return Err(format!("{label} contains duplicate {value:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_environment_allowlist(allowlist: &EnvironmentAllowlist) -> Result<(), String> {
+    if allowlist.0.is_empty() || allowlist.0.len() > 32 {
+        return Err("sandbox.environment_allowlist must contain 1..=32 keys".into());
+    }
+    let mut previous: Option<&str> = None;
+    for key in &allowlist.0 {
+        if key.is_empty()
+            || key.len() > 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || key.starts_with('_')
+            || crate::closure::is_secret_shaped_env_name(key)
+        {
+            return Err(format!("unsafe sandbox environment key {key:?}"));
+        }
+        if previous.is_some_and(|prior| prior >= key.as_str()) {
+            return Err("sandbox.environment_allowlist must be sorted and duplicate-free".into());
+        }
+        previous = Some(key);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,10 +980,24 @@ impl Config {
         if openspec_core::assert_contained(root, &path).is_err() {
             return Config::default();
         }
-        match openspec_core::read_capped(&path) {
+        match openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Config::default(),
         }
+    }
+
+    /// Strict loader for validation and trust decisions.  Unlike the ergonomic
+    /// project loader, this never converts missing, unsafe, oversized, or
+    /// malformed policy bytes into defaults.
+    pub fn load_strict(root: &Path) -> Result<Config, String> {
+        let path = config_path(root);
+        openspec_core::assert_contained(root, &path)
+            .map_err(|e| format!("unsafe local validation config: {e}"))?;
+        let text =
+            openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES)
+                .map_err(|e| format!("local validation config is unavailable: {e}"))?;
+        serde_json::from_str(&text)
+            .map_err(|e| format!("local validation config is malformed: {e}"))
     }
 
     /// Persist config as pretty JSON. The symlink guard is intrinsic to `save`
@@ -259,14 +1008,11 @@ impl Config {
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let path = config_path(root);
         openspec_core::assert_contained(root, &path).map_err(std::io::Error::other)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let mut json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         json.push('\n');
-        openspec_core::assert_contained(root, &path).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        openspec_core::atomic_write_contained(root, &path, json.as_bytes())
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -274,6 +1020,131 @@ impl Config {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    fn repository_local_policy() -> LocalValidationConfig {
+        let config: Config = serde_json::from_str(include_str!("../../../.mpd/config.json"))
+            .expect("repository config must decode with the current typed schema");
+        config
+            .local_validation
+            .expect("repository config must carry local_validation")
+    }
+
+    #[test]
+    fn repository_local_policy_is_complete_valid_and_composes_in_stable_order() {
+        let policy = repository_local_policy();
+        policy.validate().unwrap();
+        let test = policy.effective_checks("test").unwrap();
+        assert_eq!(policy.effective_checks("pre-push").unwrap(), test);
+        let mut high_risk = test;
+        high_risk.extend([
+            "phase-model-tests".to_string(),
+            "scoped-digest-throughput".to_string(),
+        ]);
+        assert_eq!(
+            policy.effective_checks("high-risk-test").unwrap(),
+            high_risk
+        );
+        let encoded = serde_json::to_vec(&policy).unwrap();
+        let decoded: LocalValidationConfig = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn platform_tokens_accept_supported_underscore_triples_and_reject_unsafe_shapes() {
+        for valid in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            assert_eq!(validate_platform_token(valid, "platform"), Ok(()));
+        }
+
+        for invalid in [
+            "../x86_64-unknown-linux-gnu",
+            "x86_64/unknown-linux-gnu",
+            "x86_64 unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu\n",
+            "_x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu_",
+            "x86__64-unknown-linux-gnu",
+        ] {
+            assert!(
+                validate_platform_token(invalid, "platform").is_err(),
+                "unsafe platform token was accepted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_policy_rejects_cycles_unknowns_duplicates_paths_and_ceilings() {
+        let baseline = repository_local_policy();
+
+        let mut policy = baseline.clone();
+        policy.profiles.get_mut("test").unwrap().includes = vec!["pre-push".into()];
+        assert!(policy.validate().unwrap_err().contains("cyclic profile"));
+
+        let mut policy = baseline.clone();
+        policy.profiles.get_mut("test").unwrap().includes = vec!["missing".into()];
+        assert!(policy.validate().unwrap_err().contains("unknown profile"));
+
+        let mut policy = baseline.clone();
+        policy
+            .profiles
+            .get_mut("build")
+            .unwrap()
+            .checks
+            .push("format".into());
+        assert!(policy.validate().unwrap_err().contains("duplicates check"));
+
+        let mut policy = baseline.clone();
+        policy.offline.advisory_db_path = "../outside".into();
+        assert!(policy
+            .validate()
+            .unwrap_err()
+            .contains("unsafe offline.advisory_db_path"));
+
+        let mut policy = baseline;
+        policy.limits.checks_per_profile = 65;
+        assert!(policy.validate().unwrap_err().contains("1..=64"));
+    }
+
+    #[test]
+    fn local_policy_codec_denies_unknown_fields_and_sensitive_display_never_changes_argv() {
+        let policy = repository_local_policy();
+        let mut value = serde_json::to_value(&policy).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown-policy-field".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<LocalValidationConfig>(value).is_err());
+
+        let args = vec!["--token".into(), "public-secret-value".into(), "run".into()];
+        let output = CheckOutputConfig {
+            sensitive_args: vec![1],
+        };
+        let displayed = SensitiveArgvDisplay::new(&args, Some(&output)).to_string();
+        assert!(!displayed.contains("public-secret-value"));
+        assert!(displayed.contains("[REDACTED]"));
+        assert_eq!(
+            args[1], "public-secret-value",
+            "display is presentation-only"
+        );
+    }
+
+    #[test]
+    fn environment_allowlist_is_sorted_duplicate_free_and_secret_denying() {
+        let baseline = repository_local_policy();
+        for keys in [
+            vec!["PATH".into(), "HOME".into()],
+            vec!["PATH".into(), "PATH".into()],
+            vec!["GITHUB_TOKEN".into()],
+            vec!["path".into()],
+        ] {
+            let mut policy = baseline.clone();
+            policy.sandbox.environment_allowlist = EnvironmentAllowlist(keys);
+            assert!(policy.validate().is_err());
+        }
+    }
 
     #[test]
     fn default_models_seeds_expected_tiers_and_fallback() {
@@ -487,7 +1358,63 @@ mod tests {
         assert!(!json.contains("personas"), "empty personas must be omitted");
     }
 
+    #[test]
+    fn typed_deploy_codec_is_tagged_and_legacy_config_remains_readable() {
+        let legacy: Config = serde_json::from_str(r#"{"deploy":"make install"}"#).unwrap();
+        assert_eq!(legacy.deploy.as_deref(), Some("make install"));
+        assert!(legacy.local_validation.is_none());
+
+        let deploy = DeployOutputConfig::Execute {
+            artifact: "mpd-release".into(),
+            install: ExactCopyInstallConfig {
+                kind: ExactCopyInstallKind::ExactCopy,
+            },
+            installed_path: ".local/bin/mpd".into(),
+            target: "local-mpd-bin".into(),
+        };
+        let bytes = serde_json::to_vec(&deploy).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<DeployOutputConfig>(&bytes).unwrap(),
+            deploy
+        );
+        assert!(serde_json::from_str::<DeployOutputConfig>(
+            r#"{"mode":"execute","artifact":"mpd-release","unexpected":true}"#
+        )
+        .is_err());
+    }
+
     proptest! {
+        /// Arbitrary hostile suffixes cannot rescue a policy path containing a
+        /// control byte. The validator must fail before any such path reaches
+        /// filesystem or process resolution.
+        #[test]
+        fn arbitrary_control_bearing_policy_paths_are_rejected(suffix in ".{0,128}") {
+            let mut policy = repository_local_policy();
+            policy.hooks.path = format!(".githooks\n{suffix}");
+            prop_assert!(policy.validate().is_err());
+        }
+
+        /// The compiled effective-profile ceiling is invariant under all
+        /// attacker-chosen larger configured values.
+        #[test]
+        fn arbitrary_profile_limit_above_ceiling_is_rejected(limit in 65usize..100_000) {
+            let mut policy = repository_local_policy();
+            policy.limits.checks_per_profile = limit;
+            prop_assert!(policy.validate().is_err());
+        }
+
+        /// Sensitive presentation metadata must reject every out-of-range
+        /// attacker-chosen index while preserving the exact argv vector.
+        #[test]
+        fn arbitrary_out_of_range_sensitive_index_is_rejected(index in 3usize..10_000) {
+            let mut policy = repository_local_policy();
+            let check = policy.checks.get_mut("format").unwrap();
+            let original = check.args.clone();
+            check.output = Some(CheckOutputConfig { sensitive_args: vec![index] });
+            prop_assert!(policy.validate().is_err());
+            prop_assert_eq!(policy.checks["format"].args.as_slice(), original.as_slice());
+        }
+
         /// `valid_model_id` is a defensive-in-depth charset gate ahead of a
         /// rendered `--model <id>` command line — it must never panic on
         /// arbitrary (including adversarial/unicode) input.

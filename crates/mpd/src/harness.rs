@@ -408,6 +408,9 @@ pub fn brief(
 pub fn terminal_safe(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        // Unicode bidirectional and directional-isolate controls can reorder
+        // rendered terminal text (spoofing); they carry no diagnostic value.
+        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
         .collect()
 }
 
@@ -680,6 +683,28 @@ mod tests {
             "safe]8;;eviltext"
         );
         assert_eq!(terminal_safe("line\nnext\tcell"), "line\nnext\tcell");
+    }
+
+    /// SC-2 regression (security-code.md, residual R2): the Unicode bidi
+    /// embedding/override range (LRE/RLE/PDF/LRO/RLO, U+202A–U+202E) and the
+    /// directional-isolate range (LRI/RLI/FSI/PDI, U+2066–U+2069) must be
+    /// stripped — a surviving RLO can visually reorder the
+    /// candidate-influenced console stderr tail into a spoofed error line.
+    #[test]
+    fn terminal_rendering_strips_bidi_directional_controls() {
+        // Every terminal-relevant directional control, individually.
+        assert_eq!(
+            terminal_safe(
+                "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j"
+            ),
+            "abcdefghij"
+        );
+        // Bidi controls stripped alongside OSC/BEL (C0) and a C1 control,
+        // while the allowed \n / \t survive: exact expected output.
+        assert_eq!(
+            terminal_safe("err\u{1b}]8;;x\u{7}: \u{9b}\u{202E}txet\u{2066}\nnext\tcol"),
+            "err]8;;x: txet\nnext\tcol"
+        );
     }
 
     #[test]

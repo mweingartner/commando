@@ -13,6 +13,8 @@ use crate::names::{validate_capability_name, validate_change_name};
 use crate::parse::{parse_delta, parse_spec};
 use crate::render::render_spec;
 use crate::schema::ChangeMeta;
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -111,6 +113,65 @@ pub struct TaskStatus {
     pub done: usize,
     /// Total tasks (checked + unchecked).
     pub total: usize,
+}
+
+/// A canonical Builder task parsed from a strict `tasks.md` plan.
+///
+/// Strict task identifiers are intentionally an ASCII, two-segment positive
+/// integer grammar (`1.1`, `12.4`).  They are machine addresses for later
+/// obligation evidence, rather than prose labels that can be duplicated or
+/// normalized differently by separate readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEntry {
+    /// The checked task's stable, canonical identifier.
+    pub id: String,
+    /// Whether the task is marked complete.
+    pub done: bool,
+    /// The task text after its identifier, preserved for evidence binding.
+    pub text: String,
+    /// Complete normalized task record, including continuation text, with the
+    /// progress marker canonicalized to unchecked.
+    pub normalized_record: String,
+    /// SHA-256 of `normalized_record`; ledger events bind this and the ID.
+    pub record_digest: String,
+    /// One-based source line, retained only for diagnostics.
+    pub source_line: usize,
+}
+
+/// The parsed form of a strict task plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskPlan {
+    /// Whether this document opts into canonical task IDs.
+    pub strict: bool,
+    /// Every parsed checkbox task in source order.
+    pub entries: Vec<TaskEntry>,
+}
+
+impl TaskPlan {
+    /// Whether every parsed task has been completed.
+    pub fn complete(&self) -> bool {
+        self.entries.iter().all(|entry| entry.done)
+    }
+
+    /// The canonical IDs still preventing Test/archive readiness.
+    pub fn open_ids(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.done)
+            .map(|entry| entry.id.as_str())
+            .collect()
+    }
+
+    /// Stable, progress-insensitive complete-plan representation. Source order
+    /// remains significant, so a reorder is a contract edit while `[x]` flips
+    /// are not.
+    pub fn normalized_progress_record(&self) -> String {
+        self.entries
+            .iter()
+            .map(|entry| entry.normalized_record.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\u{1e}\n")
+    }
 }
 
 impl TaskStatus {
@@ -295,6 +356,23 @@ impl Project {
         Ok(count_tasks(&text))
     }
 
+    /// Parse the stable-ID task contract when a plan opts into it.
+    ///
+    /// Existing OpenSpec changes which predate the contract remain readable:
+    /// they return a non-strict empty plan and retain their historical checkbox
+    /// status. Once a document declares the stable-ID contract, however, every
+    /// parsed checkbox must use a unique canonical ID; ambiguity is an error
+    /// before a caller can record a Test or archive side effect.
+    pub fn task_plan(&self, change: &str) -> Result<TaskPlan> {
+        validate_change_name(change).map_err(CoreError::Io)?;
+        let path = self.tasks_path(change);
+        if !path.exists() || assert_contained(&self.changes_dir(), &path).is_err() {
+            return Ok(TaskPlan::default());
+        }
+        let text = read_capped(&path)?;
+        parse_task_plan_text(&text).map_err(CoreError::Io)
+    }
+
     /// Plan (but do not apply) archiving `change`. Reads deltas, merges each
     /// against the current spec (or an empty base for new capabilities), and
     /// returns the resulting content plus the archive destination — with no
@@ -432,6 +510,138 @@ fn count_tasks(text: &str) -> TaskStatus {
         }
     }
     status
+}
+
+/// Parse a stable-ID task document without treating examples in fenced code as
+/// obligations. A document opts in by containing the exact phrase
+/// `Every box is required and has a stable ID` in non-fenced prose. This explicit
+/// opt-in keeps historical OpenSpec templates (which happened to number ordinary
+/// checklist items) readable while making new high-assurance plans fail closed.
+pub fn parse_task_plan_text(text: &str) -> std::result::Result<TaskPlan, String> {
+    let mut plan = TaskPlan::default();
+    let mut in_fence = false;
+    let mut candidate_lines = Vec::new();
+    let mut in_html_comment = false;
+    for (index, line) in text.split('\n').enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if in_html_comment {
+            if trimmed.contains("-->") {
+                in_html_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("<!--") {
+            if !trimmed.contains("-->") {
+                in_html_comment = true;
+            }
+            continue;
+        }
+        if trimmed
+            .to_ascii_lowercase()
+            .contains("every box is required and has a stable id")
+        {
+            plan.strict = true;
+        }
+        let bullet = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "));
+        let Some(rest) = bullet else { continue };
+        let Some(after_bracket) = rest.trim_start().strip_prefix('[') else {
+            continue;
+        };
+        let mut chars = after_bracket.chars();
+        let Some(mark) = chars.next() else { continue };
+        if chars.next() != Some(']') || !matches!(mark, ' ' | 'x' | 'X') {
+            continue;
+        }
+        let body = chars.as_str().trim_start();
+        candidate_lines.push((index, mark, body.to_string()));
+    }
+    if !plan.strict {
+        return Ok(plan);
+    }
+    let mut seen = BTreeSet::new();
+    for (entry_index, (line_index, mark, body)) in candidate_lines.iter().enumerate() {
+        let line = line_index + 1;
+        let Some((id, task_text)) = body.split_once(char::is_whitespace) else {
+            return Err(format!(
+                "tasks.md line {line}: stable task requires `N.N text`"
+            ));
+        };
+        if !is_task_id(id) {
+            return Err(format!(
+                "tasks.md line {line}: task id {id:?} must be canonical ASCII `N.N`"
+            ));
+        }
+        let task_text = task_text.trim();
+        if task_text.is_empty() || task_text.len() > 4_096 {
+            return Err(format!(
+                "tasks.md line {line}: task text must be 1..=4096 bytes"
+            ));
+        }
+        if !seen.insert(id.to_string()) {
+            return Err(format!("tasks.md line {line}: duplicate task id {id:?}"));
+        }
+        // Continuations are intentionally limited to indented Markdown lines
+        // before the next checkbox. This retains multi-line task contracts but
+        // cannot turn ordinary numbered closure-runbook prose into a task.
+        let end = candidate_lines
+            .get(entry_index + 1)
+            .map(|(next, _, _)| *next)
+            .unwrap_or_else(|| text.lines().count());
+        let mut record_text = task_text.to_string();
+        for continuation in text.lines().skip(line_index + 1).take(end - line_index - 1) {
+            if continuation.trim().is_empty() {
+                continue;
+            }
+            if continuation.starts_with(' ') || continuation.starts_with('\t') {
+                record_text.push('\n');
+                record_text.push_str(continuation.trim());
+            }
+        }
+        let normalized_record = format!("- [ ] {id} {record_text}");
+        let record_digest = format!("{:x}", Sha256::digest(normalized_record.as_bytes()));
+        plan.entries.push(TaskEntry {
+            id: id.to_string(),
+            done: matches!(mark, 'x' | 'X'),
+            text: record_text,
+            normalized_record,
+            record_digest,
+            source_line: line,
+        });
+    }
+    if plan.entries.is_empty() {
+        return Err("strict tasks.md contains no canonical checkbox tasks".into());
+    }
+    Ok(plan)
+}
+
+fn is_task_id(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let Some(second) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_some() {
+        return false;
+    }
+    [first, second].into_iter().all(|segment| {
+        !segment.is_empty()
+            && segment.len() <= 4
+            && !segment.starts_with('0')
+            && segment.bytes().all(|byte| byte.is_ascii_digit())
+            && segment.parse::<u32>().is_ok_and(|number| number > 0)
+    })
 }
 
 #[cfg(all(test, unix))]
