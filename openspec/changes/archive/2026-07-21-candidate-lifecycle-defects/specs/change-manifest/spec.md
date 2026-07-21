@@ -1,24 +1,6 @@
-# Change Manifest
+# Change Manifest Delta
 
-## Requirements
-
-### Requirement: Declared change scope
-
-Every new change SHALL carry a versioned manifest of repository-relative path
-patterns, and MPD SHALL treat its own active and generated archive paths as
-explicit system scope.
-
-#### Scenario: Staged path is outside scope
-
-- **WHEN** the Git index contains a changed path outside declared/system scope
-- **THEN** manifest state SHALL be blocked, the path SHALL be reported, and MPD
-  SHALL NOT alter the index
-
-#### Scenario: Path cannot be represented safely
-
-- **WHEN** a changed Git path is non-UTF-8, absolute, escaping, or otherwise
-  non-canonical
-- **THEN** closure SHALL fail closed with a path-safety blocker
+## MODIFIED Requirements
 
 ### Requirement: Archived closure commit
 
@@ -116,64 +98,3 @@ commit. The scope SHALL never be narrowed below the validated plan entries.
   non-canonical, oversized, or bound to a different transaction
 - **THEN** the pre-commit check SHALL block the commit rather than fall back to the
   narrower row-only scope
-
-### Requirement: Journaled archive transaction
-
-Before the first archive target changes, MPD SHALL durably stage every postimage
-and a versioned journal binding every target's contained path, explicit preimage,
-postimage digest/mode, and the source/destination directory-tree identities.
-
-Archive input validation SHALL fail closed as an ordinary reported error and SHALL
-never panic: a validation failure discovered while constructing the closure plan SHALL
-be reported before the transaction is prepared, leaving no pending transaction and no
-modified repository bytes.
-
-#### Scenario: Crash follows any target replacement
-
-- **WHEN** recovery finds a target at its exact preimage or postimage
-- **THEN** it SHALL install the recorded staged postimage or leave the exact
-  postimage unchanged without rerunning merge/render/synthesis
-
-#### Scenario: Recovery finds an unexpected third state
-
-- **WHEN** any target, staged file, or directory identity matches neither the
-  journaled preimage nor postimage contract
-- **THEN** recovery SHALL stop manual-recovery-required without another write
-
-#### Scenario: Platform cannot promise atomic replacement
-
-- **WHEN** filesystem/platform replacement or directory sync has weaker guarantees
-- **THEN** MPD SHALL retain staged recovery data, report the durability level,
-  and SHALL NOT claim stronger power-loss atomicity
-
-#### Scenario: Recovery is previewed
-
-- **WHEN** the operator runs `mpd closure recover` without `--yes`
-- **THEN** MPD SHALL make no write and SHALL report stage, write eligibility,
-  durability level, affected-path count, bounded classifications, and next action
-
-#### Scenario: Eligible recovery is confirmed
-
-- **WHEN** every pending target is exact preimage with exact staged postimage and
-  the operator runs `recover --yes`
-- **THEN** MPD SHALL perform completion-only roll-forward and SHALL NOT claim
-  rollback or filesystem-independent atomicity
-
-#### Scenario: Third-state recovery is confirmed
-
-- **WHEN** any third state makes write eligibility false and `recover --yes` runs
-- **THEN** MPD SHALL refuse before writing and direct explicit manual repair
-
-#### Scenario: Abandonment is confirmed
-
-- **WHEN** transaction state is AwaitingCommit and `closure abandon --yes` runs
-- **THEN** MPD SHALL delete only owned ignored transaction metadata and preserve
-  repository bytes, ledger history, index, commits, and remote state
-
-#### Scenario: Late closure-plan validation fails
-
-- **WHEN** archive input validation fails while the closure plan is being constructed
-  (for example a durable-documentation path outside the manifest or an unreadable
-  retained manifest)
-- **THEN** `archive --yes` SHALL exit nonzero with the specific error, SHALL NOT
-  panic, and SHALL leave no pending transaction and no modified target

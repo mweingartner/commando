@@ -353,12 +353,58 @@ pub struct ParityObservation {
     pub remote_oid: Option<String>,
     pub state: ParityState,
     pub observed_at_epoch_secs: u64,
+    /// D3: the change's landing commit this observation verified against —
+    /// for a legacy (plan-less) closure, the coherent HEAD, same as
+    /// `local_oid`. Additive and serde-defaulted so a cache written by an
+    /// older binary (schema without this field) still deserializes, and a
+    /// cache written by this binary still parses under an older one (no
+    /// `deny_unknown_fields` on this type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_oid: Option<String>,
+    /// Security-plan.md Condition 18: the ref-level classification (local
+    /// HEAD vs. the observed remote OID — verified/ahead/behind/diverged/
+    /// rewritten/ancestry-unavailable/unavailable), reported as INFORMATION
+    /// separate from `state` (the per-change landing-containment verdict).
+    /// For a legacy closure this equals `state`; for a modern closure it can
+    /// legitimately differ (e.g. `state: Verified` while `ref_state: Ahead`
+    /// when local carries later legitimate work, or `state: Diverged` while
+    /// `landing_contained: Some(true)` when the landing survives inside an
+    /// otherwise-diverged ref). `None` only when no stable observation was
+    /// reached (Unstable). Additive/optional for the same back-compat
+    /// reasons as `landed_oid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_state: Option<ParityState>,
+    /// Security-plan.md Condition 18: whether the change's landing commit
+    /// (`landed_oid`) was proven contained in the observed remote OID —
+    /// `Some(true)` (equal to or a proven ancestor of it), `Some(false)`
+    /// (proven not contained / diverged), or `None` when the remote object
+    /// is absent locally (no fetch is ever performed to find out) or no
+    /// stable observation was reached. This is the fact `state` alone can
+    /// lose: when the landing IS contained but `ref_state` is Diverged or
+    /// Rewritten, `state` reports the louder ref-level problem (never
+    /// silently VERIFIED), and `landing_contained` is what lets an operator
+    /// tell that apart from "the landing itself was never on the remote".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_contained: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitCoherence {
+    /// Whether this change's landing commit was located and verified
+    /// (design.md D3). For a legacy (plan-less) closure this degrades to
+    /// today's whole-range coherence proof.
     pub coherent: bool,
+    /// The LANDING commit OID when `coherent` — the commit that carries this
+    /// change's reviewed in-scope postimage — never raw current `HEAD` for a
+    /// modern (candidate-bound) closure, since later legitimate commits from
+    /// other changes may have moved HEAD on. A legacy closure has no
+    /// separate landing concept, so this is the coherent HEAD, as before.
     pub head: Option<String>,
+    /// Pre-landing readiness: true when no landing commit was found yet but
+    /// the current worktree exactly matches the archived postimage in
+    /// included scope and that scope is clean — "commit the exact archived
+    /// result" is the accurate next action. Never true once `coherent`.
+    pub ready_to_commit: bool,
     pub blockers: Vec<String>,
 }
 
@@ -601,15 +647,18 @@ pub fn build_candidate_closure_plan(
     })
 }
 
-/// Materialize and compare an exact immutable Commit against a previously
-/// built full-tree plan. This does not consult or update remote parity and
-/// does not issue a Commit validation receipt.
-pub fn verify_candidate_commit_equivalence(
+/// Materialize one exact immutable Commit (rejecting anything but a direct
+/// commit subject) and run `compare` against its root, tearing the
+/// materialization down afterward regardless of outcome. Shared by the
+/// full-tree [`verify_candidate_commit_equivalence`] (archive/commit-
+/// validation time) and the scoped [`scoped_commit_equivalence`] (D3
+/// landing-commit resolution) — the two comparisons differ only in which
+/// entries they compare, never in how a commit is safely materialized.
+fn materialize_commit_and_compare<T>(
     root: &Path,
     commit: &str,
-    plan: &CandidateClosurePlan,
-) -> Result<CandidateClosureEquivalence, String> {
-    validate_candidate_closure_plan(plan)?;
+    compare: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
     let subject = crate::local_validation::capture_subject(root, Some(commit))?;
     if subject.pushed_kind != "commit"
         || !subject.tag_chain.is_empty()
@@ -618,12 +667,7 @@ pub fn verify_candidate_commit_equivalence(
         return Err("closure equivalence requires a direct immutable Commit subject".into());
     }
     let materialized = crate::local_validation::materialize_subject(root, &subject)?;
-    let comparison = (|| {
-        let observed = inventory_closure_tree(&materialized.root)?
-            .into_values()
-            .collect::<Vec<_>>();
-        compare_candidate_closure_entries(plan, &subject.commit, &observed)
-    })();
+    let comparison = compare(&materialized.root);
     match (comparison, materialized.cleanup()) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -634,6 +678,33 @@ pub fn verify_candidate_commit_equivalence(
             "{error}; exact Commit cleanup also failed: {cleanup}"
         )),
     }
+}
+
+/// Materialize and compare an exact immutable Commit against a previously
+/// built full-tree plan. This does not consult or update remote parity and
+/// does not issue a Commit validation receipt.
+///
+/// No longer called by `verify_commit_coherence` after design.md D3: post-
+/// archive verification now resolves a change's own LANDING COMMIT via
+/// scoped equivalence (`scoped_commit_equivalence`), since judging every
+/// commit's FULL tree against one change's plan is exactly what
+/// misclassified interleaved-history commits before D3. Retained as the
+/// full-tree comparison primitive for archive/commit-validation-time
+/// consumers, where the whole tree genuinely is this change's
+/// responsibility, and exercised directly by this module's own tests.
+#[allow(dead_code)]
+pub fn verify_candidate_commit_equivalence(
+    root: &Path,
+    commit: &str,
+    plan: &CandidateClosurePlan,
+) -> Result<CandidateClosureEquivalence, String> {
+    validate_candidate_closure_plan(plan)?;
+    materialize_commit_and_compare(root, commit, |materialized_root| {
+        let observed = inventory_closure_tree(materialized_root)?
+            .into_values()
+            .collect::<Vec<_>>();
+        compare_candidate_closure_entries(plan, commit, &observed)
+    })
 }
 
 /// Persist a canonical Candidate closure plan in clone-private Git state.
@@ -779,14 +850,16 @@ fn candidate_closure_plan_directory(root: &Path, create: bool) -> Result<PathBuf
     Ok(directory)
 }
 
-fn compare_candidate_closure_entries(
-    plan: &CandidateClosurePlan,
-    commit_oid: &str,
+/// Path/mode/content-digest diff between one expected and one observed tree
+/// entry set — the comparison core shared by the full-tree
+/// [`compare_candidate_closure_entries`] (archive/commit-validation time) and
+/// the scoped [`compare_candidate_closure_entries_scoped`] (D3 landing-commit
+/// resolution, `closure.rs` D3). Sorted, deduplicated, deterministic.
+fn diff_closure_entries(
+    expected: &[ClosureTreeEntry],
     observed: &[ClosureTreeEntry],
-) -> Result<CandidateClosureEquivalence, String> {
-    let observed_tree_digest = closure_tree_digest(observed)?;
-    let mut expected_by_path = plan
-        .entries
+) -> Vec<String> {
+    let mut expected_by_path = expected
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
@@ -821,11 +894,47 @@ fn compare_candidate_closure_entries(
         }
     }
     blockers.sort();
+    blockers
+}
+
+fn compare_candidate_closure_entries(
+    plan: &CandidateClosurePlan,
+    commit_oid: &str,
+    observed: &[ClosureTreeEntry],
+) -> Result<CandidateClosureEquivalence, String> {
+    let observed_tree_digest = closure_tree_digest(observed)?;
+    let blockers = diff_closure_entries(&plan.entries, observed);
     Ok(CandidateClosureEquivalence {
         equivalent: blockers.is_empty() && observed_tree_digest == plan.expected_tree_digest,
         candidate_id: plan.candidate_id.clone(),
         commit_oid: commit_oid.to_string(),
         expected_tree_digest: plan.expected_tree_digest.clone(),
+        observed_tree_digest,
+        blockers,
+    })
+}
+
+/// Scoped variant used only by D3 landing-commit resolution: `expected` and
+/// `observed` have ALREADY been filtered to the same `allowed_paths` matcher
+/// used for the landing candidate's diff-purity check (security-plan.md
+/// Condition 17 — one shared matcher for both sides). Unlike the full-tree
+/// comparison, `equivalent` never gates on a whole-tree digest: the digest
+/// over a scoped subset is informational only (an out-of-scope path
+/// legitimately differs commit to commit), never a pass/fail signal.
+fn compare_candidate_closure_entries_scoped(
+    expected: &[ClosureTreeEntry],
+    commit_oid: &str,
+    observed: &[ClosureTreeEntry],
+    candidate_id: &str,
+) -> Result<CandidateClosureEquivalence, String> {
+    let observed_tree_digest = closure_tree_digest(observed)?;
+    let expected_tree_digest = closure_tree_digest(expected)?;
+    let blockers = diff_closure_entries(expected, observed);
+    Ok(CandidateClosureEquivalence {
+        equivalent: blockers.is_empty(),
+        candidate_id: candidate_id.to_string(),
+        commit_oid: commit_oid.to_string(),
+        expected_tree_digest,
         observed_tree_digest,
         blockers,
     })
@@ -2934,23 +3043,165 @@ pub fn planned_archive_digest(
     digest::canonical_digest("archive-scope", 1, entries).map_err(|e| e.to_string())
 }
 
-/// Prove the post-archive commit range is linear, contains no out-of-scope
-/// path at any intermediate commit, is clean in included scope, and still
-/// matches the archived scoped digest.
+/// Bound on how many diff-in-scope-pure commits `resolve_closure_landing`
+/// will actually materialize and compare (security-plan.md Condition 20).
+/// The per-materialization tree/byte caps (`MAX_CLOSURE_TREE_ENTRIES`/
+/// `MAX_CLOSURE_TREE_BYTES`) bound each individual comparison; this bounds
+/// the count of comparisons in the pathological no-match case. A real
+/// landing scan compares one or two commits.
+const MAX_LANDING_CANDIDATES: usize = 2_000;
+/// Bound on how many landing candidates' nearest-miss diagnostics are kept.
+const MAX_LANDING_DIAGNOSTIC_CANDIDATES: usize = 5;
+/// Bound on how many differing paths are listed per nearest-miss candidate.
+const MAX_LANDING_DIAGNOSTIC_PATHS: usize = 8;
+
+/// D3: verify a change's archived closure against its own LANDING COMMIT —
+/// the commit that actually carries the reviewed in-scope postimage — rather
+/// than judging every commit in `base..HEAD` against this change's scope.
+/// A legacy (plan-less) closure has no landing concept and degrades to
+/// today's whole-range coherence proof (`legacy_commit_coherence`); a modern
+/// (candidate-bound) closure is resolved via `resolve_closure_landing`.
 pub fn verify_commit_coherence(
     root: &Path,
     closure: &ArchiveClosure,
 ) -> Result<CommitCoherence, String> {
-    let mut blockers = Vec::new();
     let head = git::head_commit(root).map_err(|e| e.to_string())?;
-    let Some(head_oid) = head.clone() else {
+    let Some(head_oid) = head else {
         return Ok(CommitCoherence {
             coherent: false,
-            head,
+            head: None,
+            ready_to_commit: false,
             blockers: vec!["repository has no commit".into()],
         });
     };
-    let commits = match git::rev_list_reverse(root, &closure.base_commit, &head_oid) {
+    let commits = git::rev_list_reverse(root, &closure.base_commit, &head_oid);
+
+    let Some(candidate_id) = closure.candidate_id.clone() else {
+        return legacy_commit_coherence(root, closure, &head_oid, commits);
+    };
+
+    let commits = match commits {
+        Ok(commits) => commits,
+        Err(_) => {
+            return Ok(CommitCoherence {
+                coherent: false,
+                head: None,
+                ready_to_commit: false,
+                blockers: vec!["HEAD is not a readable descendant of the archive base".into()],
+            });
+        }
+    };
+    let plan = match load_candidate_closure_plan(root, &closure.transaction_id.to_hex()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Ok(CommitCoherence {
+                coherent: false,
+                head: None,
+                ready_to_commit: false,
+                blockers: vec![format!("Candidate closure plan is unavailable: {error}")],
+            });
+        }
+    };
+    if plan.candidate_id != candidate_id
+        || plan.candidate_base_commit != closure.base_commit
+        || plan.archive_path != closure.archive_path
+        || plan.archive_transaction_id != closure.transaction_id.to_hex()
+    {
+        return Ok(CommitCoherence {
+            coherent: false,
+            head: None,
+            ready_to_commit: false,
+            blockers: vec!["Candidate closure plan binding differs from the archive record".into()],
+        });
+    }
+    // Condition 17: fail closed on a vacuous scoped comparison BEFORE ever
+    // materializing a commit. The same `allowed` matcher drives both this
+    // filter and `resolve_closure_landing`'s diff-purity check, so an empty
+    // scoped expected set here would otherwise make the first in-scope-pure
+    // commit trivially "equivalent" against nothing.
+    if !plan
+        .entries
+        .iter()
+        .any(|entry| allowed(&closure.allowed_paths, &entry.path))
+    {
+        return Ok(CommitCoherence {
+            coherent: false,
+            head: None,
+            ready_to_commit: false,
+            blockers: vec![
+                "archived closure plan has no entry within this change's allowed paths; \
+                 refusing a vacuous scoped comparison"
+                    .into(),
+            ],
+        });
+    }
+
+    if commits.is_empty() {
+        let (ready, readiness_blockers) = scope_readiness(root, closure)?;
+        let blockers = if ready {
+            Vec::new()
+        } else {
+            let mut blockers = vec!["archived result has not been committed".into()];
+            blockers.extend(readiness_blockers);
+            blockers.sort();
+            blockers.dedup();
+            blockers
+        };
+        return Ok(CommitCoherence {
+            coherent: false,
+            head: None,
+            ready_to_commit: ready,
+            blockers,
+        });
+    }
+
+    let (landed, diagnostics) = resolve_closure_landing(root, closure, &plan, &commits)?;
+    if let Some(landing) = landed {
+        return Ok(CommitCoherence {
+            coherent: true,
+            head: Some(landing),
+            ready_to_commit: false,
+            blockers: Vec::new(),
+        });
+    }
+    let (ready, readiness_blockers) = scope_readiness(root, closure)?;
+    if ready {
+        return Ok(CommitCoherence {
+            coherent: false,
+            head: None,
+            ready_to_commit: true,
+            blockers: Vec::new(),
+        });
+    }
+    let mut blockers = vec![format!(
+        "no commit in `{}..{head_oid}` matches this change's archived closure",
+        closure.base_commit
+    )];
+    blockers.extend(diagnostics);
+    blockers.extend(readiness_blockers);
+    blockers.sort();
+    blockers.dedup();
+    Ok(CommitCoherence {
+        coherent: false,
+        head: None,
+        ready_to_commit: false,
+        blockers,
+    })
+}
+
+/// Legacy (plan-less) closure coherence: unchanged whole-range behavior —
+/// every commit in `base..HEAD` is judged against this change's scope, and
+/// worktree readiness is folded into the same blocker list. `commits` is the
+/// raw `rev_list_reverse` result so this shares the exact same "not yet
+/// committed" / "HEAD not a descendant" classification as the modern path.
+fn legacy_commit_coherence(
+    root: &Path,
+    closure: &ArchiveClosure,
+    head_oid: &str,
+    commits: Result<Vec<String>, git::GitError>,
+) -> Result<CommitCoherence, String> {
+    let mut blockers = Vec::new();
+    let commits = match commits {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => {
             blockers.push("archived result has not been committed".into());
@@ -2980,6 +3231,30 @@ pub fn verify_commit_coherence(
             None => blockers.push(format!("commit {} has no single parent", &commit[..12])),
         }
     }
+    blockers.extend(scope_readiness(root, closure)?.1);
+    blockers.sort();
+    blockers.dedup();
+    Ok(CommitCoherence {
+        coherent: blockers.is_empty(),
+        head: Some(head_oid.to_string()),
+        ready_to_commit: false,
+        blockers,
+    })
+}
+
+/// Pre-landing readiness: the current worktree's included-scope digest and
+/// dirtiness, reported exactly as the legacy whole-range check always has.
+/// `ready` (the worktree scoped digest exactly matches the archived
+/// postimage) is the one signal that actually gates the modern path's
+/// `ready_to_commit` — a change genuinely awaiting its first commit is
+/// EXPECTED to show its new content as dirty/untracked in `git status`, so
+/// requiring the included scope to also be git-clean would make
+/// `ready_to_commit` unreachable in the normal case; the dirty-path facts
+/// are still surfaced as blockers whenever something is ALSO wrong (`ready`
+/// is false), and the legacy path keeps folding both signals into its
+/// blocker list unconditionally, unchanged.
+fn scope_readiness(root: &Path, closure: &ArchiveClosure) -> Result<(bool, Vec<String>), String> {
+    let mut blockers = Vec::new();
     for status in git::status_v2(root).map_err(|e| e.to_string())? {
         let paths: Vec<&str> = match &status {
             git::StatusEntry::Ordinary { path, .. }
@@ -2997,44 +3272,111 @@ pub fn verify_commit_coherence(
         }
     }
     let digest = scoped_digest_for_patterns(root, &closure.allowed_paths)?;
-    if digest != closure.post_archive_digest {
+    let ready = digest == closure.post_archive_digest;
+    if !ready {
         blockers.push("current scoped content differs from the archived postimage".into());
     }
-    if let Some(candidate_id) = &closure.candidate_id {
-        match load_candidate_closure_plan(root, &closure.transaction_id.to_hex()) {
-            Ok(plan) => {
-                if plan.candidate_id != *candidate_id
-                    || plan.candidate_base_commit != closure.base_commit
-                    || plan.archive_path != closure.archive_path
-                    || plan.archive_transaction_id != closure.transaction_id.to_hex()
-                {
-                    blockers.push(
-                        "Candidate closure plan binding differs from the archive record".into(),
-                    );
-                } else {
-                    match verify_candidate_commit_equivalence(root, &head_oid, &plan) {
-                        Ok(equivalence) if equivalence.equivalent => {}
-                        Ok(equivalence) => blockers.extend(
-                            equivalence
-                                .blockers
-                                .into_iter()
-                                .map(|blocker| format!("Candidate closure mismatch: {blocker}")),
-                        ),
-                        Err(error) => blockers.push(format!(
-                            "Candidate closure comparison is unavailable: {error}"
-                        )),
-                    }
-                }
+    Ok((ready, blockers))
+}
+
+/// D3 landing-commit resolution. Scans `commits` (oldest first, as
+/// `rev_list_reverse` already returns them) for the first single-parent
+/// commit whose parent-diff is entirely within `closure.allowed_paths` AND
+/// whose in-scope tree is equivalent to the archived plan's in-scope
+/// entries. Returns the landing OID, or `None` plus bounded nearest-miss
+/// diagnostics (security-plan.md Condition 8/20) when no candidate
+/// qualifies.
+fn resolve_closure_landing(
+    root: &Path,
+    closure: &ArchiveClosure,
+    plan: &CandidateClosurePlan,
+    commits: &[String],
+) -> Result<(Option<String>, Vec<String>), String> {
+    let mut diagnostics = Vec::new();
+    let mut examined = 0usize;
+    for commit in commits {
+        // `single_parent` reports a root commit as `Ok(None)` but a MERGE
+        // commit as `Err` (`git.rs`'s "merge commit in closure range") — both
+        // simply mean "not a landing candidate", never a fatal error here.
+        let parent = match git::single_parent(root, commit) {
+            Ok(Some(parent)) => parent,
+            Ok(None) | Err(_) => continue,
+        };
+        let diff = git::diff_tree_name_status(root, &parent, commit).map_err(|e| e.to_string())?;
+        let in_scope = diff.iter().all(|entry| {
+            entry
+                .orig_path
+                .iter()
+                .chain(std::iter::once(&entry.path))
+                .all(|path| allowed(&closure.allowed_paths, path))
+        });
+        if !in_scope {
+            continue;
+        }
+        if examined >= MAX_LANDING_CANDIDATES {
+            if diagnostics.len() < MAX_LANDING_DIAGNOSTIC_CANDIDATES {
+                diagnostics.push(format!(
+                    "landing scan stopped after {MAX_LANDING_CANDIDATES} in-scope-pure \
+                     candidates without a match"
+                ));
             }
-            Err(error) => blockers.push(format!("Candidate closure plan is unavailable: {error}")),
+            break;
+        }
+        examined += 1;
+        match scoped_commit_equivalence(root, commit, plan, &closure.allowed_paths) {
+            Ok(equivalence) if equivalence.equivalent => {
+                return Ok((Some(commit.clone()), Vec::new()));
+            }
+            Ok(equivalence) if diagnostics.len() < MAX_LANDING_DIAGNOSTIC_CANDIDATES => {
+                let mut paths: Vec<String> = equivalence
+                    .blockers
+                    .into_iter()
+                    .take(MAX_LANDING_DIAGNOSTIC_PATHS)
+                    .collect();
+                paths.sort();
+                diagnostics.push(format!(
+                    "commit {}: {}",
+                    &commit[..12.min(commit.len())],
+                    paths.join(", ")
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if diagnostics.len() < MAX_LANDING_DIAGNOSTIC_CANDIDATES => {
+                diagnostics.push(format!(
+                    "commit {}: comparison unavailable: {error}",
+                    &commit[..12.min(commit.len())]
+                ));
+            }
+            Err(_) => {}
         }
     }
-    blockers.sort();
-    blockers.dedup();
-    Ok(CommitCoherence {
-        coherent: blockers.is_empty(),
-        head,
-        blockers,
+    Ok((None, diagnostics))
+}
+
+/// Materialize one candidate landing commit and compare it, in scope only,
+/// against the archived plan — the scoped counterpart to
+/// `verify_candidate_commit_equivalence`'s full-tree comparison. Both sides
+/// are filtered by the SAME `allowed` matcher the diff-purity check in
+/// `resolve_closure_landing` already used (Condition 17).
+fn scoped_commit_equivalence(
+    root: &Path,
+    commit: &str,
+    plan: &CandidateClosurePlan,
+    allowed_paths: &[String],
+) -> Result<CandidateClosureEquivalence, String> {
+    validate_candidate_closure_plan(plan)?;
+    materialize_commit_and_compare(root, commit, |materialized_root| {
+        let observed: Vec<ClosureTreeEntry> = inventory_closure_tree(materialized_root)?
+            .into_values()
+            .filter(|entry| allowed(allowed_paths, &entry.path))
+            .collect();
+        let expected: Vec<ClosureTreeEntry> = plan
+            .entries
+            .iter()
+            .filter(|entry| allowed(allowed_paths, &entry.path))
+            .cloned()
+            .collect();
+        compare_candidate_closure_entries_scoped(&expected, commit, &observed, &plan.candidate_id)
     })
 }
 
@@ -3177,16 +3519,22 @@ pub fn verify_remote_parity_with_probe(
             coherence.blockers.join("; ")
         ));
     }
-    // The coherence proof above (linear in-scope history, scoped == archived
-    // postimage, included scope clean) was computed on the HEAD read *before*
-    // this observation loop. Bind it to the head we ultimately call VERIFIED:
-    // if HEAD/scoped/cleanliness drifted between the coherence proof and a
-    // stable observation — even a concurrent `git reset --hard` that then held
-    // steady, so snapshot1 == snapshot2 — the observed head was never
-    // coherence-proven and MUST NOT be reported VERIFIED (Security-code
+    // The coherence proof above was computed on the HEAD read *before* this
+    // observation loop. Bind it to the head we ultimately call VERIFIED: if
+    // the landing drifted out of local history between the coherence proof
+    // and a stable observation — even a concurrent `git reset --hard` that
+    // then held steady, so snapshot1 == snapshot2 — the observed head was
+    // never coherence-proven and MUST NOT be reported VERIFIED (Security-code
     // finding coherence-observation-head-unbound; specs/remote-parity/spec.md
-    // "Local or remote snapshot moves during verification").
-    let coherent_head = coherence.head;
+    // "Local or remote snapshot moves during verification"). `landing` is the
+    // LANDING commit OID for a modern (candidate-bound) closure, or the
+    // coherent HEAD for a legacy one — `verify_commit_coherence` never
+    // returns `coherent: true` without a `head`.
+    let landing = coherence
+        .head
+        .clone()
+        .ok_or("closure coherence produced no OID to verify")?;
+    let modern = closure.candidate_id.is_some();
     for attempt in 0..2 {
         let snapshot1 = capture_local_snapshot(root, &closure.allowed_paths)?;
         let remote1 = git::ls_remote_with_timeout(
@@ -3205,16 +3553,23 @@ pub fn verify_remote_parity_with_probe(
             remote_timeout_secs,
         )
         .map_err(|_| "remote observation failed (offline)".to_string())?;
-        // Re-assert the coherence binding on this observation (see above): the
-        // stable head must be the coherence-checked head, its scoped content
-        // must still equal the archived postimage, and included scope must be
-        // clean. Any drift is treated as movement — one retry, then UNSTABLE —
-        // so a head move into the coherence->observation window can never be
-        // reported VERIFIED.
-        let observation_matches_coherence = coherent_head.as_deref()
-            == Some(snapshot2.head.as_str())
-            && snapshot2.scoped == closure.post_archive_digest
-            && snapshot2.included_clean;
+        // Re-assert the coherence binding on this observation (see above).
+        // Modern (D3): the landing commit must still be contained in the
+        // observed local HEAD — HEAD may have moved ON (later legitimate
+        // commits from other changes), just never OFF the landing; the
+        // worktree-postimage/clean conjuncts are dropped from this binding,
+        // since they policed a landed change's UNRELATED later worktree
+        // state, not this change's landing (design.md D3 point 4). Legacy:
+        // unchanged — HEAD must not have moved at all, and the archived
+        // postimage/clean-scope conjuncts still gate the landed binding.
+        let observation_matches_coherence = if modern {
+            git::is_ancestor(root, &landing, &snapshot2.head).map_err(|e| e.to_string())?
+                == Some(true)
+        } else {
+            landing == snapshot2.head
+                && snapshot2.scoped == closure.post_archive_digest
+                && snapshot2.included_clean
+        };
         if snapshot1 != snapshot2 || remote1 != remote2 || !observation_matches_coherence {
             if attempt == 0 {
                 continue;
@@ -3228,38 +3583,48 @@ pub fn verify_remote_parity_with_probe(
                 remote_oid: remote2,
                 state: ParityState::Unstable,
                 observed_at_epoch_secs: crate::ledger::now_epoch_secs(),
+                landed_oid: None,
+                ref_state: None,
+                landing_contained: None,
             });
         }
         let local2 = snapshot2.head;
-        let state = match remote2.as_deref() {
-            Some(remote) if remote == local2 => ParityState::Verified,
-            Some(remote) => {
-                let mut state = classify_oid_difference(root, &local2, remote)?;
-                // Only a prior VERIFIED observation for *this same* change /
-                // remote / ref may drive rewrite classification. Without the
-                // key match, an unrelated target's cached observation (the
-                // parity cache is a single global file) would supply a foreign
-                // old_oid and mislabel this target (Security-code finding
-                // rewritten-cache-not-keyed; security-plan.md cache-binding).
-                if let Some(old) = load_parity_cache(root).filter(|o| {
-                    o.state == ParityState::Verified
-                        && o.change == change
-                        && o.remote == target.remote
-                        && o.reference == target.reference
-                }) {
-                    if let Some(old_oid) = old.remote_oid {
-                        if old_oid != remote
-                            && git::is_ancestor(root, &old_oid, remote)
-                                .map_err(|e| e.to_string())?
-                                == Some(false)
-                        {
-                            state = ParityState::Rewritten;
-                        }
-                    }
+        let ref_state = ref_level_parity_state(root, change, target, &local2, remote2.as_deref())?;
+        // Whether the landing commit is proven contained in the observed
+        // remote OID — computed unconditionally (legacy and modern alike;
+        // for legacy `landing == local2` always, so this asks the same
+        // "is HEAD on the remote" question `ref_state` does) so it can be
+        // surfaced as its own fact (Condition 18), separate from whatever
+        // `state` ends up being.
+        let landing_contained = match remote2.as_deref() {
+            None => None,
+            Some(remote) if remote == landing || remote == local2 => Some(true),
+            Some(remote) => git::is_ancestor(root, &landing, remote).map_err(|e| e.to_string())?,
+        };
+        // D3: for a modern closure, VERIFIED means the change's landing
+        // commit is contained in the observed remote OID — equal to it,
+        // equal to (contained-by-construction-in) local HEAD, or a proven
+        // local ancestor of it. `ref_state` (ahead/behind/diverged/rewritten,
+        // computed exactly as for a legacy closure) remains the ref-level
+        // classification, reported loudly instead of silently overridden
+        // whenever it is Diverged/Rewritten even though the landing still
+        // checks out (security-plan.md Condition 18) — a landing surviving
+        // inside a rewritten/diverged ref is not the same claim as the ref
+        // itself being intact, and callers must not conflate the two.
+        let state = if modern {
+            match landing_contained {
+                Some(true)
+                    if matches!(ref_state, ParityState::Diverged | ParityState::Rewritten) =>
+                {
+                    ref_state
                 }
-                state
+                Some(true) => ParityState::Verified,
+                Some(false) => ref_state,
+                None if remote2.is_some() => ParityState::AncestryUnavailable,
+                None => ParityState::Unavailable,
             }
-            None => ParityState::Unavailable,
+        } else {
+            ref_state
         };
         let observation = ParityObservation {
             schema: 1,
@@ -3268,8 +3633,11 @@ pub fn verify_remote_parity_with_probe(
             reference: target.reference.clone(),
             local_oid: local2,
             remote_oid: remote2,
+            ref_state: Some(ref_state),
+            landing_contained,
             state,
             observed_at_epoch_secs: crate::ledger::now_epoch_secs(),
+            landed_oid: Some(landing.clone()),
         };
         if observation.state != ParityState::Unstable {
             save_parity_cache(root, &observation)?;
@@ -3277,6 +3645,52 @@ pub fn verify_remote_parity_with_probe(
         return Ok(observation);
     }
     unreachable!()
+}
+
+/// The ref-level parity classification: local HEAD vs. the observed remote
+/// OID, exactly as computed before design.md D3 — VERIFIED on exact OID
+/// equality, otherwise ahead/behind/diverged/ancestry-unavailable, with the
+/// previously-cached VERIFIED observation (same change/remote/ref) driving
+/// rewrite detection. Shared by the legacy path (this IS the per-change
+/// state) and the modern path (this is reported as ref-level information
+/// alongside the landing-containment verdict — security-plan.md
+/// Condition 18).
+fn ref_level_parity_state(
+    root: &Path,
+    change: &str,
+    target: &PublishTarget,
+    local2: &str,
+    remote2: Option<&str>,
+) -> Result<ParityState, String> {
+    match remote2 {
+        Some(remote) if remote == local2 => Ok(ParityState::Verified),
+        Some(remote) => {
+            let mut state = classify_oid_difference(root, local2, remote)?;
+            // Only a prior VERIFIED observation for *this same* change /
+            // remote / ref may drive rewrite classification. Without the key
+            // match, an unrelated target's cached observation (the parity
+            // cache is a single global file) would supply a foreign old_oid
+            // and mislabel this target (Security-code finding rewritten-
+            // cache-not-keyed; security-plan.md cache-binding).
+            if let Some(old) = load_parity_cache(root).filter(|o| {
+                o.state == ParityState::Verified
+                    && o.change == change
+                    && o.remote == target.remote
+                    && o.reference == target.reference
+            }) {
+                if let Some(old_oid) = old.remote_oid {
+                    if old_oid != remote
+                        && git::is_ancestor(root, &old_oid, remote).map_err(|e| e.to_string())?
+                            == Some(false)
+                    {
+                        state = ParityState::Rewritten;
+                    }
+                }
+            }
+            Ok(state)
+        }
+        None => Ok(ParityState::Unavailable),
+    }
 }
 
 #[cfg(test)]
@@ -5228,6 +5642,375 @@ mod candidate_closure_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // =====================================================================
+    // D3 — landing-commit resolution
+    // =====================================================================
+
+    fn unique_landing_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-closure-landing-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        root
+    }
+
+    /// Condition 6: a later, entirely legitimate edit of the same file this
+    /// change touched — the reproduced post-archive `git filter-branch`
+    /// redaction shape — must never be mistaken for corruption of THIS
+    /// change's closure. Landing resolution finds the actual landing commit
+    /// and never even inspects the later edit's content.
+    #[test]
+    fn landing_commit_is_found_despite_a_later_legitimate_same_file_edit() {
+        let root = unique_landing_root("later-edit");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "closure"]);
+        let landing = git::head_commit(&root).unwrap().unwrap();
+
+        fs::write(root.join("src/main.rs"), b"fn main() { /* later */ }\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "later legitimate edit"]);
+
+        let entries = vec![
+            tree_entry("README.md", 0o100644, b"base\n"),
+            tree_entry("src/main.rs", 0o100644, b"fn main() {}\n"),
+        ];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: vec!["src/**".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"unused-once-landed"),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(coherence.coherent, "{:?}", coherence.blockers);
+        assert_eq!(coherence.head.as_deref(), Some(landing.as_str()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Condition 7: another change's commits before AND after this change's
+    /// landing — touching paths entirely outside this closure's scope — must
+    /// never produce a blocker. This is the exact reproduced defect
+    /// ("commit dbacbb4/f2705b5 touches out-of-scope path" judged against
+    /// the wrong change's scope).
+    #[test]
+    fn other_changes_commits_before_and_after_the_landing_produce_no_blockers() {
+        let root = unique_landing_root("interleaved");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("other/thing.txt"), b"other change A\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "--quiet", "-m", "other change A landed"]);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "this change's closure"]);
+        let landing = git::head_commit(&root).unwrap().unwrap();
+
+        fs::write(root.join("other/thing2.txt"), b"other change B\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "--quiet", "-m", "other change B landed"]);
+
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: vec!["src/**".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"unused-once-landed"),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(coherence.coherent, "{:?}", coherence.blockers);
+        assert_eq!(coherence.head.as_deref(), Some(landing.as_str()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Condition 7: a merge commit is never a landing candidate, even one
+    /// whose first-parent diff alone would look in-scope-pure and whose
+    /// resulting tree already carries the exact reviewed content — only
+    /// `git::single_parent` gates this, so the exclusion holds regardless of
+    /// content.
+    #[test]
+    fn merge_commit_is_never_a_landing_candidate() {
+        let root = unique_landing_root("merge-excluded");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+
+        // The feature-branch commit intentionally does NOT yet match the
+        // plan's expected content — only the merge's resulting tree does —
+        // so the only way this scenario could land is by (incorrectly)
+        // treating the merge commit itself as a candidate.
+        run_git(&root, &["checkout", "-q", "-b", "feature"]);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() { /* wip */ }\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "feature add (wip)"]);
+
+        run_git(&root, &["checkout", "-q", "main"]);
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("other/x.txt"), b"x\n").unwrap();
+        run_git(&root, &["add", "other/x.txt"]);
+        run_git(&root, &["commit", "--quiet", "-m", "main diverges"]);
+
+        run_git(
+            &root,
+            &["merge", "--no-ff", "-q", "-m", "merge feature", "feature"],
+        );
+        let merge_oid = git::head_commit(&root).unwrap().unwrap();
+        assert!(git::single_parent(&root, &merge_oid).is_err());
+
+        // A real, single-parent fix-up commit on top of the merge — this is
+        // the only commit that both has a single parent AND carries the
+        // exact reviewed content; it must be found as the landing.
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "fix up after merge"]);
+        let fixup_oid = git::head_commit(&root).unwrap().unwrap();
+
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: vec!["src/**".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"irrelevant-not-landed"),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert_ne!(coherence.head.as_deref(), Some(merge_oid.as_str()));
+        assert!(coherence.coherent, "{:?}", coherence.blockers);
+        assert_eq!(
+            coherence.head.as_deref(),
+            Some(fixup_oid.as_str()),
+            "the landing must be the single-parent fix-up commit, never the merge"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A `git filter-branch`-rewritten landing commit (design.md Risk) keeps
+    /// failing verification, now with an accurate diagnosis naming the
+    /// differing in-scope path rather than a misleading cross-change
+    /// "out-of-scope" claim.
+    #[test]
+    fn rewritten_landing_fails_closed_with_an_accurate_diagnosis() {
+        let root = unique_landing_root("rewritten-landing");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "closure"]);
+
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+
+        // Simulate a `git filter-branch` redaction: rewrite the landing
+        // commit's content in place (amend), producing a new OID.
+        fs::write(root.join("src/main.rs"), b"fn main() { /* redacted */ }\n").unwrap();
+        run_git(&root, &["add", "-A"]);
+        run_git(
+            &root,
+            &["commit", "--amend", "--quiet", "-m", "closure (rewritten)"],
+        );
+
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: vec!["src/**".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"irrelevant-not-ready"),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(!coherence.coherent);
+        assert!(
+            coherence
+                .blockers
+                .iter()
+                .any(|b| b.contains("no commit") && b.contains("matches this change")),
+            "{:?}",
+            coherence.blockers
+        );
+        assert!(
+            coherence.blockers.iter().any(|b| b.contains("src/main.rs")),
+            "diagnosis must name the differing path: {:?}",
+            coherence.blockers
+        );
+        assert!(
+            !coherence
+                .blockers
+                .iter()
+                .any(|b| b.contains("out-of-scope")),
+            "a rewritten landing is never mistaken for an out-of-scope commit: {:?}",
+            coherence.blockers
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A rewritten archive base (the base commit itself no longer exists)
+    /// keeps failing verification with a clear, distinct blocker.
+    #[test]
+    fn rewritten_archive_base_is_a_clear_blocker_for_a_modern_closure() {
+        let root = unique_landing_root("rewritten-base");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "closure"]);
+
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let phantom_base = "1".repeat(40);
+        let candidate_plan = plan(entries, &phantom_base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: phantom_base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: vec!["src/**".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"irrelevant"),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(!coherence.coherent);
+        assert!(
+            coherence
+                .blockers
+                .iter()
+                .any(|b| b.contains("not a readable descendant")),
+            "{:?}",
+            coherence.blockers
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Security-plan.md Condition 17 (CRITICAL): a plan whose entries share
+    /// no path with `allowed_paths` must never be treated as vacuously
+    /// equivalent — that would let the first in-scope-pure commit become the
+    /// landing regardless of content. Fails closed BEFORE scanning any
+    /// commit.
+    #[test]
+    fn vacuous_scoped_comparison_fails_closed() {
+        let root = unique_landing_root("vacuous-scope");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        run_git(&root, &["add", "src/main.rs"]);
+        run_git(&root, &["commit", "--quiet", "-m", "closure"]);
+
+        // The plan's entries are entirely OUTSIDE the closure's declared
+        // `allowed_paths` — a pattern/normalization drift that must never be
+        // silently accepted as "nothing to compare, so it trivially passes".
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: vec!["docs/**".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"irrelevant"),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(!coherence.coherent);
+        assert!(!coherence.ready_to_commit);
+        assert!(
+            coherence
+                .blockers
+                .iter()
+                .any(|b| b.contains("vacuous scoped comparison")),
+            "{:?}",
+            coherence.blockers
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Condition 10: before the closure commit exists, readiness reporting
+    /// behaves as today — worktree scoped digest must match the archived
+    /// postimage and included scope must be clean, surfaced via
+    /// `ready_to_commit` rather than a hard blocker.
+    #[test]
+    fn pre_landing_readiness_reports_ready_to_commit_when_the_worktree_matches() {
+        let root = unique_landing_root("pre-landing-ready");
+        fs::write(root.join("README.md"), b"base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "--quiet", "-m", "base"]);
+        let base = git::head_commit(&root).unwrap().unwrap();
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), b"fn main() {}\n").unwrap();
+
+        let entries = vec![tree_entry("src/main.rs", 0o100644, b"fn main() {}\n")];
+        let candidate_plan = plan(entries, &base);
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        let allowed_paths = vec!["src/**".to_string()];
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: candidate_plan.archive_path.clone(),
+            transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+            candidate_id: Some(candidate_plan.candidate_id.clone()),
+            allowed_paths: allowed_paths.clone(),
+            system_paths: Vec::new(),
+            post_archive_digest: scoped_digest_for_patterns(&root, &allowed_paths).unwrap(),
+            archived_at: 1,
+        };
+        let coherence = verify_commit_coherence(&root, &closure).unwrap();
+        assert!(!coherence.coherent);
+        assert!(coherence.ready_to_commit, "{:?}", coherence.blockers);
+        assert!(coherence.blockers.is_empty(), "{:?}", coherence.blockers);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn run_git(root: &Path, args: &[&str]) {
         let status = StdCommand::new("git")
             .args(args)
@@ -5728,6 +6511,292 @@ mod remote_parity_tests {
         let _ = fs::remove_dir_all(&bare);
     }
 
+    // =====================================================================
+    // D3 — landing-commit-aware remote parity
+    // =====================================================================
+
+    /// Build a single-entry scoped `CandidateClosurePlan` for the D3 parity
+    /// fixtures below — the plan's own `archive_path`/`archive_transaction_id`
+    /// are whatever the caller's `ArchiveClosure` also uses.
+    fn scoped_plan(
+        entries: Vec<ClosureTreeEntry>,
+        candidate_id: &str,
+        base: &str,
+        archive_path: &str,
+        transaction_id: &str,
+    ) -> CandidateClosurePlan {
+        CandidateClosurePlan {
+            schema: CANDIDATE_CLOSURE_SCHEMA,
+            candidate_id: candidate_id.into(),
+            candidate_base_commit: base.into(),
+            archive_path: archive_path.into(),
+            archive_transaction_id: transaction_id.into(),
+            overlay_digest: "c".repeat(64),
+            expected_tree_digest: closure_tree_digest(&entries).unwrap(),
+            entries,
+        }
+    }
+
+    /// Condition 9: a stable observation verifies the CHANGE when its
+    /// landing commit is contained in the remote OID, even though local HEAD
+    /// has since moved AHEAD with later, legitimate, never-pushed work — the
+    /// exact self-hosting interleaving design.md D3 exists to fix.
+    #[test]
+    fn verify_remote_parity_verifies_the_landing_when_local_is_ahead_with_later_work() {
+        let dir = init_repo_labeled("modern-ahead");
+        write_file(&dir, "src/main.rs", "fn main() {}\n");
+        commit_all(&dir, "base");
+        let base = head(&dir);
+
+        write_file(&dir, "src/lib.rs", "pub fn hi() {}\n");
+        commit_all(&dir, "this change's closure");
+        let landing = head(&dir);
+
+        let candidate_id = "a".repeat(64);
+        let txn = "b".repeat(64);
+        let archive_path = "openspec/changes/archive/2026-07-19-modern-ahead";
+        let entries = vec![ClosureTreeEntry {
+            path: "src/lib.rs".into(),
+            mode: 0o100644,
+            byte_len: "pub fn hi() {}\n".len() as u64,
+            sha256: Digest::of_bytes(b"pub fn hi() {}\n").to_hex(),
+        }];
+        let candidate_plan = scoped_plan(entries, &candidate_id, &base, archive_path, &txn);
+        save_candidate_closure_plan(&dir, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: archive_path.into(),
+            transaction_id: Digest::from_hex(&txn).unwrap(),
+            candidate_id: Some(candidate_id),
+            allowed_paths: vec!["src/lib.rs".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"unused-once-landed"),
+            archived_at: 0,
+        };
+        let coherence = verify_commit_coherence(&dir, &closure).unwrap();
+        assert!(coherence.coherent, "{:?}", coherence.blockers);
+        assert_eq!(coherence.head.as_deref(), Some(landing.as_str()));
+
+        let bare = init_bare("modern-ahead-bare");
+        run_git(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run_git(&dir, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+
+        // Later, legitimate work from another change — never pushed.
+        write_file(&dir, "other/later.txt", "later work\n");
+        commit_all(&dir, "later work, never pushed");
+        assert_ne!(head(&dir), landing);
+
+        let target = PublishTarget {
+            remote: "origin".into(),
+            reference: "refs/heads/main".into(),
+        };
+        let observation =
+            verify_remote_parity(&dir, "modern-ahead-change", &target, &closure, 15).unwrap();
+        assert_eq!(observation.state, ParityState::Verified, "{observation:?}");
+        assert_eq!(observation.landed_oid.as_deref(), Some(landing.as_str()));
+        assert_eq!(observation.local_oid, head(&dir));
+        // Condition 18: the ref-level classification (local is genuinely
+        // ahead of the remote, which never received the later work) is
+        // still reported honestly alongside the Verified per-change verdict.
+        assert_eq!(
+            observation.ref_state,
+            Some(ParityState::Ahead),
+            "{observation:?}"
+        );
+        assert_eq!(observation.landing_contained, Some(true), "{observation:?}");
+        let _ = fs::remove_dir_all(&bare);
+    }
+
+    /// Security-code Condition C2 / Condition 18's load-bearing override
+    /// branch: the landing commit IS contained in the remote (a proven
+    /// ancestor of it), but the ref itself has genuinely diverged elsewhere
+    /// (local and remote grew different sibling commits on top of the same
+    /// landing). `state` must report the divergence — never silently
+    /// VERIFIED — while `landing_contained` still lets an operator tell this
+    /// apart from "the landing itself never reached the remote".
+    #[test]
+    fn verify_remote_parity_reports_divergence_loudly_even_when_the_landing_is_contained() {
+        let dir = init_repo_labeled("modern-diverged-landing-contained");
+        write_file(&dir, "src/main.rs", "fn main() {}\n");
+        commit_all(&dir, "base");
+        let base = head(&dir);
+
+        write_file(&dir, "src/lib.rs", "pub fn hi() {}\n");
+        commit_all(&dir, "this change's closure");
+        let landing = head(&dir);
+
+        let candidate_id = "a".repeat(64);
+        let txn = "b".repeat(64);
+        let archive_path = "openspec/changes/archive/2026-07-19-modern-diverged";
+        let entries = vec![ClosureTreeEntry {
+            path: "src/lib.rs".into(),
+            mode: 0o100644,
+            byte_len: "pub fn hi() {}\n".len() as u64,
+            sha256: Digest::of_bytes(b"pub fn hi() {}\n").to_hex(),
+        }];
+        let candidate_plan = scoped_plan(entries, &candidate_id, &base, archive_path, &txn);
+        save_candidate_closure_plan(&dir, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: archive_path.into(),
+            transaction_id: Digest::from_hex(&txn).unwrap(),
+            candidate_id: Some(candidate_id),
+            allowed_paths: vec!["src/lib.rs".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"unused-once-landed"),
+            archived_at: 0,
+        };
+        assert_eq!(
+            verify_commit_coherence(&dir, &closure)
+                .unwrap()
+                .head
+                .as_deref(),
+            Some(landing.as_str())
+        );
+
+        // Remote sibling: descends from the landing via out-of-scope content
+        // the remote alone received.
+        write_file(&dir, "other/remote-only.txt", "remote-only\n");
+        commit_all(&dir, "remote sibling");
+        let bare = init_bare("modern-diverged-bare");
+        run_git(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run_git(&dir, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let remote_tip = head(&dir);
+
+        // Local sibling: reset back to the landing, then diverge with
+        // DIFFERENT later, out-of-scope work — never pushed.
+        run_git(&dir, &["reset", "--hard", &landing]);
+        write_file(&dir, "other/local-only.txt", "local-only\n");
+        commit_all(&dir, "local sibling");
+        let local_tip = head(&dir);
+        assert_ne!(local_tip, remote_tip);
+
+        let target = PublishTarget {
+            remote: "origin".into(),
+            reference: "refs/heads/main".into(),
+        };
+        let observation =
+            verify_remote_parity(&dir, "modern-diverged-change", &target, &closure, 15).unwrap();
+
+        assert_eq!(
+            observation.landing_contained,
+            Some(true),
+            "the landing itself must still be provably on the remote: {observation:?}"
+        );
+        assert_eq!(
+            observation.ref_state,
+            Some(ParityState::Diverged),
+            "the ref-level relationship must be reported honestly: {observation:?}"
+        );
+        assert_eq!(
+            observation.state,
+            ParityState::Diverged,
+            "a diverged ref must never be silently reported VERIFIED: {observation:?}"
+        );
+        assert_ne!(observation.state, ParityState::Verified);
+        let _ = fs::remove_dir_all(&bare);
+    }
+
+    /// Condition 9: a remote object genuinely absent from local history
+    /// (never fetched) keeps AncestryUnavailable for a modern closure too —
+    /// no fetch is ever performed to find out.
+    #[test]
+    fn verify_remote_parity_reports_ancestry_unavailable_for_a_modern_closure_without_fetching() {
+        let dir = init_repo_labeled("modern-ancestry-unavailable");
+        write_file(&dir, "src/main.rs", "fn main() {}\n");
+        commit_all(&dir, "base");
+        let base = head(&dir);
+
+        write_file(&dir, "src/lib.rs", "pub fn hi() {}\n");
+        commit_all(&dir, "this change's closure");
+        let landing = head(&dir);
+
+        let candidate_id = "a".repeat(64);
+        let txn = "b".repeat(64);
+        let archive_path = "openspec/changes/archive/2026-07-19-modern-unavailable";
+        let entries = vec![ClosureTreeEntry {
+            path: "src/lib.rs".into(),
+            mode: 0o100644,
+            byte_len: "pub fn hi() {}\n".len() as u64,
+            sha256: Digest::of_bytes(b"pub fn hi() {}\n").to_hex(),
+        }];
+        let candidate_plan = scoped_plan(entries, &candidate_id, &base, archive_path, &txn);
+        save_candidate_closure_plan(&dir, &candidate_plan).unwrap();
+        let closure = ArchiveClosure {
+            base_commit: base,
+            archive_path: archive_path.into(),
+            transaction_id: Digest::from_hex(&txn).unwrap(),
+            candidate_id: Some(candidate_id),
+            allowed_paths: vec!["src/lib.rs".into()],
+            system_paths: Vec::new(),
+            post_archive_digest: Digest::of_bytes(b"unused-once-landed"),
+            archived_at: 0,
+        };
+        assert_eq!(
+            verify_commit_coherence(&dir, &closure)
+                .unwrap()
+                .head
+                .as_deref(),
+            Some(landing.as_str())
+        );
+
+        // A second, completely independent repository whose history shares
+        // nothing with `dir` — its OID is guaranteed absent from `dir`'s
+        // object database.
+        let foreign = init_repo();
+        write_file(&foreign, "unrelated.txt", "unrelated");
+        commit_all(&foreign, "unrelated root");
+        let bare = init_bare("modern-ancestry-unavailable-bare");
+        run_git(
+            &foreign,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        run_git(&foreign, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+
+        run_git(&dir, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let target = PublishTarget {
+            remote: "origin".into(),
+            reference: "refs/heads/main".into(),
+        };
+        let observation = verify_remote_parity(
+            &dir,
+            "modern-ancestry-unavailable-change",
+            &target,
+            &closure,
+            15,
+        )
+        .unwrap();
+        assert_eq!(observation.state, ParityState::AncestryUnavailable);
+        let _ = fs::remove_dir_all(&foreign);
+        let _ = fs::remove_dir_all(&bare);
+    }
+
+    /// Condition 11: `ParityObservation.landed_oid` is additive — a cache
+    /// written before this field existed still deserializes (defaults to
+    /// `None`), and a fresh observation's serialized form round-trips it.
+    #[test]
+    fn parity_observation_landed_oid_is_additive_and_back_compatible() {
+        let legacy = r#"{"schema":1,"change":"c","remote":"origin","ref":"refs/heads/main",
+            "local_oid":""#
+            .to_string()
+            + &"a".repeat(40)
+            + r#"","state":"verified","observed_at_epoch_secs":0}"#;
+        let observation: ParityObservation = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(observation.landed_oid, None);
+        // Condition 18's presentation fields are equally additive: a cache
+        // predating them defaults both to None, never a fabricated value.
+        assert_eq!(observation.ref_state, None);
+        assert_eq!(observation.landing_contained, None);
+
+        let mut with_landing = observation.clone();
+        with_landing.landed_oid = Some("b".repeat(40));
+        with_landing.ref_state = Some(ParityState::Ahead);
+        with_landing.landing_contained = Some(true);
+        let json = serde_json::to_string(&with_landing).unwrap();
+        let back: ParityObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_landing);
+    }
+
     #[test]
     fn verify_remote_parity_ignores_a_foreign_targets_cache_for_rewrite_detection() {
         // Security-code finding rewritten-cache-not-keyed: the Rewritten check
@@ -5774,9 +6843,12 @@ mod remote_parity_tests {
                 remote: "origin".into(),
                 reference: "refs/heads/main".into(),
                 local_oid: foreign_oid.clone(),
-                remote_oid: Some(foreign_oid),
+                remote_oid: Some(foreign_oid.clone()),
                 state: ParityState::Verified,
                 observed_at_epoch_secs: 0,
+                landed_oid: Some(foreign_oid),
+                ref_state: Some(ParityState::Verified),
+                landing_contained: Some(true),
             },
         )
         .unwrap();

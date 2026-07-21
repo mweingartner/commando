@@ -6,6 +6,7 @@
 use crate::closure::{self, ChangeManifest};
 use crate::digest::Digest;
 use crate::git::{self, StatusEntry};
+use crate::ledger;
 use crate::local_validation::{self, MaterializedSubject};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -169,6 +170,56 @@ struct CandidateProjectionRecordV1 {
     root_device: u64,
     root_inode: u64,
     payload_digest: String,
+}
+
+/// The content-identity slice of a [`CandidateProjectionRecordV1`]: exactly
+/// the fields design.md D1 requires to agree byte-for-byte before a stale
+/// record may ever be considered for eviction. Everything else on the
+/// record (`base_commit`, counts, excluded-dirty state, retained-root
+/// device/inode, the recomputed payload digest) is attempt-variant process
+/// state that a superseded capture attempt may legitimately disagree on.
+/// `verify_retained_projection` has already proven the retained tree equals
+/// the fresh capture's `entries` before any record comparison runs, so a
+/// mismatch here means the sidecar record disagrees with content that
+/// hashes to its own ID — corruption or a cross-change collision, never
+/// staleness.
+#[derive(Debug, PartialEq, Eq)]
+struct CandidateRecordIdentity<'a> {
+    schema: u32,
+    version: u32,
+    change: &'a str,
+    base_tree: &'a str,
+    manifest_digest: &'a str,
+    entries_digest: &'a str,
+    policy_digest: &'a str,
+    source_digest: &'a str,
+    id: &'a str,
+    entries: &'a [CandidateEntry],
+}
+
+fn record_identity<'a>(
+    schema: u32,
+    subject: &'a CandidateSubject,
+    entries: &'a [CandidateEntry],
+) -> CandidateRecordIdentity<'a> {
+    CandidateRecordIdentity {
+        schema,
+        version: subject.version,
+        change: &subject.change,
+        base_tree: &subject.base_tree,
+        manifest_digest: &subject.manifest_digest,
+        entries_digest: &subject.entries_digest,
+        policy_digest: &subject.policy_digest,
+        source_digest: &subject.source_digest,
+        id: &subject.id,
+        entries,
+    }
+}
+
+impl CandidateProjectionRecordV1 {
+    fn identity_fields(&self) -> CandidateRecordIdentity<'_> {
+        record_identity(self.schema, &self.subject, &self.entries)
+    }
 }
 
 #[derive(Debug)]
@@ -452,6 +503,15 @@ thread_local! {
     static RECORD_FINAL_CLEANUP_FAILURE: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    /// D1 concurrency test hook: bytes for a "concurrent racer" record,
+    /// written over the canonical path immediately after a refresh's own
+    /// rename lands and before its post-replace verification read — the
+    /// deterministic fixture for the race design.md D1 mechanics #5
+    /// describes, mirroring how `RECORD_READ_REPLACEMENT_COUNTDOWN` fixtures
+    /// the analogous window elsewhere in this module.
+    static REFRESH_RACE_INJECTION: std::cell::RefCell<Option<Vec<u8>>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 fn maybe_inject_record_publish_failure(
@@ -620,11 +680,34 @@ where
                         recover_candidate_record_publication(&record_path)?;
                         let observed = read_candidate_record(&record_path)?;
                         if observed.record != expected_record {
-                            return Err(
-                                "existing candidate projection record does not match its ID".into(),
-                            );
+                            // D1: a leftover record from a superseded attempt
+                            // of THIS exact content may differ only in
+                            // attempt-variant process state (base_commit,
+                            // counts, excluded-dirty state, declared-status
+                            // digest, retained-root device/inode). Identity
+                            // disagreement — including a foreign-change
+                            // record, since `subject.change` is an identity
+                            // field — stays hard-stopped, unchanged.
+                            if observed.record.identity_fields()
+                                != expected_record.identity_fields()
+                            {
+                                return Err(
+                                    "existing candidate projection record does not match its ID"
+                                        .into(),
+                                );
+                            }
+                            if candidate_id_has_live_gate_binding(root, change, &subject.id)? {
+                                return Err(format!(
+                                    "candidate {} is bound by a live gate record for change \
+                                     {change:?}; rewind the affected phase before recapturing \
+                                     over live evidence",
+                                    subject.id
+                                ));
+                            }
+                            refresh_candidate_record(&record_path, &expected_record)?
+                        } else {
+                            observed
                         }
-                        observed
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         publish_candidate_record(&record_path, &expected_record).map_err(
@@ -652,10 +735,58 @@ where
                 (device, inode, observed_record)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if fs::symlink_metadata(&record_path).is_ok() {
-                    return Err(
-                        "candidate projection record exists without its retained root".into(),
-                    );
+                match fs::symlink_metadata(&record_path) {
+                    Ok(_) => {
+                        // D1 orphan arm: the record has no paired retained
+                        // root. Evict only under the same preconditions as
+                        // the sibling arm — limited to what the orphan
+                        // record itself carries, since there is no fresh
+                        // device/inode to build a full expected record
+                        // against yet. Any failure (unreadable/malformed
+                        // record, identity mismatch, or a live gate binding)
+                        // falls back to the original fail-closed message,
+                        // with the specific precondition-failure reason
+                        // appended rather than swallowed, so an operator
+                        // debugging a stall can tell "corrupt record" from
+                        // "identity differs" from "live-bound" without
+                        // reaching for a debugger.
+                        let evictable = (|| -> Result<ObservedCandidateRecord, String> {
+                            recover_candidate_record_publication(&record_path)?;
+                            let orphan = read_candidate_record(&record_path)?;
+                            let fresh_identity =
+                                record_identity(CANDIDATE_RECORD_SCHEMA, &subject, &entries);
+                            if orphan.record.identity_fields() != fresh_identity {
+                                return Err("orphan candidate record identity differs".into());
+                            }
+                            if candidate_id_has_live_gate_binding(root, change, &subject.id)? {
+                                return Err("orphan candidate record is live-bound".into());
+                            }
+                            Ok(orphan)
+                        })();
+                        match evictable {
+                            Ok(orphan) => {
+                                remove_owned_record_path(
+                                    &record_path,
+                                    orphan.device,
+                                    orphan.inode,
+                                    &orphan.sha256,
+                                )?;
+                                sync_directory(&records)?;
+                            }
+                            Err(reason) => {
+                                return Err(format!(
+                                    "candidate projection record exists without its retained \
+                                     root: {reason}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect candidate projection record: {error}"
+                        ));
+                    }
                 }
                 make_projection_read_only(&materialized.root)?;
                 sync_tree(&materialized.root)?;
@@ -1426,6 +1557,144 @@ fn publish_candidate_record(
             })
         }
     }
+}
+
+/// Atomically refresh an existing canonical candidate projection record in
+/// place with `expected`, which the caller has built entirely from a FRESH
+/// capture (design.md D1 recovery mechanics; security-plan.md Condition 22 —
+/// no field of the stale observed record may flow into the replacement).
+/// Every eviction precondition (identity match, same owning change, no live
+/// `gates` binding) has already been checked by the caller; this function
+/// only performs the durable write. `rename` atomically replaces the
+/// existing 0o400 canonical file regardless of who currently owns it, so a
+/// concurrent refresher's later rename may land after ours — the
+/// post-replace verification read below is what makes either outcome safe:
+/// if the two racing writers computed the same `expected` bytes (the common
+/// case, since both derive them from the same live repository state) the
+/// loser still observes an equal record and proceeds; otherwise it fails
+/// closed with a retryable message rather than trusting unverified state.
+fn refresh_candidate_record(
+    path: &Path,
+    expected: &CandidateProjectionRecordV1,
+) -> Result<ObservedCandidateRecord, String> {
+    let expected_name = format!("{}.json", expected.subject.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err("candidate projection record path is non-canonical".into());
+    }
+    let parent = path
+        .parent()
+        .ok_or("candidate projection record has no parent")?;
+    let bytes = serde_json::to_vec(expected)
+        .map_err(|e| format!("cannot encode candidate projection record: {e}"))?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CANDIDATE_RECORD_BYTES {
+        return Err("candidate projection record exceeds its cap".into());
+    }
+    let temporary = parent.join(format!(
+        ".candidate-record-refresh-{}-{}-{}",
+        expected.subject.id,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "clock unavailable")?
+            .as_nanos()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+                .mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|e| format!("cannot create candidate projection record refresh: {e}"))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("cannot write candidate projection record refresh: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("cannot sync candidate projection record refresh: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o400))
+                .map_err(|e| format!("cannot protect candidate projection record refresh: {e}"))?;
+        }
+        fs::rename(&temporary, path)
+            .map_err(|e| format!("cannot publish candidate projection record refresh: {e}"))?;
+        sync_directory(parent)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    #[cfg(test)]
+    maybe_inject_refresh_race(path)?;
+    let observed = read_candidate_record(path)?;
+    if observed.record != *expected {
+        return Err(
+            "candidate projection record refresh lost a race against a concurrent recovery \
+             and no longer matches this attempt; retry the capture"
+                .into(),
+        );
+    }
+    Ok(observed)
+}
+
+#[cfg(test)]
+fn maybe_inject_refresh_race(path: &Path) -> Result<(), String> {
+    let Some(bytes) = REFRESH_RACE_INJECTION.with(|slot| slot.borrow_mut().take()) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot inject refresh race: {e}"))?;
+    }
+    fs::write(path, &bytes).map_err(|e| format!("cannot inject refresh race: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+            .map_err(|e| format!("cannot inject refresh race: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Whether `change`'s authoritative `gates` map currently binds `id` through
+/// a live gate record's `candidate` field (design.md D1 recovery
+/// precondition 3). A ledger that has never been written for `change` binds
+/// nothing; a ledger that exists but fails to load fails closed rather than
+/// being treated as absent — an unreadable ledger must never be treated as
+/// "no live binding".
+fn candidate_id_has_live_gate_binding(root: &Path, change: &str, id: &str) -> Result<bool, String> {
+    let state_path = ledger::state_path(root, change);
+    match fs::symlink_metadata(&state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect ledger for change {change:?} before candidate recovery: {error}"
+            ))
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(format!(
+                "ledger for change {change:?} is not a regular file"
+            ))
+        }
+        Ok(_) => {}
+    }
+    let observed_ledger = ledger::load(root, change).map_err(|error| {
+        format!("cannot verify candidate ledger binding for change {change:?}: {error}")
+    })?;
+    Ok(observed_ledger.gates.values().any(|record| {
+        record
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.subject.id.as_str())
+            == Some(id)
+    }))
 }
 
 fn remove_owned_record_path(
@@ -2408,6 +2677,7 @@ fn candidate_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::process::Command;
 
     struct Repo {
@@ -2533,6 +2803,30 @@ mod tests {
             mode: Some(CandidateMode::Regular),
             byte_len: bytes.len() as u64,
             sha256: Some(Digest::of_bytes(bytes).to_hex()),
+        }
+    }
+
+    /// Recursively restore owner rwx so a retained root that
+    /// `make_projection_read_only` made owner-read-only can be manually torn
+    /// down (or reconstructed) by a D1 test.
+    #[cfg(unix)]
+    fn make_tree_removable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_dir() {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = fs::read_dir(path) {
+                for child in entries.flatten() {
+                    make_tree_removable(&child.path());
+                }
+            }
+        } else {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
         }
     }
 
@@ -2861,6 +3155,908 @@ mod tests {
         }
     }
 
+    // =====================================================================
+    // D1 — stale-cache eviction under identity/attempt-variant guards
+    // =====================================================================
+
+    fn candidate_gate_record(capture: CandidateCapture) -> ledger::GateRecord {
+        ledger::GateRecord {
+            verdict: ledger::Verdict::Pass,
+            by: "Tester".into(),
+            evidence: None,
+            checks: None,
+            at: "2026-07-19".into(),
+            failure_class: None,
+            exploitability: None,
+            attempt: 1,
+            started_at_epoch_secs: 0,
+            completed_at_epoch_secs: 0,
+            receipt: None,
+            persona_tuning: None,
+            candidate: Some(capture),
+            build_output: None,
+            deploy_result: None,
+            validation_receipt: None,
+        }
+    }
+
+    fn head_oid(root: &Path) -> String {
+        String::from_utf8(git_ok(root, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// The canonical finalized fixture record shared by the D1 partition
+    /// proof and the D1 metamorphic properties below. Field values are
+    /// arbitrary but fixed; what matters is that every identity and every
+    /// attempt-variant field is populated and individually distinguishable.
+    fn partition_fixture_record() -> CandidateProjectionRecordV1 {
+        let subject = CandidateSubject {
+            version: CANDIDATE_SCHEMA,
+            change: "change".into(),
+            base_commit: "1".repeat(40),
+            base_tree: "2".repeat(40),
+            manifest_digest: "3".repeat(64),
+            entries_digest: "4".repeat(64),
+            policy_digest: "5".repeat(64),
+            source_digest: "6".repeat(64),
+            id: "7".repeat(64),
+        };
+        let record = CandidateProjectionRecordV1 {
+            schema: CANDIDATE_RECORD_SCHEMA,
+            subject,
+            entries: vec![entry(b"src/value", b"content")],
+            excluded_dirty_paths: vec![ExcludedDirtyPath {
+                path_bytes: b"excluded".to_vec(),
+                status: "M.".into(),
+            }],
+            counts: CandidateCounts {
+                entries: 1,
+                included_dirty: 1,
+                deleted: 0,
+                untracked: 0,
+                executable: 0,
+                excluded_dirty: 1,
+            },
+            excluded_dirty_digest: "8".repeat(64),
+            declared_status_digest: "9".repeat(64),
+            root_device: 1,
+            root_inode: 2,
+            payload_digest: String::new(),
+        };
+        finalize_candidate_record(record).unwrap()
+    }
+
+    /// Task 1.1: a unit-level partition proof that `identity_fields()`
+    /// exactly separates design.md D1's identity class (schema, subject
+    /// version/change/base_tree/manifest/entries/policy/source digests/id,
+    /// entries) from its attempt-variant class (base_commit, counts,
+    /// excluded-dirty state, declared-status digest, root device/inode, the
+    /// recomputed payload digest) — every field individually, not just the
+    /// two classes in aggregate.
+    #[test]
+    fn identity_fields_partition_matches_every_field_class() {
+        let base = partition_fixture_record();
+
+        // Attempt-variant: changed alone, identity is unaffected.
+        let mut variant = base.clone();
+        variant.subject.base_commit = "a".repeat(40);
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "base_commit"
+        );
+
+        let mut variant = base.clone();
+        variant.counts.included_dirty += 1;
+        assert_eq!(base.identity_fields(), variant.identity_fields(), "counts");
+
+        let mut variant = base.clone();
+        variant.excluded_dirty_paths.push(ExcludedDirtyPath {
+            path_bytes: b"other".to_vec(),
+            status: "A.".into(),
+        });
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "excluded_dirty_paths"
+        );
+
+        let mut variant = base.clone();
+        variant.excluded_dirty_digest = "b".repeat(64);
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "excluded_dirty_digest"
+        );
+
+        let mut variant = base.clone();
+        variant.declared_status_digest = "c".repeat(64);
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "declared_status_digest"
+        );
+
+        let mut variant = base.clone();
+        variant.root_device += 1;
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "root_device"
+        );
+
+        let mut variant = base.clone();
+        variant.root_inode += 1;
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "root_inode"
+        );
+
+        let mut variant = base.clone();
+        variant.payload_digest = "d".repeat(64);
+        assert_eq!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "payload_digest"
+        );
+
+        // Identity: changed alone, identity moves.
+        let mut variant = base.clone();
+        variant.schema += 1;
+        assert_ne!(base.identity_fields(), variant.identity_fields(), "schema");
+
+        let mut variant = base.clone();
+        variant.subject.version += 1;
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.version"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.change = "other-change".into();
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.change"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.base_tree = "f".repeat(40);
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.base_tree"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.manifest_digest = "1".repeat(64);
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.manifest_digest"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.entries_digest = "2".repeat(64);
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.entries_digest"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.policy_digest = "3".repeat(64);
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.policy_digest"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.source_digest = "4".repeat(64);
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.source_digest"
+        );
+
+        let mut variant = base.clone();
+        variant.subject.id = "5".repeat(64);
+        assert_ne!(
+            base.identity_fields(),
+            variant.identity_fields(),
+            "subject.id"
+        );
+
+        let mut variant = base.clone();
+        variant.entries = vec![entry(b"src/other", b"content")];
+        assert_ne!(base.identity_fields(), variant.identity_fields(), "entries");
+    }
+
+    /// One arbitrarily chosen simultaneous combination of every field
+    /// design.md D1 classifies as attempt-variant process state. `None` /
+    /// zero deltas leave a field untouched, so the space includes "no
+    /// mutation at all" through "every field forged at once".
+    #[derive(Debug, Clone)]
+    struct AttemptVariantNoise {
+        base_commit: Option<String>,
+        count_bumps: [usize; 6],
+        extra_excluded: Option<Vec<u8>>,
+        excluded_digest: Option<String>,
+        status_digest: Option<String>,
+        device_delta: u64,
+        inode_delta: u64,
+        payload_digest: Option<String>,
+    }
+
+    fn arb_attempt_variant_noise() -> impl Strategy<Value = AttemptVariantNoise> {
+        (
+            proptest::option::of("[0-9a-f]{40}"),
+            proptest::array::uniform6(0usize..1_000),
+            proptest::option::of(proptest::collection::vec(any::<u8>(), 1..32)),
+            proptest::option::of("[0-9a-f]{64}"),
+            proptest::option::of("[0-9a-f]{64}"),
+            any::<u32>(),
+            any::<u32>(),
+            proptest::option::of("[0-9a-f]{64}"),
+        )
+            .prop_map(
+                |(
+                    base_commit,
+                    count_bumps,
+                    extra_excluded,
+                    excluded_digest,
+                    status_digest,
+                    device_delta,
+                    inode_delta,
+                    payload_digest,
+                )| AttemptVariantNoise {
+                    base_commit,
+                    count_bumps,
+                    extra_excluded,
+                    excluded_digest,
+                    status_digest,
+                    device_delta: u64::from(device_delta),
+                    inode_delta: u64::from(inode_delta),
+                    payload_digest,
+                },
+            )
+    }
+
+    fn apply_attempt_variant_noise(
+        record: &mut CandidateProjectionRecordV1,
+        noise: &AttemptVariantNoise,
+    ) {
+        if let Some(value) = &noise.base_commit {
+            record.subject.base_commit = value.clone();
+        }
+        record.counts.entries = record.counts.entries.wrapping_add(noise.count_bumps[0]);
+        record.counts.included_dirty = record
+            .counts
+            .included_dirty
+            .wrapping_add(noise.count_bumps[1]);
+        record.counts.deleted = record.counts.deleted.wrapping_add(noise.count_bumps[2]);
+        record.counts.untracked = record.counts.untracked.wrapping_add(noise.count_bumps[3]);
+        record.counts.executable = record.counts.executable.wrapping_add(noise.count_bumps[4]);
+        record.counts.excluded_dirty = record
+            .counts
+            .excluded_dirty
+            .wrapping_add(noise.count_bumps[5]);
+        if let Some(path_bytes) = &noise.extra_excluded {
+            record.excluded_dirty_paths.push(ExcludedDirtyPath {
+                path_bytes: path_bytes.clone(),
+                status: "??".into(),
+            });
+        }
+        if let Some(value) = &noise.excluded_digest {
+            record.excluded_dirty_digest = value.clone();
+        }
+        if let Some(value) = &noise.status_digest {
+            record.declared_status_digest = value.clone();
+        }
+        record.root_device = record.root_device.wrapping_add(noise.device_delta);
+        record.root_inode = record.root_inode.wrapping_add(noise.inode_delta);
+        if let Some(value) = &noise.payload_digest {
+            record.payload_digest = value.clone();
+        }
+    }
+
+    /// Flip a string into a guaranteed-different sibling (first character
+    /// toggled between '0' and 'f') so an identity mutation can never be a
+    /// no-op.
+    fn string_variant(s: &str) -> String {
+        let replacement = if s.starts_with('0') { "f" } else { "0" };
+        let mut out = s.to_string();
+        out.replace_range(0..1, replacement);
+        out
+    }
+
+    proptest! {
+        /// D1 metamorphic property (design.md D1 / Conditions 1-2),
+        /// strengthening the per-field partition proof above: under an
+        /// ARBITRARY simultaneous combination of attempt-variant mutations
+        /// — any subset of base_commit, all six counts, excluded-dirty
+        /// paths and digest, declared-status digest, root device/inode,
+        /// and payload digest, each with arbitrary replacement values —
+        /// `identity_fields()` equality is invariant. This is the exact
+        /// classifier `capture_candidate_with_hook` trusts to distinguish
+        /// "stale but evictable under guard" from "corrupt, fail closed",
+        /// so no combination of legitimate process-state drift can ever be
+        /// misread as corruption (the original stall class) ...
+        #[test]
+        fn identity_equality_is_invariant_under_arbitrary_attempt_variant_mutations(
+            noise in arb_attempt_variant_noise(),
+        ) {
+            let base = partition_fixture_record();
+            let mut variant = base.clone();
+            apply_attempt_variant_noise(&mut variant, &noise);
+            prop_assert_eq!(base.identity_fields(), variant.identity_fields());
+        }
+
+        /// ... and conversely: a difference in ANY identity field — schema,
+        /// subject version/change/base_tree/manifest/entries/policy/source
+        /// digests/id, or any aspect of the entries inventory (an extra
+        /// entry, or an existing entry's path, state, mode, byte_len,
+        /// sha256) — dominates ANY arbitrary attempt-variant noise applied
+        /// at the same time: `identity_fields()` always differs, so the
+        /// record always classifies fail-closed (never evicted), no matter
+        /// how much legitimate-looking process-state drift accompanies the
+        /// disagreement.
+        #[test]
+        fn any_identity_field_difference_dominates_arbitrary_attempt_variant_noise(
+            identity_mutation in 0usize..15,
+            noise in arb_attempt_variant_noise(),
+        ) {
+            let base = partition_fixture_record();
+            let mut variant = base.clone();
+            apply_attempt_variant_noise(&mut variant, &noise);
+            match identity_mutation {
+                0 => variant.schema ^= 1,
+                1 => variant.subject.version ^= 1,
+                2 => variant.subject.change = string_variant(&variant.subject.change),
+                3 => variant.subject.base_tree = string_variant(&variant.subject.base_tree),
+                4 => {
+                    variant.subject.manifest_digest =
+                        string_variant(&variant.subject.manifest_digest)
+                }
+                5 => {
+                    variant.subject.entries_digest =
+                        string_variant(&variant.subject.entries_digest)
+                }
+                6 => variant.subject.policy_digest = string_variant(&variant.subject.policy_digest),
+                7 => variant.subject.source_digest = string_variant(&variant.subject.source_digest),
+                8 => variant.subject.id = string_variant(&variant.subject.id),
+                9 => variant.entries.push(entry(b"src/forged-extra", b"forged")),
+                10 => variant.entries[0].path_bytes.push(b'x'),
+                11 => variant.entries[0].state = CandidatePathState::Deleted,
+                12 => variant.entries[0].mode = Some(CandidateMode::Executable),
+                13 => variant.entries[0].byte_len ^= 1,
+                _ => {
+                    variant.entries[0].sha256 =
+                        variant.entries[0].sha256.as_deref().map(string_variant)
+                }
+            }
+            prop_assert_ne!(base.identity_fields(), variant.identity_fields());
+        }
+    }
+
+    /// Reproduces the original stall: a record differing from a fresh
+    /// capture ONLY in `subject.base_commit` (an amend/re-commit of the
+    /// identical tree) no longer hard-errors — it is refreshed in place from
+    /// the fresh capture's own values, and a stale compact ledger binding to
+    /// the pre-refresh record fails closed on reopen (Condition 16).
+    #[test]
+    fn attempt_variant_base_commit_divergence_is_recovered_via_refresh() {
+        let repo = Repo::new("attempt-variant-base-commit");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let first_base_commit = first.projection.capture.subject.base_commit.clone();
+        let root = first.root().to_path_buf();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+
+        git_ok(
+            &repo.root,
+            &["commit", "--allow-empty", "-q", "-m", "amend-like"],
+        );
+        let second_base_commit = head_oid(&repo.root);
+        assert_ne!(first_base_commit, second_base_commit);
+
+        let recovered = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        assert_eq!(recovered.root(), root);
+        assert_eq!(recovered.projection.entries, first.projection.entries);
+        assert_eq!(
+            recovered.projection.capture.subject.base_commit,
+            second_base_commit
+        );
+
+        let refreshed = read_candidate_record(&record_path).unwrap();
+        assert_eq!(refreshed.record.subject.base_commit, second_base_commit);
+
+        // Condition 16: the pre-refresh compact binding is now stale and
+        // must fail closed on reopen rather than silently succeed.
+        // Condition 21: assert the specific compact-binding failure, not
+        // merely that reopen errors — the stale in-memory capture's record
+        // sha256/device/inode/subject no longer match what's on disk after
+        // eviction, and `verify_record_binding` must be what refuses it.
+        let stale_binding_error =
+            reopen_candidate(&repo.root, &first.projection.capture).unwrap_err();
+        assert!(
+            stale_binding_error.contains("does not match its compact binding"),
+            "{stale_binding_error}"
+        );
+
+        reopen_candidate(&repo.root, &recovered.projection.capture).unwrap();
+        recovered.cleanup().unwrap();
+    }
+
+    /// Security-plan.md Condition 22: the refreshed record derives 100% from
+    /// the fresh capture — NO field of the observed (stale) record may flow
+    /// into the replacement, even when that record carries hostile forged
+    /// attempt-variant values (counts, device/inode, status/excluded-dirty
+    /// digests). Directly tampers the on-disk record (bypassing the module's
+    /// own writers) with a canonically-valid but adversarial record sharing
+    /// only the identity fields, then proves the refreshed record equals
+    /// exactly what an untampered fresh capture would have produced.
+    #[test]
+    fn refreshed_record_derives_entirely_from_the_fresh_capture_never_the_hostile_stale_one() {
+        let repo = Repo::new("attempt-variant-hostile-refresh");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+        let genuine = read_candidate_record(&record_path).unwrap().record;
+
+        // Forge every attempt-variant field with hostile, clearly-bogus
+        // values while keeping every identity field byte-identical, then
+        // write it directly (bypassing `publish_candidate_record` and
+        // `refresh_candidate_record` entirely) as a canonically valid
+        // record.
+        let hostile = CandidateProjectionRecordV1 {
+            schema: genuine.schema,
+            subject: genuine.subject.clone(),
+            entries: genuine.entries.clone(),
+            excluded_dirty_paths: vec![ExcludedDirtyPath {
+                path_bytes: b"forged/hostile/path".to_vec(),
+                status: "forged-hostile-status".into(),
+            }],
+            counts: CandidateCounts {
+                entries: 999_999,
+                included_dirty: 999_999,
+                deleted: 999_999,
+                untracked: 999_999,
+                executable: 999_999,
+                excluded_dirty: 999_999,
+            },
+            excluded_dirty_digest: "f".repeat(64),
+            declared_status_digest: "e".repeat(64),
+            root_device: u64::MAX,
+            root_inode: u64::MAX,
+            payload_digest: String::new(),
+        };
+        let hostile = finalize_candidate_record(hostile).unwrap();
+        assert_ne!(hostile, genuine, "the forged record must actually differ");
+        let hostile_bytes = serde_json::to_vec(&hostile).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::write(&record_path, &hostile_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&record_path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        assert_eq!(read_candidate_record(&record_path).unwrap().record, hostile);
+
+        let recovered = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let refreshed = read_candidate_record(&record_path).unwrap().record;
+
+        // The republished record equals exactly the genuine fresh capture's
+        // own computed record (down to attempt-variant fields the hostile
+        // record forged) — none of the hostile values survived.
+        assert_eq!(refreshed, genuine);
+        assert_eq!(
+            recovered.projection.capture.subject.base_commit,
+            first.projection.capture.subject.base_commit
+        );
+        assert_eq!(
+            recovered.projection.capture.counts,
+            first.projection.capture.counts
+        );
+        assert_eq!(
+            recovered.projection.capture.storage.root_device,
+            first.projection.capture.storage.root_device
+        );
+        assert_eq!(
+            recovered.projection.capture.storage.root_inode,
+            first.projection.capture.storage.root_inode
+        );
+        assert_ne!(refreshed.counts.entries, 999_999);
+        assert_ne!(refreshed.root_device, u64::MAX);
+        assert_ne!(refreshed.root_inode, u64::MAX);
+        assert_ne!(refreshed.excluded_dirty_digest, "f".repeat(64));
+        assert_ne!(refreshed.declared_status_digest, "e".repeat(64));
+
+        reopen_candidate(&repo.root, &recovered.projection.capture).unwrap();
+        recovered.cleanup().unwrap();
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+        /// The capture-level D1 metamorphic property (design.md Condition
+        /// 1 as a property, not an example list): seed the published
+        /// record with an ARBITRARY attempt-variant drift combination —
+        /// written directly to disk as a canonically valid record,
+        /// bypassing the module's own writers, exactly what a superseded
+        /// attempt leaves behind — then prove a fresh `capture_candidate`
+        /// of the unchanged tree ALWAYS succeeds (no stale-cache stall)
+        /// and ALWAYS leaves the on-disk record equal to the genuine fresh
+        /// capture's own record, never the drifted one. This drives the
+        /// real production eviction/refresh path (not just the identity
+        /// classifier) a bounded number of seeded, reproducible times.
+        #[test]
+        fn arbitrary_attempt_variant_record_drift_is_always_recovered_by_a_fresh_capture(
+            noise in arb_attempt_variant_noise(),
+        ) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CASE: AtomicUsize = AtomicUsize::new(0);
+            let case = CASE.fetch_add(1, Ordering::Relaxed);
+            let repo = Repo::new(&format!("attempt-variant-metamorphic-{case}"));
+            repo.write("src/value", b"candidate");
+            repo.manifest("recover", &["src/**"]);
+            repo.commit_all("base");
+
+            let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+            let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+            let genuine = read_candidate_record(&record_path).unwrap().record;
+
+            let mut drifted = genuine.clone();
+            apply_attempt_variant_noise(&mut drifted, &noise);
+            // A real leftover record is self-consistent: its payload digest
+            // covers its own (drifted) fields.
+            let drifted = finalize_candidate_record(drifted).unwrap();
+            let drifted_bytes = serde_json::to_vec(&drifted).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            fs::write(&record_path, &drifted_bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&record_path, fs::Permissions::from_mode(0o400)).unwrap();
+            }
+            prop_assert_eq!(&read_candidate_record(&record_path).unwrap().record, &drifted);
+
+            let recovered = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+            let refreshed = read_candidate_record(&record_path).unwrap().record;
+            prop_assert_eq!(&refreshed, &genuine);
+            prop_assert_eq!(&recovered.projection.entries, &first.projection.entries);
+
+            reopen_candidate(&repo.root, &recovered.projection.capture).unwrap();
+            recovered.cleanup().unwrap();
+        }
+    }
+
+    /// Reproduces the stall for a retained root that was recreated (e.g.
+    /// after a crash and manual restore) with byte-identical content but a
+    /// new filesystem identity: the stale record's `root_device`/
+    /// `root_inode` disagree with the fresh capture alone, and recovery
+    /// refreshes the record rather than hard-stalling.
+    #[test]
+    #[cfg(unix)]
+    fn attempt_variant_root_recreation_is_recovered_via_refresh() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = Repo::new("attempt-variant-root");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let root = first.root().to_path_buf();
+        let device_before = first.projection.capture.storage.root_device;
+        let inode_before = first.projection.capture.storage.root_inode;
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+        let entries = first.projection.entries.clone();
+
+        make_tree_removable(&root);
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        for entry in &entries {
+            let relative = std::str::from_utf8(&entry.path_bytes).unwrap();
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"candidate").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        // Every descendant directory (not just the root) must go back to
+        // owner-read-only, mirroring what `make_projection_read_only` does
+        // for a real publication.
+        make_projection_read_only(&root).unwrap();
+        let (device_after, inode_after) = directory_identity(&fs::symlink_metadata(&root).unwrap());
+        assert_ne!(
+            (device_before, inode_before),
+            (device_after, inode_after),
+            "recreation must yield a new filesystem identity"
+        );
+
+        let recovered = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        assert_eq!(recovered.root(), root);
+        assert_eq!(recovered.projection.entries, entries);
+        assert_eq!(
+            recovered.projection.capture.storage.root_device,
+            device_after
+        );
+        assert_eq!(recovered.projection.capture.storage.root_inode, inode_after);
+
+        let refreshed = read_candidate_record(&record_path).unwrap();
+        assert_eq!(refreshed.record.root_device, device_after);
+        assert_eq!(refreshed.record.root_inode, inode_after);
+
+        // Condition 21: assert the specific compact-binding failure, not
+        // merely that reopen errors — the stale in-memory capture's record
+        // sha256/device/inode/subject no longer match what's on disk after
+        // eviction, and `verify_record_binding` must be what refuses it.
+        let stale_binding_error =
+            reopen_candidate(&repo.root, &first.projection.capture).unwrap_err();
+        assert!(
+            stale_binding_error.contains("does not match its compact binding"),
+            "{stale_binding_error}"
+        );
+        reopen_candidate(&repo.root, &recovered.projection.capture).unwrap();
+        recovered.cleanup().unwrap();
+    }
+
+    /// Condition 3: a live gate binding (this exact candidate ID carried by
+    /// a record in the capturing change's authoritative `gates` map) blocks
+    /// eviction even though the only disagreement is attempt-variant; the
+    /// error names rewind guidance and nothing on disk changes.
+    #[test]
+    fn live_gate_binding_blocks_attempt_variant_eviction() {
+        let repo = Repo::new("live-binding-blocks-eviction");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+        let before = fs::read(&record_path).unwrap();
+
+        let mut state = ledger::Ledger::new("recover", "mpd", false, ledger::ChangeKind::Fix);
+        state.gates.insert(
+            crate::phase::Phase::Test,
+            candidate_gate_record(first.projection.capture.clone()),
+        );
+        ledger::save(&repo.root, &state).unwrap();
+
+        git_ok(
+            &repo.root,
+            &["commit", "--allow-empty", "-q", "-m", "amend-like"],
+        );
+
+        let error = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap_err();
+        assert!(error.contains("bound by a live gate record"), "{error}");
+        assert!(error.contains("rewind"), "{error}");
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "a live-bound record must not change on disk"
+        );
+
+        reopen_candidate(&repo.root, &first.projection.capture).unwrap();
+        first.cleanup().unwrap();
+    }
+
+    /// Condition 2: a record owned by a different change never gets
+    /// evicted, even when its content is byte-identical (a realistic
+    /// cross-change collision: two changes whose manifests declare the same
+    /// paths over the same base tree compute the same candidate ID). The
+    /// existing fail-closed message is unchanged and the foreign record is
+    /// left untouched.
+    #[test]
+    fn cross_change_id_collision_never_evicts_the_others_record() {
+        let repo = Repo::new("cross-change-collision");
+        repo.write("src/value", b"shared");
+        repo.manifest("change-a", &["src/**"]);
+        repo.manifest("change-b", &["src/**"]);
+        repo.commit_all("base");
+
+        let policy = "f".repeat(64);
+        let first = capture_candidate(&repo.root, "change-a", &policy).unwrap();
+        let retained_root = first.root().to_path_buf();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+        let before = fs::read(&record_path).unwrap();
+        assert_eq!(
+            first.projection.capture.subject.id,
+            candidate_id(
+                &first.projection.capture.subject.base_tree,
+                &first.projection.capture.subject.manifest_digest,
+                &first.projection.capture.subject.entries_digest,
+                &policy,
+                &first.projection.capture.subject.source_digest,
+            )
+            .unwrap()
+        );
+
+        let error = capture_candidate(&repo.root, "change-b", &policy).unwrap_err();
+        assert!(error.contains("does not match its ID"), "{error}");
+        assert_eq!(
+            fs::read(&record_path).unwrap(),
+            before,
+            "the other change's record must be untouched"
+        );
+        assert!(retained_root.exists());
+
+        first.cleanup().unwrap();
+    }
+
+    /// Condition 1: an orphaned record (retained root lost, e.g. to a
+    /// crash) whose identity matches a fresh capture is evicted and the
+    /// capture falls through to fresh publication rather than hard-stalling.
+    #[test]
+    #[cfg(unix)]
+    fn orphaned_record_is_evicted_and_capture_republishes() {
+        let repo = Repo::new("orphaned-record-recovery");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let root = first.root().to_path_buf();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+        assert!(record_path.is_file());
+
+        make_tree_removable(&root);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+        assert!(record_path.is_file(), "the record is now orphaned");
+
+        let recovered = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        assert_eq!(recovered.root(), root);
+        assert_eq!(recovered.projection.entries, first.projection.entries);
+        assert!(root.exists());
+
+        // Condition 21: assert the specific compact-binding failure, not
+        // merely that reopen errors — the stale in-memory capture's record
+        // sha256/device/inode/subject no longer match what's on disk after
+        // eviction, and `verify_record_binding` must be what refuses it.
+        let stale_binding_error =
+            reopen_candidate(&repo.root, &first.projection.capture).unwrap_err();
+        assert!(
+            stale_binding_error.contains("does not match its compact binding"),
+            "{stale_binding_error}"
+        );
+        reopen_candidate(&repo.root, &recovered.projection.capture).unwrap();
+        recovered.cleanup().unwrap();
+    }
+
+    /// Condition 3's orphan-arm counterpart: a live gate binding blocks
+    /// orphan-record eviction exactly as it blocks the existing-root arm.
+    #[test]
+    #[cfg(unix)]
+    fn live_gate_binding_blocks_orphan_record_eviction() {
+        let repo = Repo::new("live-binding-blocks-orphan");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let root = first.root().to_path_buf();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+        let before = fs::read(&record_path).unwrap();
+
+        let mut state = ledger::Ledger::new("recover", "mpd", false, ledger::ChangeKind::Fix);
+        state.gates.insert(
+            crate::phase::Phase::Test,
+            candidate_gate_record(first.projection.capture.clone()),
+        );
+        ledger::save(&repo.root, &state).unwrap();
+
+        make_tree_removable(&root);
+        fs::remove_dir_all(&root).unwrap();
+
+        let error = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap_err();
+        assert!(
+            error.contains("record exists without its retained root"),
+            "{error}"
+        );
+        // The precondition-failure reason must be surfaced, not swallowed.
+        assert!(error.contains("live-bound"), "{error}");
+        assert_eq!(fs::read(&record_path).unwrap(), before);
+
+        // The retained root is already gone (removed above to fabricate the
+        // orphan) and eviction was correctly refused, so there is no valid
+        // capture handle left to `cleanup()` through — tear the orphaned
+        // record down directly.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&record_path).unwrap();
+    }
+
+    /// Design.md D1 mechanics #5 / Condition 16: two attempts racing the
+    /// record rename. The loser observes the winner's (different) record
+    /// after its own rename lands and fails closed with a retryable
+    /// message rather than adopting unverified state; a stale compact
+    /// binding to the pre-race record then fails closed on reopen too.
+    #[test]
+    fn concurrent_attempt_variant_eviction_loser_fails_closed_retryably() {
+        let repo = Repo::new("attempt-variant-race");
+        repo.write("src/value", b"candidate");
+        repo.manifest("recover", &["src/**"]);
+        repo.commit_all("base");
+
+        let first = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap();
+        let record_path = PathBuf::from(&first.projection.capture.storage.record_path);
+
+        git_ok(
+            &repo.root,
+            &["commit", "--allow-empty", "-q", "-m", "amend-1"],
+        );
+        let racer_base_commit = head_oid(&repo.root);
+        git_ok(
+            &repo.root,
+            &["commit", "--allow-empty", "-q", "-m", "amend-2"],
+        );
+
+        let mut racer_subject = first.projection.capture.subject.clone();
+        racer_subject.base_commit = racer_base_commit;
+        let racer_record = CandidateProjectionRecordV1 {
+            schema: CANDIDATE_RECORD_SCHEMA,
+            subject: racer_subject,
+            entries: first.projection.entries.clone(),
+            excluded_dirty_paths: first.projection.excluded_dirty_paths.clone(),
+            counts: first.projection.capture.counts.clone(),
+            excluded_dirty_digest: first.projection.capture.excluded_dirty_digest.clone(),
+            declared_status_digest: first.projection.capture.declared_status_digest.clone(),
+            root_device: first.projection.capture.storage.root_device,
+            root_inode: first.projection.capture.storage.root_inode,
+            payload_digest: String::new(),
+        };
+        let racer_record = finalize_candidate_record(racer_record).unwrap();
+        let racer_bytes = serde_json::to_vec(&racer_record).unwrap();
+        REFRESH_RACE_INJECTION.with(|slot| *slot.borrow_mut() = Some(racer_bytes));
+
+        let error = capture_candidate(&repo.root, "recover", &"a".repeat(64)).unwrap_err();
+        assert!(error.contains("lost a race"), "{error}");
+
+        let after = read_candidate_record(&record_path).unwrap();
+        assert_eq!(
+            after.record, racer_record,
+            "the loser must not have overwritten the winning racer's record"
+        );
+
+        // Condition 21: assert the specific compact-binding failure, not
+        // merely that reopen errors — the stale in-memory capture's record
+        // sha256/device/inode/subject no longer match what's on disk after
+        // eviction, and `verify_record_binding` must be what refuses it.
+        let stale_binding_error =
+            reopen_candidate(&repo.root, &first.projection.capture).unwrap_err();
+        assert!(
+            stale_binding_error.contains("does not match its compact binding"),
+            "{stale_binding_error}"
+        );
+
+        // Manual teardown: neither in-memory capture handle matches the
+        // racer's on-disk state, so `cleanup()` cannot be used here.
+        use std::os::unix::fs::PermissionsExt;
+        make_tree_removable(first.root());
+        fs::remove_dir_all(first.root()).unwrap();
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&record_path).unwrap();
+    }
+
     #[test]
     fn projection_record_codec_reopen_and_tamper_checks_are_closed() {
         let repo = Repo::new("projection-record");
@@ -3085,6 +4281,9 @@ mod tests {
         }
         let error = capture_candidate(&foreign_repo.root, "record", &"a".repeat(64)).unwrap_err();
         assert!(error.contains("record exists without its retained root"));
+        // The precondition-failure reason (an unreadable/malformed orphan
+        // record) must be surfaced, not swallowed.
+        assert!(error.contains("malformed"), "{error}");
         assert_eq!(fs::read(&record).unwrap(), b"foreign record");
         let candidates = local_validation::git_common_dir(&foreign_repo.root)
             .unwrap()

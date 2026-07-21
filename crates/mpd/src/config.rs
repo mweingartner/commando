@@ -1404,14 +1404,22 @@ mod tests {
         }
 
         /// Sensitive presentation metadata must reject every out-of-range
-        /// attacker-chosen index while preserving the exact argv vector.
+        /// attacker-chosen index (>= the check's argv length) while preserving
+        /// the exact argv vector. An in-range index is valid metadata. The
+        /// boundary is derived from the actual argv so the invariant holds
+        /// regardless of how many args the `format` check carries.
         #[test]
-        fn arbitrary_out_of_range_sensitive_index_is_rejected(index in 3usize..10_000) {
+        fn arbitrary_out_of_range_sensitive_index_is_rejected(index in 0usize..10_000) {
             let mut policy = repository_local_policy();
             let check = policy.checks.get_mut("format").unwrap();
             let original = check.args.clone();
+            let arg_count = original.len();
             check.output = Some(CheckOutputConfig { sensitive_args: vec![index] });
-            prop_assert!(policy.validate().is_err());
+            if index >= arg_count {
+                prop_assert!(policy.validate().is_err());
+            } else {
+                prop_assert!(policy.validate().is_ok());
+            }
             prop_assert_eq!(policy.checks["format"].args.as_slice(), original.as_slice());
         }
 

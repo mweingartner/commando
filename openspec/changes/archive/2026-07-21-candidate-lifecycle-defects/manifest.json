@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "paths": [
+    ".mpd/state/candidate-lifecycle-defects.json",
+    "crates/mpd/**",
+    "docs/candidate-lifecycle-defects.md",
+    "openspec/changes/candidate-lifecycle-defects/**",
+    "openspec/specs/**"
+  ],
+  "shared_paths": []
+}

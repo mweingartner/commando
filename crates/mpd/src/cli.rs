@@ -1632,13 +1632,24 @@ fn workflow_status(
         (Ok(None), None) => WorkflowFact::new(WorkflowOutcome::NotRun, "MISSING"),
     };
     let remote_parity = match parity {
+        // Security-code Condition 18: the ref-level classification and the
+        // raw landing-containment fact are surfaced as evidence alongside
+        // the per-change verdict in every case where an observation exists
+        // — a Verified/Blocked label alone cannot distinguish "the ref is
+        // also ahead/behind" from "the landing itself never reached the
+        // remote".
         Some(observation) if parity_current => WorkflowFact::new(WorkflowOutcome::Pass, "VERIFIED")
-            .with_evidence(observation.local_oid.clone()),
+            .with_evidence(format!(
+                "{}; {}",
+                observation.local_oid,
+                describe_ref_level_parity(observation)
+            )),
         Some(observation) if head.as_deref() != Some(observation.local_oid.as_str()) => {
             WorkflowFact::new(WorkflowOutcome::Stale, "STALE")
                 .with_evidence(observation.local_oid.clone())
         }
-        Some(observation) => WorkflowFact::new(WorkflowOutcome::Blocked, observation.state.label()),
+        Some(observation) => WorkflowFact::new(WorkflowOutcome::Blocked, observation.state.label())
+            .with_evidence(describe_ref_level_parity(observation)),
         None => WorkflowFact::new(WorkflowOutcome::NotRun, "NOT VERIFIED"),
     };
     let transfer = match (matching_authorization, parity_current) {
@@ -2078,7 +2089,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             "attempt_authorization": attempt_authorization,
             "evidence": evidence,
             "manifest": manifest,
-            "commit_coherence": coherence.as_ref().map(|c| serde_json::json!({"coherent":c.coherent,"head":c.head,"blockers":c.blockers})),
+            "commit_coherence": coherence.as_ref().map(|c| serde_json::json!({"coherent":c.coherent,"head":c.head,"ready_to_commit":c.ready_to_commit,"blockers":c.blockers})),
             "remote_parity": parity,
             "workflow": workflow,
         });
@@ -2263,6 +2274,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             p.state.label().to_ascii_uppercase(),
             p.observed_at_epoch_secs
         );
+        println!("  {}", describe_ref_level_parity(p));
     } else {
         println!("\nRemote parity: NOT VERIFIED");
     }
@@ -2924,17 +2936,11 @@ fn validate_candidate_report_binding(
     capture: &crate::candidate::CandidateCapture,
 ) -> Result<(), String> {
     let expected_request = format!("candidate:{}", capture.subject.id);
-    for (label, subject) in [
-        ("report", &report.subject),
-        (
-            "receipt",
-            &report
-                .receipt
-                .as_ref()
-                .ok_or("candidate profile passed without an ephemeral result receipt")?
-                .subject,
-        ),
-    ] {
+    let receipt = report
+        .receipt
+        .as_ref()
+        .ok_or("candidate profile passed without an ephemeral result receipt")?;
+    for (label, subject) in [("report", &report.subject), ("receipt", &receipt.subject)] {
         if subject.requested != expected_request
             || subject.pushed_kind != "candidate"
             || subject.commit != capture.subject.base_commit
@@ -2945,6 +2951,24 @@ fn validate_candidate_report_binding(
             return Err(format!(
                 "candidate validation {label} subject differs from the retained Candidate"
             ));
+        }
+    }
+    // Security-code Condition C3: pin the Build output's candidate_id to the
+    // exact retained Candidate too, when the receipt carries a typed one.
+    // The D1 eviction guard keys on `record.candidate.subject.id` and D2's
+    // ledger-binding predicate keys on `build_output.candidate_id`
+    // independently; neither previously cross-checked the two against each
+    // other on this path, so a receipt whose subject matched the Candidate
+    // but whose typed Build output named a DIFFERENT candidate would have
+    // passed here undetected. Fail closed rather than trust the two fields
+    // to cooperate.
+    if let Some(output) = receipt.build_output.as_ref() {
+        if output.candidate_id.as_deref() != Some(capture.subject.id.as_str()) {
+            return Err(
+                "candidate validation receipt's Build output candidate ID differs from the \
+                 retained Candidate"
+                    .into(),
+            );
         }
     }
     Ok(())
@@ -5672,6 +5696,28 @@ fn resolve_publish_target(
         .map(|(remote, reference)| closure::PublishTarget { remote, reference }))
 }
 
+/// Security-code Condition 18 / C1: the per-change landing-containment
+/// verdict (`observation.state`) and the ref-level classification
+/// (`observation.ref_state`) are deliberately separate facts — a Diverged or
+/// Rewritten `state` can mean either "the landing itself never reached the
+/// remote" or "the landing is fine but the ref diverged elsewhere", and an
+/// operator cannot tell those apart from `state` alone. This renders both,
+/// plus the raw landing-containment boolean, as one human-readable line so
+/// every text surface presents them identically; `--json` output already
+/// carries both fields directly on `ParityObservation`.
+fn describe_ref_level_parity(observation: &closure::ParityObservation) -> String {
+    let ref_state = observation
+        .ref_state
+        .map(|state| state.label().to_ascii_uppercase())
+        .unwrap_or_else(|| "UNKNOWN (no stable observation)".into());
+    let contained = match observation.landing_contained {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown (remote object not locally present, no fetch performed)",
+    };
+    format!("ref-level state: {ref_state}; landing commit contained in remote: {contained}")
+}
+
 fn cmd_publish(verify: bool, json: bool) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, None)?;
@@ -5698,20 +5744,29 @@ fn cmd_publish(verify: bool, json: bool) -> CmdResult {
         let cached = closure::load_parity_cache(&root).filter(|p| {
             p.change == change && p.remote == target.remote && p.reference == target.reference
         });
+        let next = if coherence.coherent {
+            "mpd publish --verify"
+        } else if coherence.ready_to_commit {
+            "commit the exact archived result"
+        } else {
+            "resolve the blockers below before publishing"
+        };
         if json {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "change": change,
                 "remote": target.remote,
                 "ref": target.reference,
-                "commit_coherence": {"coherent": coherence.coherent, "head": coherence.head, "blockers": coherence.blockers},
+                "commit_coherence": {"coherent": coherence.coherent, "head": coherence.head, "ready_to_commit": coherence.ready_to_commit, "blockers": coherence.blockers},
                 "last_observation": cached,
-                "next": if coherence.coherent { "mpd publish --verify" } else { "commit the exact archived result" }
+                "next": next
             })).unwrap());
         } else {
             println!(
                 "Publish readiness: {}",
                 if coherence.coherent {
                     "READY"
+                } else if coherence.ready_to_commit {
+                    "AWAITING COMMIT"
                 } else {
                     "BLOCKED"
                 }
@@ -5732,14 +5787,7 @@ fn cmd_publish(verify: bool, json: bool) -> CmdResult {
                 );
             }
             println!("No push or deploy performed.");
-            println!(
-                "\n→ next: {}",
-                if coherence.coherent {
-                    "mpd publish --verify"
-                } else {
-                    "commit the exact archived result"
-                }
-            );
+            println!("\n→ next: {next}");
         }
         return Ok(if coherence.coherent { 0 } else { 1 });
     }
@@ -5769,6 +5817,10 @@ fn cmd_publish(verify: bool, json: bool) -> CmdResult {
                     "  remote: {}",
                     observation.remote_oid.as_deref().unwrap_or("(missing)")
                 );
+                if let Some(landed) = observation.landed_oid.as_deref() {
+                    println!("  this change's landing commit: {landed}");
+                }
+                println!("  {}", describe_ref_level_parity(&observation));
                 println!("No push or deploy performed.");
             }
             if observation.state == closure::ParityState::Verified {
@@ -7468,8 +7520,14 @@ fn runtime_doctor_findings_with_receipt(
                 Some(archive) => match closure::verify_commit_coherence(root, archive) {
                     Ok(observation)
                         if observation.coherent
-                            && observation.head.as_deref() == subject.as_deref()
-                            && receipt_subject.as_deref() == subject.as_deref() =>
+                            && receipt_subject.as_deref() == subject.as_deref()
+                            && observation.head.as_deref().is_some_and(|landing| {
+                                Some(landing) == subject.as_deref()
+                                    || subject.as_deref().is_some_and(|head| {
+                                        crate::git::is_ancestor(root, landing, head)
+                                            == Ok(Some(true))
+                                    })
+                            }) =>
                     {
                         coherent = true;
                         DoctorFinding {
@@ -7478,7 +7536,8 @@ fn runtime_doctor_findings_with_receipt(
                             component: "closure".into(),
                             state: "coherent".into(),
                             message: format!(
-                                "archived closure and current receipt cohere with exact HEAD {}",
+                                "archived closure's landing commit {} coheres with exact HEAD {}",
+                                observation.head.as_deref().unwrap_or_default(),
                                 subject.as_deref().unwrap_or_default()
                             ),
                             fix: String::new(),
@@ -7844,8 +7903,9 @@ mod tests {
         is_valid_date_prefix, parse_exploit, receipt_failure_fact, require_closure_plan,
         resolve_runtime_head, resolve_runtime_ledger, retained_candidate_for_objective_gate,
         runtime_doctor_findings_with_receipt, sandbox_blocker, strict_actor_separation_issue,
-        strict_gate_command, union_closure_scope, upstream_artifact_pointers, validate_evidence,
-        validate_introduced_by, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
+        strict_gate_command, union_closure_scope, upstream_artifact_pointers,
+        validate_candidate_report_binding, validate_evidence, validate_introduced_by,
+        WorkflowOutcome, REQUIRED_DOC_SECTIONS,
     };
     use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, Verdict};
     use crate::phase::{Applicability, Phase};
@@ -8110,6 +8170,116 @@ mod tests {
                 .unwrap_err()
                 .contains("bindings differ")
         );
+    }
+
+    /// Security-code Condition C3: `validate_candidate_report_binding` must
+    /// pin a typed Build output's `candidate_id` to the retained Candidate,
+    /// not just the report/receipt subject — a receipt whose subject matches
+    /// but whose `build_output.candidate_id` names a different candidate
+    /// must fail closed rather than pass on subject agreement alone.
+    #[test]
+    fn validate_candidate_report_binding_pins_build_output_candidate_id_too() {
+        let capture = candidate_capture('7');
+        let subject = crate::local_validation::Subject {
+            requested: format!("candidate:{}", capture.subject.id),
+            pushed_oid: capture.subject.base_commit.clone(),
+            pushed_kind: "candidate".into(),
+            tag_chain: Vec::new(),
+            commit: capture.subject.base_commit.clone(),
+            tree: capture.subject.base_tree.clone(),
+        };
+        let receipt = crate::local_validation::ValidationReceiptV1 {
+            schema: 1,
+            id: "1".repeat(64),
+            subject: subject.clone(),
+            profile: "build".into(),
+            config_digest: "2".repeat(64),
+            checks_digest: "3".repeat(64),
+            trusted_policy_oid: "4".repeat(40),
+            trusted_before_policy_digest: "5".repeat(64),
+            candidate_policy_digest: "6".repeat(64),
+            effective_policy_digest: "7".repeat(64),
+            sandbox: crate::local_validation::SandboxReceiptBindingV1 {
+                contract_version: 1,
+                adapter_digest: "8".repeat(64),
+                profile_digest: "9".repeat(64),
+                environment_keys: Vec::new(),
+                certified_host: "fixture-host".into(),
+                adapter_abi_digest: "a".repeat(64),
+                canary_contract_digest: "b".repeat(64),
+                residual_limitations: Vec::new(),
+                run_request_digests: Vec::new(),
+                run_authority_digests: Vec::new(),
+                run_root_inventory_digests: Vec::new(),
+                run_canary_digests: Vec::new(),
+            },
+            validation_contract_version: 1,
+            validator_version: "fixture".into(),
+            validator_digest: "c".repeat(64),
+            platform: crate::local_validation::PlatformReceiptBindingV1 {
+                operating_system: "linux".into(),
+                architecture: "x86_64".into(),
+                cargo_target: "x86_64-unknown-linux-gnu".into(),
+            },
+            toolchain: crate::local_validation::ToolchainReceiptBindingV1 {
+                rust_release: "1.80.0".into(),
+                host: None,
+                components: Vec::new(),
+            },
+            cargo_lock_digest: "d".repeat(64),
+            advisory: crate::local_validation::AdvisoryReceiptBindingV1 {
+                revision: "e".repeat(40),
+                tree: "f".repeat(40),
+                lock_digest: "1".repeat(64),
+                max_age_days: 30,
+            },
+            tool_policy_digest: "2".repeat(64),
+            tool_digests: std::collections::BTreeMap::new(),
+            results: Vec::new(),
+            started_epoch_secs: 1,
+            completed_epoch_secs: 2,
+            outcome: "passed".into(),
+            build_output: Some(candidate_output(&capture.subject.id)),
+        };
+        let report = crate::local_validation::ValidationReport {
+            schema: 1,
+            subject: subject.clone(),
+            profile: "build".into(),
+            status: "passed".into(),
+            receipt: Some(receipt.clone()),
+            blocker: None,
+            counts: crate::local_validation::ValidationCountsV1 {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                blocked: 0,
+                not_run: 0,
+            },
+            actions: Vec::new(),
+        };
+
+        // A matching build_output.candidate_id passes.
+        validate_candidate_report_binding(&report, &capture).unwrap();
+
+        // A build_output naming a DIFFERENT candidate must fail closed, even
+        // though the report/receipt subjects still match the retained
+        // Candidate exactly — the two fields must agree, not merely
+        // cooperate.
+        let mut mismatched_report = report.clone();
+        mismatched_report.receipt.as_mut().unwrap().build_output =
+            Some(candidate_output(&"9".repeat(64)));
+        let error = validate_candidate_report_binding(&mismatched_report, &capture).unwrap_err();
+        assert!(
+            error.contains("Build output candidate ID differs"),
+            "{error}"
+        );
+
+        // No typed build_output at all (e.g. a Security/Test profile
+        // receipt) is unaffected — the check is conditional on one being
+        // present.
+        let mut no_output_report = report.clone();
+        no_output_report.receipt.as_mut().unwrap().build_output = None;
+        validate_candidate_report_binding(&no_output_report, &capture).unwrap();
     }
 
     #[test]

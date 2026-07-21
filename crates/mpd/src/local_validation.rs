@@ -1392,31 +1392,27 @@ fn candidate_output_ledger_bound(
     }
     let ledger = crate::ledger::load(root, change)
         .map_err(|error| format!("cannot verify candidate ledger binding: {error}"))?;
+    // D2: only the authoritative `gates` map (latest verdict per phase) can
+    // bind an output. `history` is an append-only audit trail — a phase that
+    // has been rewound by `invalidate_for_freshness` leaves its superseded
+    // records in `history` only, and those records legitimately carry
+    // `candidate` (every candidate gate attaches it) without `build_output`
+    // (only a passing Build ever attaches that). Treating a candidate-
+    // carrying-but-output-less record as a binding — or consulting `history`
+    // at all — is exactly what permanently poisoned re-export after a
+    // freshness rewind; see design.md D2.
     let mut bound = false;
-    for record in ledger
-        .history
-        .iter()
-        .map(|event| &event.record)
-        .chain(ledger.gates.values())
-    {
-        let record_candidate = record
-            .candidate
-            .as_ref()
-            .map(|candidate| candidate.subject.id.as_str());
-        let output_candidate = record
-            .build_output
-            .as_ref()
-            .and_then(|output| output.candidate_id.as_deref());
-        if record_candidate == Some(candidate_id) || output_candidate == Some(candidate_id) {
-            let output = record
-                .build_output
-                .as_ref()
-                .ok_or("candidate ledger binding has no typed Build output")?;
-            if output.path != relative {
-                return Err("candidate ledger binding points at a different output path".into());
-            }
-            bound = true;
+    for record in ledger.gates.values() {
+        let Some(output) = record.build_output.as_ref() else {
+            continue;
+        };
+        if output.candidate_id.as_deref() != Some(candidate_id) {
+            continue;
         }
+        if output.path != relative {
+            return Err("candidate ledger binding points at a different output path".into());
+        }
+        bound = true;
     }
     Ok(bound)
 }
@@ -10046,6 +10042,251 @@ mod tests {
         }
     }
 
+    // =====================================================================
+    // D2 — Build-output binding is authoritative through `gates` only
+    // =====================================================================
+
+    fn stub_candidate_capture(change: &str, id: &str) -> crate::candidate::CandidateCapture {
+        crate::candidate::CandidateCapture {
+            subject: crate::candidate::CandidateSubject {
+                version: 1,
+                change: change.to_string(),
+                base_commit: "a".repeat(40),
+                base_tree: "b".repeat(40),
+                manifest_digest: "c".repeat(64),
+                entries_digest: "d".repeat(64),
+                policy_digest: "e".repeat(64),
+                source_digest: "f".repeat(64),
+                id: id.to_string(),
+            },
+            clone_private_root: "/stub/candidate-root".into(),
+            storage: crate::candidate::CandidateStorageBinding {
+                record_path: "/stub/candidate-record.json".into(),
+                record_sha256: "0".repeat(64),
+                root_device: 0,
+                root_inode: 0,
+                record_device: 0,
+                record_inode: 0,
+            },
+            counts: crate::candidate::CandidateCounts::default(),
+            excluded_dirty_digest: "1".repeat(64),
+            excluded_dirty_sample: Vec::new(),
+            declared_status_digest: "2".repeat(64),
+            captured_at_epoch_secs: 0,
+        }
+    }
+
+    fn stub_build_output(candidate_id: &str, path: &str) -> BuildOutputV1 {
+        BuildOutputV1 {
+            schema: BUILD_OUTPUT_SCHEMA,
+            name: "artifact".into(),
+            path: path.into(),
+            max_bytes: 1024,
+            required_mode: 0o644,
+            size: 4,
+            mode: 0o644,
+            device: 0,
+            inode: 0,
+            sha256: "3".repeat(64),
+            candidate_id: Some(candidate_id.to_string()),
+        }
+    }
+
+    fn stub_gate_record(
+        candidate: Option<crate::candidate::CandidateCapture>,
+        build_output: Option<BuildOutputV1>,
+    ) -> crate::ledger::GateRecord {
+        crate::ledger::GateRecord {
+            verdict: crate::ledger::Verdict::Pass,
+            by: "fixture".into(),
+            evidence: None,
+            checks: None,
+            at: "2026-07-19".into(),
+            failure_class: None,
+            exploitability: None,
+            attempt: 1,
+            started_at_epoch_secs: 0,
+            completed_at_epoch_secs: 0,
+            receipt: None,
+            persona_tuning: None,
+            candidate,
+            build_output,
+            deploy_result: None,
+            validation_receipt: None,
+        }
+    }
+
+    /// Condition 5 / D2: a Security(code)/Test-style gate record — carrying
+    /// `candidate` but never `build_output` — must never be treated as a
+    /// binding. This is the exact `:1414` false-positive the redesign
+    /// removes: before D2, any record referencing the candidate ID (via
+    /// either field) errored "no typed Build output" instead of simply not
+    /// being a binding.
+    #[test]
+    fn candidate_carrying_record_without_build_output_is_never_a_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-bound-candidate-only-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".mpd")).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let candidate_id = Digest::of_bytes(b"candidate-only").to_hex();
+        let relative = format!(".mpd/build-output/{candidate_id}/artifact");
+
+        let mut ledger = crate::ledger::Ledger::new(
+            "rebind-candidate-only",
+            "mpd",
+            false,
+            crate::ledger::ChangeKind::Fix,
+        );
+        ledger.gates.insert(
+            crate::phase::Phase::SecurityCode,
+            stub_gate_record(
+                Some(stub_candidate_capture(
+                    "rebind-candidate-only",
+                    &candidate_id,
+                )),
+                None,
+            ),
+        );
+        crate::ledger::save(&root, &ledger).unwrap();
+
+        assert!(!candidate_output_ledger_bound(
+            &root,
+            "rebind-candidate-only",
+            &candidate_id,
+            &relative
+        )
+        .unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// D2's core fix: a Build PASS that was rewound by
+    /// `invalidate_for_freshness` leaves its typed `build_output` in
+    /// `history` only — `gates` no longer carries it. Re-export of the same
+    /// candidate ID must succeed (not poisoned by the superseded event), and
+    /// binding must resume the instant a live `gates` record carries the
+    /// output again.
+    #[test]
+    fn rewound_history_only_build_output_does_not_poison_re_export() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-bound-rewound-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".mpd")).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let candidate_id = Digest::of_bytes(b"rewound-candidate").to_hex();
+        let relative = format!(".mpd/build-output/{candidate_id}/artifact");
+
+        let mut ledger = crate::ledger::Ledger::new(
+            "rebind-rewound",
+            "mpd",
+            false,
+            crate::ledger::ChangeKind::Fix,
+        );
+        let capture = stub_candidate_capture("rebind-rewound", &candidate_id);
+        let output = stub_build_output(&candidate_id, &relative);
+        ledger.history.push(crate::ledger::GateEvent {
+            phase: crate::phase::Phase::Build,
+            record: stub_gate_record(Some(capture.clone()), Some(output.clone())),
+        });
+        // `gates` deliberately does NOT carry Build — this is exactly what
+        // `invalidate_for_freshness` leaves behind after a freshness rewind.
+        crate::ledger::save(&root, &ledger).unwrap();
+
+        assert!(
+            !candidate_output_ledger_bound(&root, "rebind-rewound", &candidate_id, &relative)
+                .unwrap(),
+            "a history-only Build output must not bind re-export"
+        );
+
+        // A live re-record of Build (the freshly re-run Build passing again)
+        // makes it a real binding once more, at the same path.
+        ledger.gates.insert(
+            crate::phase::Phase::Build,
+            stub_gate_record(Some(capture), Some(output)),
+        );
+        crate::ledger::save(&root, &ledger).unwrap();
+        assert!(
+            candidate_output_ledger_bound(&root, "rebind-rewound", &candidate_id, &relative)
+                .unwrap(),
+            "a live gates Build output must bind"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Condition 4: a live `gates` binding at a DIFFERENT path still errors
+    /// (the anti-double-bind path-consistency check is unchanged).
+    #[test]
+    fn live_gates_build_output_at_a_different_path_still_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-bound-different-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".mpd")).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let candidate_id = Digest::of_bytes(b"different-path").to_hex();
+        let bound_path = format!(".mpd/build-output/{candidate_id}/artifact");
+
+        let mut ledger = crate::ledger::Ledger::new(
+            "rebind-different-path",
+            "mpd",
+            false,
+            crate::ledger::ChangeKind::Fix,
+        );
+        ledger.gates.insert(
+            crate::phase::Phase::Build,
+            stub_gate_record(
+                Some(stub_candidate_capture(
+                    "rebind-different-path",
+                    &candidate_id,
+                )),
+                Some(stub_build_output(&candidate_id, &bound_path)),
+            ),
+        );
+        crate::ledger::save(&root, &ledger).unwrap();
+
+        let error = candidate_output_ledger_bound(
+            &root,
+            "rebind-different-path",
+            &candidate_id,
+            "different/artifact/path",
+        )
+        .unwrap_err();
+        assert!(error.contains("different output path"), "{error}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn candidate_transaction_owns_output_across_precommit_and_cas_outcomes() {
@@ -10570,6 +10811,52 @@ mod tests {
             candidate_failure.report.blocker.as_deref(),
             Some("candidate test failed")
         );
+
+        // Condition 19: a PASSING non-Build profile must never attach a
+        // typed build_output. The guard at this call site is keyed on the
+        // configured profile name (`profile == candidate_policy.gates.build`)
+        // rather than a literal `Phase::Build` check, so this exercises the
+        // real invariant `candidate_output_ledger_bound`'s D2 binding
+        // predicate depends on: Build stays the only profile this ever
+        // happens for.
+        let security_code_pass = validate_candidate_profile_inner(
+            &root,
+            captured.root(),
+            &captured.projection.capture,
+            &candidate_policy.gates.security_code,
+            &candidate_policy,
+            |_, _, subject, _, _, _| {
+                Ok(ValidationReport {
+                    schema: VALIDATION_SCHEMA,
+                    subject: subject.clone(),
+                    profile: "security".into(),
+                    status: "passed".into(),
+                    receipt: Some(test_receipt(subject.clone(), "security")),
+                    blocker: None,
+                    counts: ValidationCountsV1 {
+                        total: 1,
+                        passed: 1,
+                        failed: 0,
+                        blocked: 0,
+                        not_run: 0,
+                    },
+                    actions: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(security_code_pass.report.status, "passed");
+        assert!(
+            security_code_pass.build_output.is_none(),
+            "only the configured Build profile may ever attach a typed build_output"
+        );
+        assert!(security_code_pass
+            .report
+            .receipt
+            .as_ref()
+            .unwrap()
+            .build_output
+            .is_none());
 
         let validation = validate_candidate_profile_inner(
             &root,
