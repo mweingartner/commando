@@ -248,6 +248,9 @@ pub enum CheckKind {
     Sast,
     Nonfunctional,
     SelfCheck,
+    /// The doc-staleness lane (design.md D3): the mandatory non-secret-scan
+    /// floor check for the opt-in `docs-build`/`docs-test` profiles.
+    DocCheck,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -272,6 +275,17 @@ pub struct GateProfiles {
     pub test: String,
     pub pre_push: String,
     pub high_risk_test: String,
+    /// Opt-in, proportionate lane for a proven documentation-only scope at
+    /// effective Low risk (design.md D3). Additive and defaulted: an absent
+    /// field parses and behaves byte-identically to today. Never wired into
+    /// this repository's own `.mpd/config.json` — adopting it is a
+    /// separate, high-rigor config change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_build: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_security_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_test: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]

@@ -31,6 +31,7 @@
 //! The archive-transaction executor (crash-safe journal/staging/recovery)
 //! lives in `openspec_core::transaction`, not here.
 
+use crate::config::CheckKind;
 use crate::digest::{self, Digest};
 use crate::git;
 use crate::ledger::{RiskAssessment, RiskLevel, Verdict};
@@ -2010,15 +2011,87 @@ pub fn evidence_validity(
     }
 }
 
-pub const RISK_CLASSIFIER_VERSION: u32 = 1;
+pub const RISK_CLASSIFIER_VERSION: u32 = 2;
+
+/// Whether `pattern` is a single, wildcard-stem markdown file at the
+/// repository root: exactly one path segment (no `/`), ending in the
+/// *literal* `.md`. `*.md`, `README.md`, `SECURITY.md`, and even the
+/// degenerate `**.md` (no `/` at all, so here `**` is just two stem
+/// wildcard characters, not the cross-segment glob token) all qualify;
+/// `*`, `*.*`, `*.m?`, and any multi-segment `**/*.md` do not (design.md
+/// D1 `root_markdown`; security-plan.md's prefix-escape analysis).
+fn root_markdown(pattern: &str) -> bool {
+    !pattern.contains('/') && pattern.ends_with(".md")
+}
+
+/// Whether `pattern` is provably safe under the D1 closed allowlist: a
+/// literal, case-sensitive, wildcard-free prefix of `docs/`,
+/// `openspec/specs/`, or this change's own `openspec/changes/<change>/`
+/// directory (trailing slash mandatory — `openspec/changes/<change>-evil/**`
+/// and the bare `openspec/changes/<change>` both fail this), or a root
+/// markdown file. Plain `str::starts_with` is a byte-exact comparison, so
+/// this rejects case variants (`Docs/**`), Unicode look-alikes (anything
+/// inserted right after the literal `docs` no longer starts with `docs/`),
+/// and leading-wildcard patterns (`**/docs/x`, `d*cs/**`) without any
+/// special-casing.
+fn doc_safe_pattern(pattern: &str, change: &str) -> bool {
+    pattern.starts_with("docs/")
+        || pattern.starts_with("openspec/specs/")
+        || pattern.starts_with(&format!("openspec/changes/{change}/"))
+        || root_markdown(pattern)
+}
+
+/// D1: is this change's *entire* declared scope (`paths ∪ shared_paths`)
+/// documentation-only? A closed allowlist, fail-closed conjunction — one
+/// non-qualifying pattern anywhere poisons the whole scope (design.md
+/// Condition 2) — and an empty scope is never documentation-only
+/// (Condition 11: `predicate(∅) = false`, by construction, not as an
+/// afterthought; the dangerous "fix" of making the empty scope qualify so
+/// a naively-stated conjunction law holds is deliberately not taken here —
+/// the conjunction/monotone-poisoning laws are instead exercised over
+/// non-empty operands and over the pure per-pattern `doc_safe_pattern`).
+///
+/// Trusts no caller (security-plan.md Condition 10 / Finding F1): this
+/// self-validates every pattern via [`digest::validate_canonical_path`]
+/// and the `change` argument via [`validate_change_name`] rather than
+/// assuming [`ChangeManifest::validate`] already ran anywhere upstream —
+/// [`load_manifest`] itself performs no validation.
+pub fn scope_is_documentation_only(manifest: &ChangeManifest, change: &str) -> bool {
+    if validate_change_name(change).is_err() {
+        return false;
+    }
+    if manifest.paths.is_empty() {
+        return false;
+    }
+    manifest
+        .paths
+        .iter()
+        .chain(manifest.shared_paths.iter())
+        .all(|pattern| {
+            digest::validate_canonical_path(pattern).is_ok() && doc_safe_pattern(pattern, change)
+        })
+}
 
 /// Derive the minimum review risk from declared scope and the small set of
 /// execution-bearing configuration signals. This deliberately classifies
 /// conservatively: an unknown path below a sensitive root is High.
+///
+/// `change` is the change whose own directory [`scope_is_documentation_only`]
+/// allows into scope (`openspec/changes/<change>/`, own directory only).
+/// When the manifest's entire declared scope is documentation-only,
+/// `derived` is forced to `Low` and every signal the v1 derivation would
+/// otherwise have produced is relabeled `suppressed:<signal>` rather than
+/// dropped — under a *proven* documentation-only scope every such signal is
+/// definitionally synthetic (a genuinely sensitive path would have made the
+/// predicate false instead, restoring full v1-identical derivation for the
+/// whole mixed scope: Condition 2's fail-closed conjunction). `effective =
+/// requested.max(derived)` is unchanged, so a requested Medium/High is never
+/// lowered (design.md D2, Conditions 3 and 13).
 pub fn classify_effective_risk(
     manifest: &ChangeManifest,
     config: &crate::config::Config,
     requested: RiskLevel,
+    change: &str,
 ) -> RiskAssessment {
     let mut reasons = Vec::new();
     let mut paths = manifest.paths.clone();
@@ -2099,10 +2172,29 @@ pub fn classify_effective_risk(
     }
     reasons.sort();
     reasons.dedup();
-    let derived = if reasons.is_empty() {
-        RiskLevel::Low
+    // D2: under a PROVEN documentation-only scope, every reason collected
+    // above can only have come from an allowlist-proven-safe path — any
+    // genuinely sensitive pattern would have made the predicate false,
+    // which falls through to the v1-identical `else` branch below with no
+    // suppression at all. So when the predicate holds, relabeling every
+    // collected reason as `suppressed:<reason>` is definitionally safe.
+    let predicate_holds = scope_is_documentation_only(manifest, change);
+    let (derived, reasons) = if predicate_holds {
+        let mut suppressed: Vec<String> = reasons
+            .iter()
+            .map(|reason| format!("suppressed:{reason}"))
+            .collect();
+        suppressed.sort();
+        let mut relabeled = vec!["documentation-only-scope".to_string()];
+        relabeled.extend(suppressed);
+        (RiskLevel::Low, relabeled)
     } else {
-        RiskLevel::High
+        let derived = if reasons.is_empty() {
+            RiskLevel::Low
+        } else {
+            RiskLevel::High
+        };
+        (derived, reasons)
     };
     let effective = requested.max(derived);
     let signal_bytes = serde_json::to_vec(&(
@@ -2111,6 +2203,7 @@ pub fn classify_effective_risk(
         &reasons,
         config.deploy.is_some(),
         config.local_validation.is_some(),
+        predicate_holds,
     ))
     .expect("risk classifier tuple is serializable");
     RiskAssessment {
@@ -2121,6 +2214,92 @@ pub fn classify_effective_risk(
         reasons,
         signal_digest: Digest::of_bytes(&signal_bytes).to_hex(),
     }
+}
+
+/// D3: choose the structured local-validation profile *name* for `phase`,
+/// applying the opt-in documentation lane only when `manifest` is
+/// documentation-only AND `effective` is *exactly* `RiskLevel::Low` (no
+/// `<= Medium` widening — Condition 13). The strict gate executor and the
+/// post-archive workflow status are this function's only two callers, and
+/// both MUST go through it (Condition 8) so they can never diverge on
+/// which profile a phase actually runs.
+///
+/// `manifest` and `effective` are caller-supplied rather than reloaded or
+/// re-derived here (Condition 12): callers are expected to hand in the
+/// manifest/assessment pair their own command already established. Because
+/// `docs_lane` is a conjunction of two independently-conservative facts —
+/// a *live* predicate re-check plus an `effective` value fixed earlier in
+/// the same command — any divergence between an earlier and later read can
+/// only ever add restriction, never remove it: a manifest that widens out
+/// of documentation-only between reads fails the live predicate outright
+/// (full profile), and a High `effective` fixed earlier can never
+/// retroactively become Low just because a later read looks narrower.
+///
+/// Returns the chosen profile's name, or an explicit config-policy blocker
+/// string (never a silent fallback) when a *selected* docs profile is
+/// missing its mandatory floor: at least one `secret-scan`-kind check
+/// always, plus at least one `doc-check`-kind check for `docs-build` and
+/// `docs-test` (design.md D3, Condition 4).
+pub fn select_gate_profile(
+    local: &crate::config::LocalValidationConfig,
+    phase: Phase,
+    manifest: &ChangeManifest,
+    change: &str,
+    effective: RiskLevel,
+) -> Result<String, String> {
+    let docs_lane = effective == RiskLevel::Low && scope_is_documentation_only(manifest, change);
+    let (full, docs, requires_doc_check) = match phase {
+        Phase::Build => (&local.gates.build, local.gates.docs_build.as_ref(), true),
+        Phase::SecurityCode => (
+            &local.gates.security_code,
+            local.gates.docs_security_code.as_ref(),
+            false,
+        ),
+        Phase::Test if effective == RiskLevel::High => {
+            return Ok(local.gates.high_risk_test.clone());
+        }
+        Phase::Test => (&local.gates.test, local.gates.docs_test.as_ref(), true),
+        other => {
+            return Err(format!(
+                "no structured profile selection is defined for phase {}",
+                other.label()
+            ))
+        }
+    };
+    let Some(docs_profile) = docs.filter(|_| docs_lane) else {
+        return Ok(full.clone());
+    };
+
+    // Selection-time floor (never config convention alone): resolve the
+    // docs profile's effective checks (post-`includes`) and require the
+    // mandatory kinds by content, not by name.
+    let checks = local.effective_checks(docs_profile)?;
+    let mut has_secret_scan = false;
+    let mut has_doc_check = false;
+    for check_name in &checks {
+        let kind = local
+            .checks
+            .get(check_name)
+            .ok_or_else(|| {
+                format!("docs profile {docs_profile:?} references unknown check {check_name:?}")
+            })?
+            .kind;
+        has_secret_scan |= kind == CheckKind::SecretScan;
+        has_doc_check |= kind == CheckKind::DocCheck;
+    }
+    if !has_secret_scan {
+        return Err(format!(
+            "config-policy blocker: docs profile {docs_profile:?} for {} omits a required secret-scan check",
+            phase.label()
+        ));
+    }
+    if requires_doc_check && !has_doc_check {
+        return Err(format!(
+            "config-policy blocker: docs profile {docs_profile:?} for {} omits a required doc-check check",
+            phase.label()
+        ));
+    }
+    Ok(docs_profile.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2761,7 +2940,7 @@ pub fn capture_dependency_values(
             ("tasks.md-normalized", task_bytes),
         ],
     )?;
-    let risk = classify_effective_risk(&manifest, config, ledger.governance.risk);
+    let risk = classify_effective_risk(&manifest, config, ledger.governance.risk, change);
     // Reconciliations authorize another attempt; they do not change the
     // approved threat model. Including them would make `mpd resolve` stale
     // Architecture immediately after recording the authorization. The stable
@@ -4394,12 +4573,24 @@ mod system_scope_tests {
 
 #[cfg(test)]
 mod risk_classifier_tests {
+    use super::scope_is_documentation_only_tests::{arb_allow_pattern, arb_deny_pattern};
+    use super::select_gate_profile_tests::{gates as fixture_gates, policy as fixture_policy};
     use super::*;
+    use proptest::prelude::*;
 
     fn manifest(path: &str) -> ChangeManifest {
         ChangeManifest {
             version: MANIFEST_SCHEMA,
             paths: vec![path.into()],
+            shared_paths: vec![],
+            publish: None,
+        }
+    }
+
+    fn manifest_many(paths: &[&str]) -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: paths.iter().map(|p| (*p).to_string()).collect(),
             shared_paths: vec![],
             publish: None,
         }
@@ -4423,6 +4614,7 @@ mod risk_classifier_tests {
                 &manifest(path),
                 &crate::config::Config::default(),
                 RiskLevel::Low,
+                "some-change",
             );
             assert_eq!(result.derived, RiskLevel::High, "{path}");
             assert_eq!(result.effective, RiskLevel::High, "{path}");
@@ -4437,8 +4629,12 @@ mod risk_classifier_tests {
             deploy: Some("install reviewed artifact".into()),
             ..Default::default()
         };
-        let result =
-            classify_effective_risk(&manifest(".mpd/config.json"), &config, RiskLevel::Low);
+        let result = classify_effective_risk(
+            &manifest(".mpd/config.json"),
+            &config,
+            RiskLevel::Low,
+            "some-change",
+        );
         assert_eq!(result.requested, RiskLevel::Low);
         assert_eq!(result.derived, RiskLevel::High);
         assert_eq!(result.effective, RiskLevel::High);
@@ -4448,6 +4644,1014 @@ mod risk_classifier_tests {
     fn source_is_not_a_security_plan_dependency() {
         assert!(!DependencyPolicy::for_phase(Phase::SecurityPlan).contains(&DependencyKey::Source));
         assert!(DependencyPolicy::for_phase(Phase::SecurityCode).contains(&DependencyKey::Source));
+    }
+
+    // -----------------------------------------------------------------
+    // D2 / classifier v2: documentation-only scope suppresses synthetic
+    // signals (design.md Conditions 3, 7, 13; security-plan.md Condition 11).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classifier_version_is_bumped_to_2() {
+        assert_eq!(RISK_CLASSIFIER_VERSION, 2);
+        let result = classify_effective_risk(
+            &manifest("docs/readme.md"),
+            &crate::config::Config::default(),
+            RiskLevel::Low,
+            "some-change",
+        );
+        assert_eq!(result.classifier_version, 2);
+    }
+
+    #[test]
+    fn documentation_only_scope_on_a_deployment_configured_repo_derives_low() {
+        // The exact repro from design.md's Context: a deployment-configured
+        // repo (both synthetic signals fire under v1) with a pure docs scope
+        // must resolve derived/effective Low at requested Low.
+        let config = crate::config::Config {
+            deploy: Some("install reviewed artifact".into()),
+            ..Default::default()
+        };
+        let result = classify_effective_risk(
+            &manifest_many(&["docs/**", "openspec/changes/some-change/**"]),
+            &config,
+            RiskLevel::Low,
+            "some-change",
+        );
+        assert_eq!(result.derived, RiskLevel::Low);
+        assert_eq!(result.effective, RiskLevel::Low);
+        assert_eq!(result.reasons[0], "documentation-only-scope");
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r == "suppressed:deployment-configured"),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    #[test]
+    fn false_cognate_keyword_hits_on_doc_paths_are_suppressed_not_dropped() {
+        // `openspec/specs/process-governance/spec.md` fires the
+        // "process-execution" keyword category purely because the filename
+        // contains "process" — the false-cognate design.md calls out. Under
+        // a proven doc-only scope it must be suppressed, never silently
+        // discarded (the `suppressed:` marker keeps it auditable).
+        let result = classify_effective_risk(
+            &manifest("openspec/specs/process-governance/spec.md"),
+            &crate::config::Config::default(),
+            RiskLevel::Low,
+            "some-change",
+        );
+        assert_eq!(result.derived, RiskLevel::Low);
+        assert_eq!(result.effective, RiskLevel::Low);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|r| r.starts_with("suppressed:process-execution:")),
+            "{:?}",
+            result.reasons
+        );
+    }
+
+    #[test]
+    fn predicate_true_never_lowers_a_requested_medium_or_high() {
+        for requested in [RiskLevel::Medium, RiskLevel::High] {
+            let result = classify_effective_risk(
+                &manifest("docs/readme.md"),
+                &crate::config::Config::default(),
+                requested,
+                "some-change",
+            );
+            assert_eq!(result.derived, RiskLevel::Low, "{requested:?}");
+            assert_eq!(result.requested, requested);
+            assert_eq!(result.effective, requested, "{requested:?}");
+        }
+    }
+
+    #[test]
+    fn each_condition_5_deny_pattern_keeps_full_unsuppressed_derivation_alongside_a_doc_pattern() {
+        // Condition 2: one non-qualifying pattern anywhere poisons the whole
+        // scope back to v1-identical derivation — verified across the full
+        // negative corpus named in Conditions 5 and 10, each paired with a
+        // legitimate doc pattern so the mix, not just the single pattern, is
+        // under test.
+        let config = crate::config::Config {
+            deploy: Some("install reviewed artifact".into()),
+            ..Default::default()
+        };
+        for deny in [
+            "crates/**",
+            "security/**",
+            ".githooks/**",
+            ".mpd/config.json",
+            ".mpd/**",
+            "scripts/**",
+            "Cargo.toml",
+            "Cargo.lock",
+            ".github/**",
+            "openspec/schemas/**",
+            "openspec/changes/other-change/**",
+            "Docs/**",
+            "**/docs/x",
+            "d*cs/**",
+            "openspec/changes/some-change",
+            "openspec/changes/some-change-evil/**",
+            "docs/../crates/**",
+            "docs//x",
+            "docs/./x",
+        ] {
+            let result = classify_effective_risk(
+                &manifest_many(&["docs/readme.md", deny]),
+                &config,
+                RiskLevel::Low,
+                "some-change",
+            );
+            assert_eq!(result.derived, RiskLevel::High, "{deny}");
+            assert_eq!(result.effective, RiskLevel::High, "{deny}");
+            assert!(
+                result
+                    .reasons
+                    .contains(&"deployment-configured".to_string()),
+                "{deny}: {:?}",
+                result.reasons
+            );
+            assert!(
+                !result
+                    .reasons
+                    .iter()
+                    .any(|r| r == "documentation-only-scope"),
+                "{deny}: {:?}",
+                result.reasons
+            );
+        }
+    }
+
+    #[test]
+    fn empty_scope_never_suppresses_even_when_no_keyword_reason_fires() {
+        // Condition 11 / F2: an empty `paths` is never documentation-only,
+        // so the classifier must fall through to v1-identical derivation —
+        // here that derivation happens to still be Low (no signal at all),
+        // but critically it is NOT the suppressed/doc-only Low: no
+        // `documentation-only-scope` marker is present.
+        let manifest = ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: vec![],
+            shared_paths: vec![],
+            publish: None,
+        };
+        let result = classify_effective_risk(
+            &manifest,
+            &crate::config::Config::default(),
+            RiskLevel::Low,
+            "some-change",
+        );
+        assert_eq!(result.derived, RiskLevel::Low);
+        assert!(!result
+            .reasons
+            .iter()
+            .any(|r| r == "documentation-only-scope"));
+    }
+
+    #[test]
+    fn signal_digest_changes_when_the_predicate_flips_for_the_same_underlying_signal() {
+        let config = crate::config::Config {
+            deploy: Some("install reviewed artifact".into()),
+            ..Default::default()
+        };
+        let doc_only = classify_effective_risk(
+            &manifest("docs/readme-notes.md"),
+            &config,
+            RiskLevel::Low,
+            "some-change",
+        );
+        let mixed = classify_effective_risk(
+            &manifest_many(&["docs/readme-notes.md", "crates/**"]),
+            &config,
+            RiskLevel::Low,
+            "some-change",
+        );
+        assert_ne!(doc_only.signal_digest, mixed.signal_digest);
+        assert_eq!(doc_only.derived, RiskLevel::Low);
+        assert_eq!(mixed.derived, RiskLevel::High);
+    }
+
+    // -----------------------------------------------------------------
+    // C1 (security-code.md F-1; design.md Conditions 3, 6, 7): seeded
+    // classifier-level property tests over scopes drawn from the shared
+    // allow ∪ deny pattern corpora × every requested level × both
+    // synthetic-signal config bits. These sweep the classifier's OWN
+    // computation — `ledger.rs::effective_risk_max_law` exercises only
+    // the abstract `RiskLevel::max` ordinal law and never calls
+    // `classify_effective_risk`. Failing seeds persist to
+    // `crates/mpd/proptest-regressions/closure.txt` (proptest's default
+    // persistence, same as the existing suites in this crate).
+    // -----------------------------------------------------------------
+
+    fn manifest_of(paths: Vec<String>, shared_paths: Vec<String>) -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths,
+            shared_paths,
+            publish: None,
+        }
+    }
+
+    /// A config whose two synthetic v1 signals are individually
+    /// steerable: `deploy` drives `deployment-configured`, and the
+    /// fixture `local_validation` (its `deploy_output` is `None`, keeping
+    /// the two bits independent) drives
+    /// `local-validation-process-hook-sandbox-policy`.
+    fn config_with(deploy: bool, local_validation: bool) -> crate::config::Config {
+        crate::config::Config {
+            deploy: deploy.then(|| "install reviewed artifact".to_string()),
+            local_validation: local_validation
+                .then(|| fixture_policy(fixture_gates(false), vec![])),
+            ..Default::default()
+        }
+    }
+
+    fn arb_requested_risk() -> impl Strategy<Value = RiskLevel> {
+        prop_oneof![
+            Just(RiskLevel::Low),
+            Just(RiskLevel::Medium),
+            Just(RiskLevel::High),
+        ]
+    }
+
+    fn arb_scope_pattern() -> impl Strategy<Value = String> {
+        prop_oneof![arb_allow_pattern(), arb_deny_pattern()]
+    }
+
+    proptest! {
+        /// Max-law at the classifier level (Condition 3) plus
+        /// suppression-iff-predicate (Condition 6): for ANY scope and ANY
+        /// requested level, the classifier's own `effective` is exactly
+        /// `max(requested, derived)` — a requested level is never lowered
+        /// — and the `documentation-only-scope` marker plus `suppressed:`
+        /// relabels appear precisely when `scope_is_documentation_only`
+        /// holds. When the predicate is false (any sensitive pattern
+        /// anywhere, in `paths` or `shared_paths`), nothing is suppressed
+        /// and the derivation is v1-identical: High iff any reason fired.
+        #[test]
+        fn classifier_max_law_holds_and_suppression_occurs_iff_the_predicate_holds(
+            paths in prop::collection::vec(arb_scope_pattern(), 1..5),
+            shared_paths in prop::collection::vec(arb_scope_pattern(), 0..3),
+            requested in arb_requested_risk(),
+            deploy_configured in any::<bool>(),
+            local_validation_configured in any::<bool>(),
+        ) {
+            let change = "proptest-change";
+            let manifest = manifest_of(paths, shared_paths);
+            let config = config_with(deploy_configured, local_validation_configured);
+            let predicate = scope_is_documentation_only(&manifest, change);
+            let result = classify_effective_risk(&manifest, &config, requested, change);
+
+            // The max-law, on the classifier's own output.
+            prop_assert_eq!(result.requested, requested);
+            prop_assert_eq!(result.effective, result.requested.max(result.derived));
+            prop_assert!(result.effective.rank() >= result.requested.rank());
+            prop_assert!(result.effective.rank() >= result.derived.rank());
+
+            // Suppression iff predicate.
+            let doc_marker = result.reasons.iter().any(|r| r == "documentation-only-scope");
+            let any_suppressed = result.reasons.iter().any(|r| r.starts_with("suppressed:"));
+            prop_assert_eq!(doc_marker, predicate);
+            if predicate {
+                prop_assert_eq!(result.derived, RiskLevel::Low);
+                for reason in &result.reasons {
+                    prop_assert!(
+                        reason == "documentation-only-scope"
+                            || reason.starts_with("suppressed:"),
+                        "raw reason under a proven documentation-only scope: {}",
+                        reason
+                    );
+                }
+                let deploy_suppressed = result
+                    .reasons
+                    .iter()
+                    .any(|r| r == "suppressed:deployment-configured");
+                prop_assert_eq!(deploy_suppressed, deploy_configured);
+                let lv_suppressed = result.reasons.iter().any(|r| {
+                    r == "suppressed:local-validation-process-hook-sandbox-policy"
+                });
+                prop_assert_eq!(lv_suppressed, local_validation_configured);
+            } else {
+                prop_assert!(!any_suppressed);
+                prop_assert_eq!(
+                    result.derived == RiskLevel::High,
+                    !result.reasons.is_empty()
+                );
+                let deploy_raw = result
+                    .reasons
+                    .contains(&"deployment-configured".to_string());
+                prop_assert_eq!(deploy_raw, deploy_configured);
+                let lv_raw = result
+                    .reasons
+                    .contains(&"local-validation-process-hook-sandbox-policy".to_string());
+                prop_assert_eq!(lv_raw, local_validation_configured);
+            }
+        }
+
+        /// Digest sensitivity, version half (Condition 7): recomputing the
+        /// exact v2 tuple pins that the classifier version, the relabeled
+        /// reasons, both config bits, AND the predicate outcome are all in
+        /// the digest preimage — and a v1 world's digest for the SAME
+        /// scope and config (version 1, raw un-relabeled reasons, no
+        /// predicate field) never equals v2's, so a v1↔v2 assessment can
+        /// never collide or replay in either direction.
+        #[test]
+        fn signal_digest_binds_the_classifier_version_and_never_collides_with_a_v1_world(
+            paths in prop::collection::vec(arb_scope_pattern(), 1..5),
+            requested in arb_requested_risk(),
+            deploy_configured in any::<bool>(),
+            local_validation_configured in any::<bool>(),
+        ) {
+            let change = "proptest-change";
+            let manifest = manifest_of(paths.clone(), vec![]);
+            let config = config_with(deploy_configured, local_validation_configured);
+            let predicate = scope_is_documentation_only(&manifest, change);
+            let result = classify_effective_risk(&manifest, &config, requested, change);
+
+            let mut sorted_paths = paths;
+            sorted_paths.sort();
+            sorted_paths.dedup();
+            let v2_bytes = serde_json::to_vec(&(
+                RISK_CLASSIFIER_VERSION,
+                &sorted_paths,
+                &result.reasons,
+                deploy_configured,
+                local_validation_configured,
+                predicate,
+            ))
+            .expect("v2 risk classifier tuple is serializable");
+            prop_assert_eq!(
+                Digest::of_bytes(&v2_bytes).to_hex(),
+                result.signal_digest.clone()
+            );
+
+            // Reconstruct what v1 recorded for the same inputs: version 1,
+            // the raw (never-relabeled) reasons, and no predicate field.
+            let v1_reasons: Vec<String> = if predicate {
+                result
+                    .reasons
+                    .iter()
+                    .filter(|reason| reason.as_str() != "documentation-only-scope")
+                    .map(|reason| reason.trim_start_matches("suppressed:").to_string())
+                    .collect()
+            } else {
+                result.reasons.clone()
+            };
+            let v1_bytes = serde_json::to_vec(&(
+                1u32,
+                &sorted_paths,
+                &v1_reasons,
+                deploy_configured,
+                local_validation_configured,
+            ))
+            .expect("v1 risk classifier tuple is serializable");
+            prop_assert_ne!(
+                Digest::of_bytes(&v1_bytes).to_hex(),
+                result.signal_digest.clone()
+            );
+        }
+
+        /// Digest sensitivity, suppression half (Conditions 6 and 7): with
+        /// the declared path scope held byte-identical, flipping ONLY the
+        /// predicate outcome (the own-change-dir pattern is doc-safe
+        /// solely for its own change) or ONLY the suppressed set (toggling
+        /// the deploy bit under a true predicate) always moves
+        /// `signal_digest` — a suppressed assessment can never collide
+        /// with or replay as an unsuppressed one.
+        #[test]
+        fn same_scope_digest_diverges_when_only_the_predicate_or_suppressed_set_flips(
+            decoration in prop::collection::vec(arb_allow_pattern(), 0..3),
+            requested in arb_requested_risk(),
+            deploy_configured in any::<bool>(),
+        ) {
+            let mut paths = decoration;
+            paths.push("openspec/changes/proptest-change/**".to_string());
+            let manifest = manifest_of(paths, vec![]);
+            let config = config_with(deploy_configured, false);
+
+            // Same manifest bytes; own change vs another change flips ONLY
+            // the predicate outcome.
+            let own = classify_effective_risk(&manifest, &config, requested, "proptest-change");
+            let other = classify_effective_risk(&manifest, &config, requested, "other-change");
+            prop_assert!(scope_is_documentation_only(&manifest, "proptest-change"));
+            prop_assert!(!scope_is_documentation_only(&manifest, "other-change"));
+            prop_assert_ne!(own.signal_digest.clone(), other.signal_digest);
+
+            // Predicate held true; toggling the deploy bit flips ONLY the
+            // suppressed set ({} vs {deployment-configured}).
+            let toggled_config = config_with(!deploy_configured, false);
+            let toggled =
+                classify_effective_risk(&manifest, &toggled_config, requested, "proptest-change");
+            prop_assert_ne!(own.signal_digest, toggled.signal_digest);
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_is_documentation_only_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn manifest_of(paths: Vec<String>) -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths,
+            shared_paths: Vec::new(),
+            publish: None,
+        }
+    }
+
+    fn owned(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    // Condition 1/6: the D1 allowlist corpus — every one of these, alone,
+    // is documentation-only for change "my-change".
+    const ALLOW_CORPUS: &[&str] = &[
+        "docs/**",
+        "docs/guide/*.md",
+        "docs/x",
+        "openspec/specs/**",
+        "openspec/specs/thing/spec.md",
+        "openspec/changes/my-change/design.md",
+        "openspec/changes/my-change/**",
+        "README.md",
+        "SECURITY.md",
+        "*.md",
+        "**.md",
+    ];
+
+    // Condition 5/10: the extended deny corpus — every one of these, alone,
+    // is NOT documentation-only for change "my-change".
+    const DENY_CORPUS: &[&str] = &[
+        "crates/**",
+        "security/**",
+        ".githooks/**",
+        ".mpd/config.json",
+        ".mpd/**",
+        "scripts/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".github/**",
+        "openspec/schemas/**",
+        "openspec/changes/other-change/**",
+        "README",
+        "*",
+        "**",
+        "*.*",
+        "*.m?",
+        "Docs/**",
+        "**/docs/x",
+        "d*cs/**",
+        "openspec/changes/my-change",
+        "openspec/changes/my-change-evil/**",
+        "docs/../crates/**",
+        "docs//x",
+        "docs/./x",
+        "docs\\evil",
+        "docs/\u{1}evil",
+        "docs\u{200B}/x",
+    ];
+
+    #[test]
+    fn predicate_allows_the_documented_corpus() {
+        for pattern in ALLOW_CORPUS {
+            assert!(
+                scope_is_documentation_only(
+                    &manifest_of(vec![(*pattern).to_string()]),
+                    "my-change"
+                ),
+                "expected safe: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_denies_the_full_deny_corpus() {
+        for pattern in DENY_CORPUS {
+            assert!(
+                !scope_is_documentation_only(
+                    &manifest_of(vec![(*pattern).to_string()]),
+                    "my-change"
+                ),
+                "expected NOT safe: {pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlong_pattern_is_not_safe() {
+        let long = "a".repeat(digest::MAX_PATH_BYTES + 1);
+        assert!(!scope_is_documentation_only(
+            &manifest_of(vec![long]),
+            "my-change"
+        ));
+    }
+
+    #[test]
+    fn empty_paths_is_never_documentation_only_even_with_safe_shared_paths() {
+        let manifest = ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: Vec::new(),
+            shared_paths: owned(&["docs/**", "README.md"]),
+            publish: None,
+        };
+        assert!(!scope_is_documentation_only(&manifest, "my-change"));
+    }
+
+    #[test]
+    fn one_deny_pattern_in_shared_paths_poisons_an_otherwise_safe_paths_list() {
+        let manifest = ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: owned(&["docs/**"]),
+            shared_paths: owned(&["crates/**"]),
+            publish: None,
+        };
+        assert!(!scope_is_documentation_only(&manifest, "my-change"));
+    }
+
+    #[test]
+    fn own_change_dir_is_own_dir_only_not_a_sibling_or_cross_change() {
+        let manifest = manifest_of(vec!["openspec/changes/my-change/design.md".to_string()]);
+        assert!(scope_is_documentation_only(&manifest, "my-change"));
+        assert!(!scope_is_documentation_only(&manifest, "other-change"));
+    }
+
+    #[test]
+    fn invalid_change_names_fail_closed_regardless_of_scope() {
+        let manifest = manifest_of(vec!["docs/readme.md".to_string()]);
+        for bad_change in [
+            "",
+            "Not-Kebab",
+            "a--b",
+            "-leading",
+            "trailing-",
+            "has/slash",
+            "1-leads",
+        ] {
+            assert!(
+                !scope_is_documentation_only(&manifest, bad_change),
+                "expected fail-closed for change {bad_change:?}"
+            );
+        }
+    }
+
+    pub(super) fn arb_allow_pattern() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("docs/a".to_string()),
+            Just("docs/a/b.rs".to_string()),
+            Just("docs/**".to_string()),
+            Just("openspec/specs/x".to_string()),
+            Just("openspec/specs/x/spec.md".to_string()),
+            Just("openspec/changes/proptest-change/x".to_string()),
+            Just("openspec/changes/proptest-change/**".to_string()),
+            Just("README.md".to_string()),
+            Just("*.md".to_string()),
+        ]
+    }
+
+    pub(super) fn arb_deny_pattern() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("crates/mpd/src/config/mod.rs".to_string()),
+            Just("security/policy.yaml".to_string()),
+            Just(".githooks/pre-commit".to_string()),
+            Just(".mpd/config.json".to_string()),
+            Just("scripts/deploy.sh".to_string()),
+            Just("Cargo.toml".to_string()),
+            Just("Cargo.lock".to_string()),
+            Just(".github/workflows/ci.yml".to_string()),
+            Just("openspec/schemas/mpd/schema.yaml".to_string()),
+            Just("openspec/changes/other-change/manifest.json".to_string()),
+            Just("README".to_string()),
+            Just("Docs/readme.md".to_string()),
+            Just("**/docs/x".to_string()),
+            Just("openspec/changes/proptest-change".to_string()),
+            Just("openspec/changes/proptest-change-evil/x".to_string()),
+        ]
+    }
+
+    proptest! {
+        /// Condition 6/11: restated over non-empty operands (F2's fix), the
+        /// scope predicate is exactly the conjunction of the pure
+        /// per-pattern `doc_safe_pattern` (plus self-validation) over the
+        /// union.
+        #[test]
+        fn conjunction_law_over_nonempty_scopes(
+            left in prop::collection::vec(prop_oneof![arb_allow_pattern(), arb_deny_pattern()], 1..4),
+            right in prop::collection::vec(prop_oneof![arb_allow_pattern(), arb_deny_pattern()], 1..4),
+        ) {
+            let change = "proptest-change";
+            let combined: Vec<String> = left.iter().cloned().chain(right.iter().cloned()).collect();
+            let left_safe = scope_is_documentation_only(&manifest_of(left.clone()), change);
+            let right_safe = scope_is_documentation_only(&manifest_of(right.clone()), change);
+            let combined_safe = scope_is_documentation_only(&manifest_of(combined), change);
+            prop_assert_eq!(combined_safe, left_safe && right_safe);
+        }
+
+        /// Condition 6: monotone poisoning — starting from a non-empty
+        /// not-safe scope, adding any further pattern never flips it safe.
+        /// (The empty-scope boundary is deliberately excluded here and
+        /// covered by its own dedicated test above — Condition 11/F2.)
+        #[test]
+        fn monotone_poisoning_from_nonempty_not_safe(
+            base in prop::collection::vec(prop_oneof![arb_allow_pattern(), arb_deny_pattern()], 1..4),
+            extra in prop_oneof![arb_allow_pattern(), arb_deny_pattern()],
+        ) {
+            let change = "proptest-change";
+            prop_assume!(!scope_is_documentation_only(&manifest_of(base.clone()), change));
+            let mut widened = base;
+            widened.push(extra);
+            prop_assert!(!scope_is_documentation_only(&manifest_of(widened), change));
+        }
+
+        /// Condition 11/F2, restated as a property: the empty scope is
+        /// never documentation-only, no matter what (safe) content sits in
+        /// `shared_paths` alone.
+        #[test]
+        fn empty_paths_is_never_documentation_only_property(
+            shared in prop::collection::vec(arb_allow_pattern(), 0..3)
+        ) {
+            let manifest = ChangeManifest {
+                version: MANIFEST_SCHEMA,
+                paths: Vec::new(),
+                shared_paths: shared,
+                publish: None,
+            };
+            prop_assert!(!scope_is_documentation_only(&manifest, "proptest-change"));
+        }
+
+        /// Condition 6: every allow-corpus pattern, alone, is safe.
+        #[test]
+        fn allow_corpus_pattern_is_always_safe(pattern in arb_allow_pattern()) {
+            prop_assert!(scope_is_documentation_only(&manifest_of(vec![pattern]), "proptest-change"));
+        }
+
+        /// Condition 6: a deny-corpus pattern is never safe, even decorated
+        /// with arbitrarily many additional (possibly safe) patterns.
+        #[test]
+        fn deny_corpus_pattern_is_never_safe_under_decoration(
+            deny in arb_deny_pattern(),
+            decoration in prop::collection::vec(arb_allow_pattern(), 0..3),
+        ) {
+            let mut patterns = decoration;
+            patterns.push(deny);
+            prop_assert!(!scope_is_documentation_only(&manifest_of(patterns), "proptest-change"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod select_gate_profile_tests {
+    use super::*;
+    use crate::config::{
+        CheckConfig, EnvironmentAllowlist, GateProfiles, HookPolicyConfig, LocalValidationConfig,
+        NetworkAdapter, OfflinePolicyConfig, ProfileConfig, ReceiptLimits, RequiredToolchainConfig,
+        ResourceLimitsConfig, ResultPolicy, SandboxPolicyConfig, ToolConfig, ToolRequirement,
+    };
+    use std::collections::BTreeMap;
+
+    pub(super) fn gates(docs: bool) -> GateProfiles {
+        GateProfiles {
+            build: "build".into(),
+            security_code: "security".into(),
+            test: "test".into(),
+            pre_push: "test".into(),
+            high_risk_test: "high".into(),
+            docs_build: docs.then(|| "docs-build".to_string()),
+            docs_security_code: docs.then(|| "docs-security".to_string()),
+            docs_test: docs.then(|| "docs-test".to_string()),
+        }
+    }
+
+    fn docs_profile(checks: &[&str]) -> ProfileConfig {
+        ProfileConfig {
+            includes: Vec::new(),
+            checks: checks.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    pub(super) fn policy(
+        gates: GateProfiles,
+        extra_profiles: Vec<(&str, ProfileConfig)>,
+    ) -> LocalValidationConfig {
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "true".to_string(),
+            ToolConfig {
+                program: "true".into(),
+                version_args: Vec::new(),
+                requirement: ToolRequirement::Required,
+                install_hint: "fixture".into(),
+            },
+        );
+        let mut checks = BTreeMap::new();
+        for (name, kind) in [
+            ("format", CheckKind::Format),
+            ("lint", CheckKind::Lint),
+            ("test", CheckKind::Test),
+            ("release-build", CheckKind::ReleaseBuild),
+            ("dependency-audit", CheckKind::DependencyAudit),
+            ("secret-scan", CheckKind::SecretScan),
+            ("sast", CheckKind::Sast),
+            ("self-check", CheckKind::SelfCheck),
+            ("nonfunctional", CheckKind::Nonfunctional),
+            ("doc-staleness", CheckKind::DocCheck),
+        ] {
+            checks.insert(
+                name.to_string(),
+                CheckConfig {
+                    kind,
+                    program: "true".into(),
+                    args: Vec::new(),
+                    timeout_secs: 1,
+                    result_policy: ResultPolicy::ExitZero,
+                    output: None,
+                },
+            );
+        }
+        let full: Vec<String> = [
+            "format",
+            "lint",
+            "test",
+            "release-build",
+            "dependency-audit",
+            "secret-scan",
+            "sast",
+            "self-check",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "build".to_string(),
+            ProfileConfig {
+                includes: Vec::new(),
+                checks: full.clone(),
+            },
+        );
+        profiles.insert(
+            "security".to_string(),
+            ProfileConfig {
+                includes: Vec::new(),
+                checks: full.clone(),
+            },
+        );
+        profiles.insert(
+            "test".to_string(),
+            ProfileConfig {
+                includes: Vec::new(),
+                checks: full,
+            },
+        );
+        profiles.insert(
+            "high".to_string(),
+            ProfileConfig {
+                includes: vec!["test".to_string()],
+                checks: vec!["nonfunctional".to_string()],
+            },
+        );
+        for (name, profile) in extra_profiles {
+            profiles.insert(name.to_string(), profile);
+        }
+        LocalValidationConfig {
+            schema: 1,
+            required_toolchain: RequiredToolchainConfig {
+                rust_release: "1.91.0".into(),
+                host: None,
+                components: vec!["true".into()],
+            },
+            tools,
+            checks,
+            profiles,
+            gates,
+            hooks: HookPolicyConfig {
+                path: ".githooks".into(),
+                require_bundled: true,
+            },
+            receipts: ReceiptLimits {
+                log_count_cap: 16,
+                log_byte_cap: 1024,
+            },
+            offline: OfflinePolicyConfig {
+                cargo_lock: "Cargo.lock".into(),
+                cargo_target: "aarch64-apple-darwin".into(),
+                advisory_db_path: "mpd/advisory-db".into(),
+                advisory_revision: "a".repeat(40),
+                advisory_tree: "b".repeat(40),
+                advisory_max_age_days: 30,
+            },
+            sandbox: SandboxPolicyConfig {
+                contract_version: 1,
+                network_adapter: NetworkAdapter::PlatformMandatory,
+                environment_allowlist: EnvironmentAllowlist(vec!["PATH".into()]),
+            },
+            limits: ResourceLimitsConfig {
+                checks_per_profile: 16,
+                aggregate_secs: 64,
+                output_bytes: 1024,
+                log_bytes: 1024,
+                worktree_bytes: 1024 * 1024,
+                child_processes: 32,
+                child_open_files: 64,
+                child_file_bytes: 1024 * 1024,
+            },
+            build_output: None,
+            deploy_output: None,
+        }
+    }
+
+    fn doc_manifest() -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: vec!["docs/**".to_string()],
+            shared_paths: vec![],
+            publish: None,
+        }
+    }
+
+    fn mixed_manifest() -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths: vec!["docs/**".to_string(), "crates/**".to_string()],
+            shared_paths: vec![],
+            publish: None,
+        }
+    }
+
+    fn full_docs_profiles() -> Vec<(&'static str, ProfileConfig)> {
+        vec![
+            (
+                "docs-build",
+                docs_profile(&["format", "doc-staleness", "secret-scan"]),
+            ),
+            ("docs-security", docs_profile(&["secret-scan"])),
+            (
+                "docs-test",
+                docs_profile(&["format", "doc-staleness", "secret-scan"]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn unconfigured_docs_fields_select_exactly_todays_profiles() {
+        let local = policy(gates(false), vec![]);
+        let manifest = doc_manifest();
+        for (phase, expected) in [
+            (Phase::Build, "build"),
+            (Phase::SecurityCode, "security"),
+            (Phase::Test, "test"),
+        ] {
+            let chosen =
+                select_gate_profile(&local, phase, &manifest, "my-change", RiskLevel::Low).unwrap();
+            assert_eq!(chosen, expected, "{phase:?}");
+        }
+        let chosen =
+            select_gate_profile(&local, Phase::Test, &manifest, "my-change", RiskLevel::High)
+                .unwrap();
+        assert_eq!(chosen, "high");
+    }
+
+    #[test]
+    fn configured_docs_lane_selects_docs_profiles_for_a_doc_only_low_scope() {
+        let local = policy(gates(true), full_docs_profiles());
+        let manifest = doc_manifest();
+        assert_eq!(
+            select_gate_profile(&local, Phase::Build, &manifest, "my-change", RiskLevel::Low)
+                .unwrap(),
+            "docs-build"
+        );
+        assert_eq!(
+            select_gate_profile(
+                &local,
+                Phase::SecurityCode,
+                &manifest,
+                "my-change",
+                RiskLevel::Low
+            )
+            .unwrap(),
+            "docs-security"
+        );
+        assert_eq!(
+            select_gate_profile(&local, Phase::Test, &manifest, "my-change", RiskLevel::Low)
+                .unwrap(),
+            "docs-test"
+        );
+    }
+
+    #[test]
+    fn mixed_scope_falls_back_to_full_profiles_even_when_docs_lane_is_configured() {
+        let local = policy(gates(true), full_docs_profiles());
+        let manifest = mixed_manifest();
+        for (phase, expected) in [
+            (Phase::Build, "build"),
+            (Phase::SecurityCode, "security"),
+            (Phase::Test, "test"),
+        ] {
+            assert_eq!(
+                select_gate_profile(&local, phase, &manifest, "my-change", RiskLevel::Low).unwrap(),
+                expected,
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn medium_or_high_effective_risk_excludes_the_docs_lane_even_for_a_pure_doc_scope() {
+        let local = policy(gates(true), full_docs_profiles());
+        let manifest = doc_manifest();
+        assert_eq!(
+            select_gate_profile(
+                &local,
+                Phase::Build,
+                &manifest,
+                "my-change",
+                RiskLevel::Medium
+            )
+            .unwrap(),
+            "build",
+            "Condition 13: Medium must not widen into the docs lane"
+        );
+        assert_eq!(
+            select_gate_profile(&local, Phase::Test, &manifest, "my-change", RiskLevel::High)
+                .unwrap(),
+            "high"
+        );
+    }
+
+    #[test]
+    fn docs_profile_missing_secret_scan_blocks_loudly_rather_than_falling_back() {
+        let local = policy(
+            gates(true),
+            vec![("docs-build", docs_profile(&["format", "doc-staleness"]))],
+        );
+        let manifest = doc_manifest();
+        let error =
+            select_gate_profile(&local, Phase::Build, &manifest, "my-change", RiskLevel::Low)
+                .unwrap_err();
+        assert!(error.contains("secret-scan"), "{error}");
+    }
+
+    #[test]
+    fn docs_build_missing_doc_check_blocks_loudly() {
+        let local = policy(
+            gates(true),
+            vec![("docs-build", docs_profile(&["format", "secret-scan"]))],
+        );
+        let manifest = doc_manifest();
+        let error =
+            select_gate_profile(&local, Phase::Build, &manifest, "my-change", RiskLevel::Low)
+                .unwrap_err();
+        assert!(error.contains("doc-check"), "{error}");
+    }
+
+    #[test]
+    fn docs_security_code_does_not_require_a_doc_check() {
+        let local = policy(
+            gates(true),
+            vec![("docs-security", docs_profile(&["secret-scan"]))],
+        );
+        let manifest = doc_manifest();
+        assert_eq!(
+            select_gate_profile(
+                &local,
+                Phase::SecurityCode,
+                &manifest,
+                "my-change",
+                RiskLevel::Low
+            )
+            .unwrap(),
+            "docs-security"
+        );
+    }
+
+    #[test]
+    fn both_call_sites_share_one_deterministic_helper() {
+        // Condition 8: the strict gate executor and workflow status both
+        // call this exact function — pinned here as a pure, deterministic
+        // contract so neither call site can quietly diverge.
+        let local = policy(
+            gates(true),
+            vec![(
+                "docs-build",
+                docs_profile(&["format", "doc-staleness", "secret-scan"]),
+            )],
+        );
+        let manifest = doc_manifest();
+        let first =
+            select_gate_profile(&local, Phase::Build, &manifest, "my-change", RiskLevel::Low)
+                .unwrap();
+        let second =
+            select_gate_profile(&local, Phase::Build, &manifest, "my-change", RiskLevel::Low)
+                .unwrap();
+        assert_eq!(first, second);
     }
 }
 

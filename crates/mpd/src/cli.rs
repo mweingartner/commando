@@ -1554,21 +1554,52 @@ fn workflow_status(
                 )
             }
             Some(local) => {
-                let profile = if ledger.effective_risk() == RiskLevel::High {
-                    &local.gates.high_risk_test
-                } else {
-                    &local.gates.test
-                };
-                match crate::local_validation::doctor_runtime_receipt_health(root, local, profile) {
-                    Ok(health) => current_validation_status(
-                        &health.profile,
-                        &health.receipt_id,
-                        &health.sandbox,
-                        &health.results,
-                        "passed",
-                        true,
-                    ),
+                // design.md Condition 8: share the exact same selection
+                // helper the strict gate executor uses. Post-archive there
+                // is no live `manifest.json` to reload (the change
+                // directory has already moved into `openspec/changes/
+                // archive/...`), so the closest live stand-in is the
+                // closure's own frozen `allowed_paths` — the declared scope
+                // merged with system-owned paths at archive time. Because
+                // that merge always includes the change's own sensitive
+                // `.mpd/state/<change>.json` ledger path, the predicate can
+                // never hold here, so this always resolves to exactly
+                // today's High/non-High split — a fail-safe, not a gap.
+                let synthetic_manifest = ledger
+                    .archive_closure
+                    .as_ref()
+                    .map(|record| closure::ChangeManifest {
+                        version: closure::MANIFEST_SCHEMA,
+                        paths: record.allowed_paths.clone(),
+                        shared_paths: Vec::new(),
+                        publish: None,
+                    })
+                    .unwrap_or_else(closure::ChangeManifest::seed);
+                match closure::select_gate_profile(
+                    local,
+                    Phase::Test,
+                    &synthetic_manifest,
+                    &ledger.change,
+                    ledger.effective_risk(),
+                ) {
                     Err(error) => (receipt_failure_fact(&error), blocked_containment(&error)),
+                    Ok(profile) => {
+                        match crate::local_validation::doctor_runtime_receipt_health(
+                            root, local, &profile,
+                        ) {
+                            Ok(health) => current_validation_status(
+                                &health.profile,
+                                &health.receipt_id,
+                                &health.sandbox,
+                                &health.results,
+                                "passed",
+                                true,
+                            ),
+                            Err(error) => {
+                                (receipt_failure_fact(&error), blocked_containment(&error))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1920,6 +1951,7 @@ fn current_risk_assessment(
         &manifest,
         config,
         ledger.governance.risk,
+        change,
     ))
 }
 
@@ -2832,6 +2864,7 @@ fn execute_strict_candidate_build(
     root: &Path,
     change: &str,
     expected_policy: &crate::config::LocalValidationConfig,
+    profile: &str,
 ) -> Result<
     (
         PendingCandidateBuild,
@@ -2852,7 +2885,7 @@ fn execute_strict_candidate_build(
             root,
             pending.captured().root(),
             pending.capture(),
-            &candidate_policy.gates.build,
+            profile,
             &candidate_policy,
         )?;
         if let Some(output) = validation.build_output {
@@ -2861,8 +2894,7 @@ fn execute_strict_candidate_build(
         let report = validation.report;
         if report.status != "passed" {
             return Err(format!(
-                "Build candidate profile {:?} refused: {}",
-                candidate_policy.gates.build,
+                "Build candidate profile {profile:?} refused: {}",
                 report.blocker.as_deref().unwrap_or(&report.status)
             ));
         }
@@ -3255,15 +3287,30 @@ fn cmd_gate(
             }
             let cfg = Config::load_strict(&root)?;
             if let Some(local) = cfg.local_validation.as_ref() {
-                let profile = match phase {
-                    Phase::Build => &local.gates.build,
-                    Phase::SecurityCode => &local.gates.security_code,
-                    Phase::Test if effective_risk == RiskLevel::High => &local.gates.high_risk_test,
-                    Phase::Test => &local.gates.test,
-                    _ => unreachable!(),
-                };
+                // design.md Condition 12: prefer the single manifest/
+                // assessment snapshot this command already established.
+                // `effective_risk` above is already the freshly-recomputed,
+                // just-saved value for THIS command (`enforce_freshness_
+                // before_effects` ran, then the ledger was reloaded before
+                // reading it). Reloading the manifest here is fail-safe by
+                // construction rather than a rigor gap: `select_gate_profile`
+                // requires BOTH the live predicate to hold AND this fixed
+                // `effective_risk == Low`, so a manifest that widens between
+                // reads only ever forces the full profile, never the reverse
+                // (see `select_gate_profile`'s doc comment).
+                let live_manifest =
+                    closure::load_manifest(&root, &change).map_err(|error| error.to_string())?;
+                let profile = closure::select_gate_profile(
+                    local,
+                    phase,
+                    &live_manifest,
+                    &change,
+                    effective_risk,
+                )?;
+                let profile = profile.as_str();
                 let report = if phase == Phase::Build {
-                    let (pending, report) = execute_strict_candidate_build(&root, &change, local)?;
+                    let (pending, report) =
+                        execute_strict_candidate_build(&root, &change, local, profile)?;
                     gate_candidate = Some(pending.capture().clone());
                     pending_candidate_build = Some(pending);
                     report

@@ -1667,6 +1667,120 @@ fn governance_defaults_overrides_and_brief_parity() {
     assert_eq!(next["attempt_limit"], 3);
 }
 
+/// design.md D1/D2 (proportionate-governance): a docs-only declared scope on
+/// a deployment-configured repo — both synthetic signals fire under v1 —
+/// resolves an honest derived/effective Low at requested Low; the same repo
+/// with the scope widened to a genuinely sensitive path stays High, with no
+/// suppression marker present. Exercised purely via `mpd status --json`
+/// (classification runs on every status read; no gate/sandbox execution
+/// needed).
+#[test]
+fn documentation_only_scope_resolves_low_on_a_deployment_configured_repo_but_mixed_scope_stays_high(
+) {
+    let sb = Sandbox::new("docs-risk");
+    let out = sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    assert!(out.status.success(), "init failed: {}", stdout(&out));
+    write_config_with_deploy(&sb, "install reviewed artifact");
+
+    let out = sb.mpd(&["begin", "doc-change", "--risk", "low"]);
+    assert!(out.status.success(), "begin failed: {}", stdout(&out));
+    // Narrow the fixture-wide "**" scope `Sandbox::mpd` seeds after `begin`
+    // down to a pure documentation-only scope.
+    sb.write(
+        "openspec/changes/doc-change/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"docs/**\", \"openspec/changes/doc-change/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+
+    let status = json(&sb.mpd(&["status", "--json"]));
+    let risk = &status["risk_assessment"];
+    assert_eq!(risk["requested"], "low", "{risk}");
+    assert_eq!(risk["derived"], "low", "{risk}");
+    assert_eq!(risk["effective"], "low", "{risk}");
+    assert_eq!(risk["classifier_version"], 2, "{risk}");
+    let reasons: Vec<&str> = risk["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"documentation-only-scope"), "{reasons:?}");
+    assert!(
+        reasons.contains(&"suppressed:deployment-configured"),
+        "{reasons:?}"
+    );
+
+    // Widen to a genuinely sensitive path: full v1-identical derivation
+    // returns, unsuppressed, and effective goes back to High.
+    sb.write(
+        "openspec/changes/doc-change/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"docs/**\", \"crates/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    let status = json(&sb.mpd(&["status", "--json"]));
+    let risk = &status["risk_assessment"];
+    assert_eq!(risk["derived"], "high", "{risk}");
+    assert_eq!(risk["effective"], "high", "{risk}");
+    let reasons: Vec<&str> = risk["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !reasons.contains(&"documentation-only-scope"),
+        "{reasons:?}"
+    );
+    assert!(reasons.contains(&"deployment-configured"), "{reasons:?}");
+}
+
+/// design.md's self-widening risk: a documentation-only change widens its
+/// own manifest after Architecture PASS. Classification is recomputed from
+/// the live manifest before every effectful command, and `Scope` is an
+/// Architecture dependency, so the widened scope stales evidence and rewinds
+/// before any further gate can run — never silently keeping the earlier,
+/// narrower approval alive.
+#[test]
+fn a_doc_only_change_widening_its_own_manifest_after_architecture_pass_stales_evidence_and_rewinds()
+{
+    let sb = Sandbox::new("docs-widen");
+    let out = sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
+    assert!(out.status.success(), "init failed: {}", stdout(&out));
+    let out = sb.mpd(&["begin", "doc-widen", "--risk", "low"]);
+    assert!(out.status.success(), "begin failed: {}", stdout(&out));
+    sb.write(
+        "openspec/changes/doc-widen/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"docs/**\", \"openspec/changes/doc-widen/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    fill_artifacts(&sb, "doc-widen");
+
+    let out = sb.mpd(&["gate", "architecture", "--pass"]);
+    assert!(out.status.success(), "architecture gate: {}", stdout(&out));
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-plan"
+    );
+
+    // Widen the manifest to a sensitive path AFTER the Architecture PASS.
+    sb.write(
+        "openspec/changes/doc-widen/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"docs/**\", \"crates/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    let status = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(
+        status["effective_phase"], "architecture",
+        "widened scope must rewind to Architecture: {status}"
+    );
+    let reasons: Vec<&str> = status["blocking_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("stale evidence")),
+        "{reasons:?}"
+    );
+}
+
 #[test]
 fn fail_class_and_security_exploitability_are_strict_and_persisted() {
     let sb = Sandbox::new("classified-fail");

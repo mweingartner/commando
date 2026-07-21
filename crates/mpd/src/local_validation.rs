@@ -9441,6 +9441,9 @@ mod tests {
                 test: "profile".into(),
                 pre_push: "profile".into(),
                 high_risk_test: "profile".into(),
+                docs_build: None,
+                docs_security_code: None,
+                docs_test: None,
             },
             hooks: HookPolicyConfig {
                 path: ".githooks".into(),
@@ -10671,6 +10674,9 @@ mod tests {
             test: "test".into(),
             pre_push: "test".into(),
             high_risk_test: "high".into(),
+            docs_build: None,
+            docs_security_code: None,
+            docs_test: None,
         };
         policy.offline.advisory_db_path = "mpd/advisory-db".into();
         policy.offline.advisory_revision = advisory_commit;
