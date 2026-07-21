@@ -1284,10 +1284,19 @@ fn executable_root(path: &Path) -> &Path {
 mod tests {
     use super::*;
 
+    /// Baseline limits for supervisor tests that do NOT test deadlines.
+    /// The time budgets are deliberately generous: under full-suite parallel
+    /// load, spawning `/bin/sh` alone can exceed a milliseconds-scale
+    /// deadline, turning a `Passed`/`output-limit`/`worktree-limit`
+    /// expectation into a spurious `check-timeout` (observed as a
+    /// load-dependent flake in `supervisor_distinguishes_success_and_nonzero_exit`
+    /// and `supervisor_blocks_output_and_worktree_floods`). Deadline behavior
+    /// itself is pinned by `supervisor_enforces_check_and_aggregate_deadlines`,
+    /// which sets its own short budgets explicitly.
     fn limits() -> RunnerLimits {
         RunnerLimits {
-            per_check: Duration::from_millis(150),
-            aggregate: Duration::from_millis(400),
+            per_check: Duration::from_secs(30),
+            aggregate: Duration::from_secs(60),
             output_bytes: 4096,
             log_bytes: 4096,
             worktree_bytes: 64 * 1024,
@@ -1568,7 +1577,12 @@ mod tests {
             return;
         }
         let root = test_worktree("timeout");
-        let outcome = supervised_shell("sleep 5", &root, limits());
+        // Deadline behavior needs a short budget by definition; `sleep 5`
+        // exceeds it deterministically regardless of scheduler load (a
+        // delayed spawn only makes the timeout more certain, never less).
+        let mut short = limits();
+        short.per_check = Duration::from_millis(150);
+        let outcome = supervised_shell("sleep 5", &root, short);
         assert!(matches!(
             outcome,
             RunOutcome::Blocked {
@@ -1603,7 +1617,11 @@ mod tests {
         // readers, and prove the original process group has disappeared.
         let outcome = supervised_shell("sleep 30 & exit 0", &root, limits());
         assert!(matches!(outcome, RunOutcome::Passed { .. }));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        // Far below both the 30 s background sleep and the 30 s per-check
+        // budget: the supervisor returned because it reaped the pipe holder,
+        // not because anything timed out. 10 s leaves headroom for a loaded
+        // scheduler without blunting that discrimination.
+        assert!(started.elapsed() < Duration::from_secs(10));
         fs::remove_dir_all(root).unwrap();
     }
 

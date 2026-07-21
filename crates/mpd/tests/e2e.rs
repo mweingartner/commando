@@ -5255,3 +5255,96 @@ fn reconcile_before_security_does_not_skip_architecture() {
     );
     assert_eq!(after["governance"]["risk"], "high");
 }
+
+/// D8: `--introduced-by` validates before anything is created (no ledger, no
+/// scaffold, no `.mpd/current` change on an unresolvable target), then a
+/// valid link persists, surfaces in `mpd status`, and is grouped by
+/// originating change in `mpd stats --json`.
+#[test]
+fn introduced_by_validates_before_creating_anything_and_surfaces_downstream() {
+    let sb = Sandbox::new("introduced-by");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+
+    // `--introduced-by` requires `--fix` at the clap level.
+    let requires_fix = sb.mpd(&["begin", "no-fix-flag", "--introduced-by", "whatever"]);
+    assert!(!requires_fix.status.success());
+
+    // An unresolvable target fails closed: no ledger, no scaffold, no
+    // `.mpd/current` change (Cond 8).
+    let rejected = sb.mpd(&[
+        "begin",
+        "orphan-fix",
+        "--fix",
+        "--introduced-by",
+        "never-archived",
+    ]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("never-archived"));
+    assert!(!sb.dir.join("openspec/changes/orphan-fix").exists());
+    assert!(!sb.dir.join(".mpd/state/orphan-fix.json").exists());
+    assert!(!sb.dir.join(".mpd/current").exists());
+
+    // Archive a real change so there is something legitimate to cite.
+    assert!(sb
+        .mpd(&["begin", "original-feature", "--chore"])
+        .status
+        .success());
+    fill_artifacts(&sb, "original-feature");
+    write_thing_spec(&sb, "original-feature");
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "documentation",
+        "doc-validation",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(sb.mpd(&["archive", "--yes"]).status.success());
+    // Clear the pending-closure pointer so a new change can begin; the
+    // archived ledger content (with `archive_closure` set) stays exactly
+    // where the transaction put it.
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+
+    // Now `--introduced-by` resolves against the just-archived change.
+    let ok = sb.mpd(&[
+        "begin",
+        "fix-the-bug",
+        "--fix",
+        "--introduced-by",
+        "original-feature",
+    ]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    assert!(stdout(&ok).contains("Introduced by: original-feature"));
+
+    let status = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(status["introduced_by"], "original-feature");
+
+    let stats = json(&sb.mpd(&["stats", "--json"]));
+    assert_eq!(
+        stats["aggregate"]["defect_escapes_by_originating_change"]["original-feature"],
+        1
+    );
+    let fix_row = stats["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["change"] == "fix-the-bug")
+        .expect("fix-the-bug row present");
+    assert_eq!(fix_row["introduced_by"], "original-feature");
+}

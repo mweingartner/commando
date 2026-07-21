@@ -39,6 +39,11 @@ const MAX_PUSH_ENUM_BYTES: usize = 64 * 1024 * 1024;
 /// The complete pre-push batch shares this enumeration budget. A per-ref cap
 /// alone would let a large multi-ref push force repeated 64 MiB traversals.
 const MAX_PUSH_ENUM_TOTAL_BYTES: usize = MAX_PUSH_ENUM_BYTES;
+/// Cap on the number of distinct (blob oid, path) bindings the D1 path-mapping
+/// pass may accumulate across the whole outgoing batch — same order of
+/// magnitude as the outgoing object cap, since the pass only ever widens a
+/// blob already counted against that cap into one-or-more paths.
+const MAX_PUSH_PATH_MAPPINGS: usize = MAX_PUSH_OBJECTS;
 const MAX_DELETION_APPROVALS: usize = 64;
 const MAX_DELETION_APPROVAL_BYTES: u64 = 64 * 1024;
 const MAX_MATERIALIZED_TREE_BYTES: usize = 16 * 1024 * 1024;
@@ -6440,7 +6445,13 @@ pub fn authorize_pre_push(
         outgoing.push(OutgoingObject { oid, kind, size });
     }
     outgoing.sort_by(|a, b| a.oid.cmp(&b.oid));
-    scan_outgoing_objects(root, &outgoing)?;
+    let commit_oids: Vec<String> = outgoing
+        .iter()
+        .filter(|object| object.kind == "commit")
+        .map(|object| object.oid.clone())
+        .collect();
+    let path_map = map_outgoing_blob_paths(root, &commit_oids)?;
+    scan_outgoing_objects(root, &outgoing, &path_map)?;
 
     // A source profile may be reused *within this invocation* for subjects
     // sharing a peeled commit. There is deliberately no cross-invocation cache.
@@ -6504,7 +6515,12 @@ pub fn authorize_pre_push(
         object_bytes,
         deletion_count: deletions.len(),
         deletion_approval_digest,
-        scanner_digest: Digest::of_bytes(b"mpd-builtin-outgoing-secret-scan-v1").to_hex(),
+        // D1 changed the outgoing SCAN semantics (path-mapped allowlisting),
+        // not the underlying secret-detection RULES in `checks::secrets` — so
+        // only `scanner_digest` bumps. Bumping `rules_digest` too would be
+        // dishonest: nothing about the rule set actually changed (Cond 10 —
+        // scanner digests are honest, not incremented reflexively).
+        scanner_digest: Digest::of_bytes(b"mpd-builtin-outgoing-secret-scan-v2").to_hex(),
         rules_digest: Digest::of_bytes(b"mpd-builtin-secret-rules-v1").to_hex(),
         trusted_policy_digest,
         effective_policy_digest,
@@ -6587,7 +6603,139 @@ fn enumerate_update_objects(
     Ok((out, bytes))
 }
 
-fn scan_outgoing_objects(root: &Path, objects: &[OutgoingObject]) -> Result<(), String> {
+/// Map every blob introduced or modified by `commits` to the repo-relative
+/// path(s) it was staged at (D1). `enumerate_update_objects` deliberately
+/// keeps `--no-object-names`, so this is a second, capped pass rather than a
+/// change to the authoritative object set.
+///
+/// Per-commit `diff-tree` is used instead of trusting `rev-list`'s own
+/// single first-seen name: `rev-list` names each object once, so a secret
+/// blob present at BOTH an allowlisted fixture path and a real source path
+/// would be scanned only under the fixture name and wrongly suppressed. With
+/// diff-tree, every path binding introduced anywhere in the outgoing range is
+/// observed, and a multi-path blob is scanned once per distinct path.
+///
+/// A path that fails UTF-8 decoding or canonical-path validation is a hard
+/// error for the whole mapping pass, exactly like a structural parse failure
+/// or cap overflow: the push is blocked, never partially skipped. This is
+/// deliberately NOT "drop this one occurrence and keep going" — a diff-tree
+/// row we cannot safely name is exactly the kind of row an attacker needs to
+/// launder a multi-binding secret (the same blob committed at BOTH an
+/// allowlisted path and an invalid-byte path; if the invalid row were merely
+/// dropped, the blob would map to only the allowlisted path and the finding
+/// at the real, unscanned path would be silently suppressed). Fail-closed at
+/// the whole-pass level closes that hole unconditionally: an operator with a
+/// genuinely non-UTF-8/non-canonical tracked path must fix it before the
+/// push can be authorized at all.
+fn map_outgoing_blob_paths(
+    root: &Path,
+    commits: &[String],
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut pair_count = 0usize;
+    let mut total_bytes = 0usize;
+    for commit in commits {
+        validate_oid(commit)?;
+        let output = canonical_git(
+            root,
+            &[
+                "diff-tree",
+                "-r",
+                "-m",
+                "--no-renames",
+                "--root",
+                "--no-commit-id",
+                "--raw",
+                "-z",
+                "--end-of-options",
+                commit,
+            ],
+            MAX_PUSH_ENUM_BYTES,
+        )
+        .map_err(|error| {
+            // `canonical_git` fails this way both on genuine cap overflow
+            // ("... exceeded its cap") and on unrelated spawn/IO failures;
+            // only the former is honestly a cap-exceeded condition.
+            if error.contains("exceeded its cap") {
+                "outgoing-path-mapping-cap-exceeded".to_string()
+            } else {
+                format!("outgoing-path-mapping-git-failed: {error}")
+            }
+        })?;
+        if !output.success {
+            return Err("outgoing-path-mapping-cap-exceeded".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(output.stdout.len())
+            .ok_or("outgoing-path-mapping-cap-exceeded")?;
+        if total_bytes > MAX_PUSH_ENUM_TOTAL_BYTES {
+            return Err("outgoing-path-mapping-cap-exceeded".into());
+        }
+        let mut fields: Vec<&[u8]> = output.stdout.split(|&byte| byte == 0).collect();
+        if fields.last().is_some_and(|field| field.is_empty()) {
+            fields.pop();
+        }
+        if !fields.len().is_multiple_of(2) {
+            return Err("malformed outgoing path mapping record".into());
+        }
+        for pair in fields.chunks_exact(2) {
+            let header = std::str::from_utf8(pair[0])
+                .map_err(|_| "malformed outgoing path mapping record".to_string())?;
+            let header = header
+                .strip_prefix(':')
+                .ok_or("malformed outgoing path mapping record")?;
+            let parts: Vec<&str> = header.split(' ').collect();
+            if parts.len() != 5 {
+                return Err("malformed outgoing path mapping record".into());
+            }
+            let new_mode = parts[1];
+            let new_oid = parts[3];
+            let status = parts[4];
+            if status.len() != 1 {
+                return Err("malformed outgoing path mapping record".into());
+            }
+            if !matches!(status, "A" | "M" | "C" | "R" | "T") {
+                // Deletions and other rows introduce no new blob to map.
+                continue;
+            }
+            if new_mode.starts_with("160") || new_mode.starts_with("040") {
+                // Gitlink (submodule) or tree row: not a blob, never mapped.
+                continue;
+            }
+            validate_oid(new_oid)?;
+            // F1 (Security-code): a row whose path is not valid UTF-8 or not
+            // canonical MUST NOT be silently dropped. Dropping it here would
+            // let a blob with one allowlisted, valid binding and one
+            // invalid-path binding map to ONLY the allowlisted path,
+            // wrongly suppressing a secret that also reaches the remote at
+            // the (unscanned, unmapped) invalid path. Fail closed for the
+            // whole push instead.
+            let path = std::str::from_utf8(pair[1])
+                .map_err(|_| "outgoing-path-mapping-unsafe-path".to_string())?;
+            crate::digest::validate_canonical_path(path)
+                .map_err(|_| "outgoing-path-mapping-unsafe-path".to_string())?;
+            let paths = map.entry(new_oid.to_string()).or_default();
+            if paths.insert(path.to_string()) {
+                pair_count = pair_count
+                    .checked_add(1)
+                    .ok_or("outgoing-path-mapping-cap-exceeded")?;
+                if pair_count > MAX_PUSH_PATH_MAPPINGS {
+                    return Err("outgoing-path-mapping-cap-exceeded".into());
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn scan_outgoing_objects(
+    root: &Path,
+    objects: &[OutgoingObject],
+    path_map: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), String> {
+    let allowlist = crate::allowlist::Allowlist::load(root);
+    let mut suppressed = 0usize;
+    let mut blocked = false;
     for object in objects {
         if !matches!(object.kind.as_str(), "blob" | "commit" | "tag") {
             continue;
@@ -6597,11 +6745,46 @@ fn scan_outgoing_objects(root: &Path, objects: &[OutgoingObject]) -> Result<(), 
         // intentional: ASCII secret patterns remain observable without
         // rendering raw bytes in a terminal or durable receipt.
         let text = String::from_utf8_lossy(&bytes);
-        let findings =
-            crate::checks::secrets::scan_text(&format!("git-object:{}", object.oid), &text);
-        if !findings.is_empty() {
-            return Err("outgoing-secret-scan-failed".into());
+        let mapped = if object.kind == "blob" {
+            path_map.get(&object.oid).filter(|paths| !paths.is_empty())
+        } else {
+            None
+        };
+        match mapped {
+            Some(paths) => {
+                // A mapped blob is scanned once per distinct path it was
+                // introduced at, filtered through the path-glob allowlist.
+                // Suppression requires an allowlist match under EVERY mapped
+                // path — a finding surviving under any one path still
+                // blocks (never first-wins).
+                for path in paths {
+                    for finding in crate::checks::secrets::scan_text(path, &text) {
+                        if allowlist.is_allowed(path, finding.line, finding.rule) {
+                            suppressed += 1;
+                        } else {
+                            blocked = true;
+                        }
+                    }
+                }
+            }
+            None => {
+                // Unmapped blobs, and commit/tag message text, keep the
+                // synthetic full-strictness scan: no allowlist ever applies.
+                let synthetic = format!("git-object:{}", object.oid);
+                if !crate::checks::secrets::scan_text(&synthetic, &text).is_empty() {
+                    blocked = true;
+                }
+            }
         }
+    }
+    // Suppression is always counted and reported, matching the allowlist
+    // module's doctrine — never silent, even when the push is about to be
+    // blocked by a different, non-suppressed finding.
+    if suppressed > 0 {
+        println!("  {suppressed} outgoing secret finding(s) suppressed by allowlist.");
+    }
+    if blocked {
+        return Err("outgoing-secret-scan-failed".into());
     }
     Ok(())
 }
@@ -12613,7 +12796,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(
-            scan_outgoing_objects(&root, &outgoing),
+            scan_outgoing_objects(&root, &outgoing, &BTreeMap::new()),
             Err("outgoing-secret-scan-failed".into())
         );
 
@@ -12639,7 +12822,7 @@ mod tests {
             oid: tag,
         };
         assert_eq!(
-            scan_outgoing_objects(&root, &[tag_object]),
+            scan_outgoing_objects(&root, &[tag_object], &BTreeMap::new()),
             Err("outgoing-secret-scan-failed".into())
         );
 
@@ -12683,7 +12866,7 @@ mod tests {
             oid: commit,
         };
         assert_eq!(
-            scan_outgoing_objects(&root, &[commit_object]),
+            scan_outgoing_objects(&root, &[commit_object], &BTreeMap::new()),
             Err("outgoing-secret-scan-failed".into())
         );
         assert_eq!(
@@ -12695,6 +12878,550 @@ mod tests {
             refs_before,
             "fresh outgoing scanning must not mutate or replace receipts/refs"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outgoing_scan_allowlist_requires_match_under_every_mapped_path() {
+        // D1 Cond 1/2/20: the path-mapped scan lets a genuinely allowlisted
+        // fixture pass, but a blob with the SAME content also bound to a
+        // real, non-allowlisted path must still block — allowlist matching
+        // is per-path, never first-wins.
+        let root = push_fixture("multi-binding");
+        let baseline = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let mpd = root.join(".mpd");
+        std::fs::create_dir_all(&mpd).unwrap();
+        std::fs::write(
+            mpd.join("secret-allowlist.json"),
+            "{\"paths\": [\"fixtures/**\"]}",
+        )
+        .unwrap();
+        let secret = "token = \"abc123abc123abc123abc123\"\n";
+        std::fs::create_dir_all(root.join("fixtures")).unwrap();
+        std::fs::write(root.join("fixtures/leak.txt"), secret).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "fixtures/leak.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "allowlisted fixture"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let leak_oid = git_output(&root, &["rev-parse", "HEAD:fixtures/leak.txt"]).unwrap();
+
+        let collect_outgoing = |head: &str| -> (Vec<OutgoingObject>, Vec<String>) {
+            let (objects, _) = enumerate_update_objects(&root, head, &baseline).unwrap();
+            let outgoing = objects
+                .into_iter()
+                .map(|oid| OutgoingObject {
+                    size: git_object_size(&root, &oid).unwrap(),
+                    kind: git_object_type(&root, &oid).unwrap(),
+                    oid,
+                })
+                .collect::<Vec<_>>();
+            let commit_oids = outgoing
+                .iter()
+                .filter(|o| o.kind == "commit")
+                .map(|o| o.oid.clone())
+                .collect();
+            (outgoing, commit_oids)
+        };
+
+        let allowlisted_head = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let (outgoing, commit_oids) = collect_outgoing(&allowlisted_head);
+        let path_map = map_outgoing_blob_paths(&root, &commit_oids).unwrap();
+        assert_eq!(
+            path_map.get(&leak_oid).cloned().unwrap_or_default(),
+            BTreeSet::from(["fixtures/leak.txt".to_string()])
+        );
+        assert_eq!(
+            scan_outgoing_objects(&root, &outgoing, &path_map),
+            Ok(()),
+            "a secret at an allowlisted path alone must pass"
+        );
+
+        // Introduce the SAME content at a second, non-allowlisted path. Git
+        // dedups identical blob content, so this is the exact multi-path
+        // binding D1 exists to catch.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/real.rs"), secret).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "src/real.rs"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "same secret at a real source path"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let head = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let (outgoing, commit_oids) = collect_outgoing(&head);
+        let path_map = map_outgoing_blob_paths(&root, &commit_oids).unwrap();
+        let bound_paths = path_map.get(&leak_oid).cloned().unwrap_or_default();
+        assert_eq!(
+            bound_paths,
+            BTreeSet::from(["fixtures/leak.txt".to_string(), "src/real.rs".to_string()])
+        );
+        assert_eq!(
+            scan_outgoing_objects(&root, &outgoing, &path_map),
+            Err("outgoing-secret-scan-failed".into()),
+            "a finding surviving under any one mapped path must still block"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outgoing_scan_fails_closed_when_any_binding_of_a_blob_has_an_invalid_path() {
+        // Security-code F1: an invalid-path binding must NEVER be silently
+        // dropped. The exact laundering shape: the same blob is committed at
+        // BOTH an allowlisted, canonical path AND a second, non-canonical
+        // path (here, one containing a backslash — a valid Unix filename
+        // byte, but rejected by `validate_canonical_path`). If the invalid
+        // row were merely dropped, the blob would map to only the
+        // allowlisted path and the secret would reach the remote unscanned
+        // at the second path. The whole mapping pass must instead fail
+        // closed, blocking the push outright.
+        let root = push_fixture("invalid-binding");
+        let baseline = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let mpd = root.join(".mpd");
+        std::fs::create_dir_all(&mpd).unwrap();
+        std::fs::write(
+            mpd.join("secret-allowlist.json"),
+            "{\"paths\": [\"fixtures/**\"]}",
+        )
+        .unwrap();
+        let secret = "token = \"abc123abc123abc123abc123\"\n";
+        std::fs::create_dir_all(root.join("fixtures")).unwrap();
+        std::fs::write(root.join("fixtures/leak.txt"), secret).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "fixtures/leak.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "allowlisted fixture"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        // The SAME content, committed again at a non-canonical path (a
+        // literal backslash byte — legal on a Unix filesystem, rejected by
+        // `validate_canonical_path`).
+        let invalid_path = "fixtures/leak\\evil.txt";
+        std::fs::write(root.join(invalid_path), secret).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "--", invalid_path])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "same secret at a non-canonical path"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let head = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let (objects, _) = enumerate_update_objects(&root, &head, &baseline).unwrap();
+        let outgoing = objects
+            .into_iter()
+            .map(|oid| OutgoingObject {
+                size: git_object_size(&root, &oid).unwrap(),
+                kind: git_object_type(&root, &oid).unwrap(),
+                oid,
+            })
+            .collect::<Vec<_>>();
+        let commit_oids = outgoing
+            .iter()
+            .filter(|o| o.kind == "commit")
+            .map(|o| o.oid.clone())
+            .collect::<Vec<_>>();
+
+        let error = map_outgoing_blob_paths(&root, &commit_oids).unwrap_err();
+        assert_eq!(error, "outgoing-path-mapping-unsafe-path");
+
+        // The push must never reach a state where this blob is scanned only
+        // under the allowlisted path: with the mapping pass itself failing,
+        // `authorize_pre_push` never even calls `scan_outgoing_objects`, so
+        // the secret at the invalid path can never be suppressed.
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outgoing_scan_annotated_tag_on_blob_stays_unmapped_and_never_allowlisted() {
+        // D1 Cond 20: a blob reachable only via an annotated tag pointing
+        // directly at it (never through any commit's tree diff) stays
+        // unmapped and is scanned under the synthetic `git-object:<oid>`
+        // name at full strictness — even a maximally permissive allowlist
+        // must not suppress it.
+        let root = push_fixture("tag-on-blob");
+        let mpd = root.join(".mpd");
+        std::fs::create_dir_all(&mpd).unwrap();
+        std::fs::write(mpd.join("secret-allowlist.json"), "{\"paths\": [\"**\"]}").unwrap();
+        let secret = "token = \"abc123abc123abc123abc123\"\n";
+        let scratch = root.join("scratch-secret.txt");
+        std::fs::write(&scratch, secret).unwrap();
+        let hash_output = Command::new("git")
+            .args(["hash-object", "-w", "--", "scratch-secret.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(hash_output.status.success());
+        let blob_oid = String::from_utf8(hash_output.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(Command::new("git")
+            .args([
+                "tag",
+                "-a",
+                "blobtag",
+                "-m",
+                "annotate a blob directly",
+                &blob_oid,
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let tag_oid = git_output(&root, &["rev-parse", "blobtag"]).unwrap();
+        let objects = vec![
+            OutgoingObject {
+                size: git_object_size(&root, &blob_oid).unwrap(),
+                kind: git_object_type(&root, &blob_oid).unwrap(),
+                oid: blob_oid,
+            },
+            OutgoingObject {
+                size: git_object_size(&root, &tag_oid).unwrap(),
+                kind: git_object_type(&root, &tag_oid).unwrap(),
+                oid: tag_oid,
+            },
+        ];
+        // No commit ever diffs in this blob, so the path map is empty
+        // regardless of which commits are passed.
+        let path_map = map_outgoing_blob_paths(&root, &[]).unwrap();
+        assert!(path_map.is_empty());
+        assert_eq!(
+            scan_outgoing_objects(&root, &objects, &path_map),
+            Err("outgoing-secret-scan-failed".into()),
+            "an unmapped blob reachable only via a direct tag must block despite a `**` allowlist"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outgoing_scan_maps_paths_introduced_by_a_merge_side_branch() {
+        // D1 Cond 20: `-m` must cover merge commits — a path introduced only
+        // by a merge's side-branch parent is still enumerated and mapped.
+        let root = push_fixture("merge-side-branch");
+        let baseline = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let default_branch = git_output(&root, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        let mpd = root.join(".mpd");
+        std::fs::create_dir_all(&mpd).unwrap();
+        std::fs::write(
+            mpd.join("secret-allowlist.json"),
+            "{\"paths\": [\"fixtures/**\"]}",
+        )
+        .unwrap();
+        let secret = "token = \"abc123abc123abc123abc123\"\n";
+
+        assert!(Command::new("git")
+            .args(["checkout", "-qb", "feature", &baseline])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(root.join("fixtures")).unwrap();
+        std::fs::write(root.join("fixtures/leak.txt"), secret).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "fixtures/leak.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "feature branch secret fixture"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(Command::new("git")
+            .args(["checkout", "-q", &default_branch])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("safe2.txt"), "second mainline content\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "safe2.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "second mainline commit"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "merge",
+                "-q",
+                "--no-edit",
+                "feature",
+                "-m",
+                "merge feature branch"
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let merge_oid = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let leak_oid = git_output(
+            &root,
+            &["rev-parse", &format!("{merge_oid}:fixtures/leak.txt")],
+        )
+        .unwrap();
+
+        let (objects, _) = enumerate_update_objects(&root, &merge_oid, &baseline).unwrap();
+        let outgoing = objects
+            .into_iter()
+            .map(|oid| OutgoingObject {
+                size: git_object_size(&root, &oid).unwrap(),
+                kind: git_object_type(&root, &oid).unwrap(),
+                oid,
+            })
+            .collect::<Vec<_>>();
+        let commit_oids = outgoing
+            .iter()
+            .filter(|o| o.kind == "commit")
+            .map(|o| o.oid.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            commit_oids.len() >= 3,
+            "feature, second-mainline, and merge commits are all outgoing"
+        );
+        let path_map = map_outgoing_blob_paths(&root, &commit_oids).unwrap();
+        assert_eq!(
+            path_map.get(&leak_oid).cloned().unwrap_or_default(),
+            BTreeSet::from(["fixtures/leak.txt".to_string()]),
+            "the side branch's introduced path must be mapped via the merge's -m diff"
+        );
+        assert_eq!(
+            scan_outgoing_objects(&root, &outgoing, &path_map),
+            Ok(()),
+            "the merge-introduced allowlisted path must pass"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `(whole-range mapping result, optional scan outcome)` — the paired
+    /// return of [`permuted_outgoing_outcome`], named to keep the signature
+    /// within clippy's type-complexity budget.
+    type PermutedOutcome = (
+        Result<BTreeMap<String, BTreeSet<String>>, String>,
+        Option<Result<(), String>>,
+    );
+
+    /// Metamorphic-fixture helper for the D1 mapping pass: a fresh repo with
+    /// the standard `fixtures/**` allowlist, one commit per `(path, content)`
+    /// step in the given order. Returns the whole-range mapping result and —
+    /// only when mapping succeeded, mirroring `authorize_pre_push`'s ordering
+    /// — the scan outcome over the complete outgoing range.
+    fn permuted_outgoing_outcome(tag: &str, steps: &[(&str, &str)]) -> PermutedOutcome {
+        let root = push_fixture(tag);
+        let baseline = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let mpd = root.join(".mpd");
+        std::fs::create_dir_all(&mpd).unwrap();
+        std::fs::write(
+            mpd.join("secret-allowlist.json"),
+            "{\"paths\": [\"fixtures/**\"]}",
+        )
+        .unwrap();
+        for (path, content) in steps {
+            let full = root.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&full, content).unwrap();
+            assert!(Command::new("git")
+                .args(["add", "--", path])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args(["commit", "-qm", "step"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let head = git_output(&root, &["rev-parse", "HEAD"]).unwrap();
+        let (objects, _) = enumerate_update_objects(&root, &head, &baseline).unwrap();
+        let outgoing: Vec<OutgoingObject> = objects
+            .into_iter()
+            .map(|oid| OutgoingObject {
+                size: git_object_size(&root, &oid).unwrap(),
+                kind: git_object_type(&root, &oid).unwrap(),
+                oid,
+            })
+            .collect();
+        let commit_oids: Vec<String> = outgoing
+            .iter()
+            .filter(|o| o.kind == "commit")
+            .map(|o| o.oid.clone())
+            .collect();
+        let mapping = map_outgoing_blob_paths(&root, &commit_oids);
+        let scan = mapping
+            .as_ref()
+            .ok()
+            .map(|path_map| scan_outgoing_objects(&root, &outgoing, path_map));
+        let _ = std::fs::remove_dir_all(root);
+        (mapping, scan)
+    }
+
+    const COMMIT_PERMUTATIONS: [[usize; 3]; 6] = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+
+    /// D1 metamorphic property: the diff-tree mapping pass is a parser over
+    /// git history, so its outcome must be a function of the SET of path
+    /// bindings in the outgoing range — never of commit order, and never of
+    /// unrelated files committed alongside. Blob oids are content-addressed,
+    /// so the entire oid→paths map must be byte-identical across every
+    /// permutation, and the suppress/block decision must never flip.
+    #[test]
+    fn outgoing_scan_outcome_is_invariant_under_commit_order_and_unrelated_files() {
+        let secret = "token = \"abc123abc123abc123abc123\"\n";
+
+        // Scenario A (suppressed): the secret exists ONLY at an allowlisted
+        // path; the other two commits are unrelated plain files. Every
+        // ordering must map identically and pass.
+        let suppressed_steps: [(&str, &str); 3] = [
+            ("fixtures/leak.txt", secret),
+            ("notes/readme.txt", "plain notes\n"),
+            ("docs/guide.txt", "more plain text\n"),
+        ];
+        let mut reference_map: Option<BTreeMap<String, BTreeSet<String>>> = None;
+        for (index, order) in COMMIT_PERMUTATIONS.iter().enumerate() {
+            let steps: Vec<(&str, &str)> = order.iter().map(|&i| suppressed_steps[i]).collect();
+            let (mapping, scan) =
+                permuted_outgoing_outcome(&format!("meta-suppressed-{index}"), &steps);
+            let mapping = mapping.unwrap_or_else(|error| {
+                panic!("permutation {order:?} must map cleanly, got {error}")
+            });
+            match &reference_map {
+                None => reference_map = Some(mapping),
+                Some(reference) => assert_eq!(
+                    &mapping, reference,
+                    "permutation {order:?} changed the oid→paths map"
+                ),
+            }
+            assert_eq!(
+                scan,
+                Some(Ok(())),
+                "permutation {order:?} flipped an allowlist-suppressed push to blocked"
+            );
+        }
+        let reference = reference_map.unwrap();
+        assert!(
+            reference
+                .values()
+                .any(|paths| paths == &BTreeSet::from(["fixtures/leak.txt".to_string()])),
+            "the secret blob must be bound to exactly its allowlisted path"
+        );
+
+        // Scenario B (blocked): the SAME secret content also bound at a real,
+        // non-allowlisted source path. Every ordering must observe both
+        // bindings and block.
+        let blocked_steps: [(&str, &str); 3] = [
+            ("fixtures/leak.txt", secret),
+            ("src/real.rs", secret),
+            ("notes/readme.txt", "plain notes\n"),
+        ];
+        let mut reference_map: Option<BTreeMap<String, BTreeSet<String>>> = None;
+        for (index, order) in COMMIT_PERMUTATIONS.iter().enumerate() {
+            let steps: Vec<(&str, &str)> = order.iter().map(|&i| blocked_steps[i]).collect();
+            let (mapping, scan) =
+                permuted_outgoing_outcome(&format!("meta-blocked-{index}"), &steps);
+            let mapping = mapping.unwrap_or_else(|error| {
+                panic!("permutation {order:?} must map cleanly, got {error}")
+            });
+            assert!(
+                mapping.values().any(|paths| paths
+                    == &BTreeSet::from([
+                        "fixtures/leak.txt".to_string(),
+                        "src/real.rs".to_string()
+                    ])),
+                "permutation {order:?} lost a binding of the dedup'd secret blob: {mapping:?}"
+            );
+            match &reference_map {
+                None => reference_map = Some(mapping),
+                Some(reference) => assert_eq!(
+                    &mapping, reference,
+                    "permutation {order:?} changed the oid→paths map"
+                ),
+            }
+            assert_eq!(
+                scan,
+                Some(Err("outgoing-secret-scan-failed".into())),
+                "permutation {order:?} let a multi-binding secret through"
+            );
+        }
+    }
+
+    /// Security-code F1 metamorphic invariant: an invalid-path binding
+    /// ANYWHERE in the outgoing range — first, middle, or last commit — must
+    /// hard-fail the whole mapping pass before the scan (and therefore any
+    /// allowlist suppression) can run. Position must never matter.
+    #[test]
+    fn outgoing_scan_invalid_path_binding_fails_closed_at_every_commit_position() {
+        let secret = "token = \"abc123abc123abc123abc123\"\n";
+        let invalid: (&str, &str) = ("fixtures/leak\\evil.txt", secret);
+        let allowlisted: (&str, &str) = ("fixtures/leak.txt", secret);
+        let unrelated: (&str, &str) = ("notes/readme.txt", "plain notes\n");
+        for position in 0..3 {
+            let mut steps = vec![allowlisted, unrelated];
+            steps.insert(position, invalid);
+            let (mapping, scan) =
+                permuted_outgoing_outcome(&format!("f1-position-{position}"), &steps);
+            assert_eq!(
+                mapping.unwrap_err(),
+                "outgoing-path-mapping-unsafe-path",
+                "an invalid binding at commit position {position} must fail the whole pass"
+            );
+            assert!(
+                scan.is_none(),
+                "the scan (and any allowlist) must never run after a failed mapping pass"
+            );
+        }
+    }
+
+    /// D1 boundary: a commit argument that is not a full hexadecimal oid is
+    /// rejected by `validate_oid` before any git subprocess is spawned.
+    #[test]
+    fn map_outgoing_blob_paths_rejects_a_malformed_commit_argument() {
+        let root = push_fixture("bad-oid");
+        let error = map_outgoing_blob_paths(&root, &["not-a-valid-oid".to_string()]).unwrap_err();
+        assert_eq!(error, "Git object id is not a full hexadecimal oid");
         let _ = std::fs::remove_dir_all(root);
     }
 

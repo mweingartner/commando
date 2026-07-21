@@ -1,3 +1,7 @@
 {
-  "test": "cargo test --workspace"
+  "test": "cargo test --workspace",
+  "secretAllow": [
+    "AKIAIOSFODNN7EXAMPLE",
+    "xoxb-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture"
+  ]
 }

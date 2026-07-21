@@ -686,14 +686,32 @@ pub fn save_candidate_closure_plan(root: &Path, plan: &CandidateClosurePlan) -> 
     result
 }
 
+fn candidate_closure_plan_path(root: &Path, transaction_id: &str) -> Result<PathBuf, String> {
+    Digest::from_hex(transaction_id).map_err(|_| "Candidate closure transaction ID is invalid")?;
+    let directory = candidate_closure_plan_directory(root, false)?;
+    Ok(directory.join(format!("{transaction_id}.json")))
+}
+
+/// Whether a Candidate closure plan file has ever been recorded for
+/// `transaction_id`, without loading or validating it. This lets a caller
+/// distinguish "no plan was ever saved" (a legacy/non-candidate closure —
+/// fine) from "a plan exists but is unreadable or invalid" (evidence of
+/// tampering or corruption). ANY failure resolving the clone-private plan
+/// directory itself — including a repo that has never saved a Candidate
+/// closure plan at all, so `.git/mpd` or `.git/mpd/closure-plans` was never
+/// created — also means "not recorded", not an error.
+pub fn candidate_closure_plan_recorded(root: &Path, transaction_id: &str) -> bool {
+    candidate_closure_plan_path(root, transaction_id)
+        .map(|path| std::fs::symlink_metadata(&path).is_ok())
+        .unwrap_or(false)
+}
+
 /// Load and canonicalize the clone-private plan for one archive transaction.
 pub fn load_candidate_closure_plan(
     root: &Path,
     transaction_id: &str,
 ) -> Result<CandidateClosurePlan, String> {
-    Digest::from_hex(transaction_id).map_err(|_| "Candidate closure transaction ID is invalid")?;
-    let directory = candidate_closure_plan_directory(root, false)?;
-    let path = directory.join(format!("{transaction_id}.json"));
+    let path = candidate_closure_plan_path(root, transaction_id)?;
     let metadata =
         std::fs::symlink_metadata(&path).map_err(|_| "Candidate closure plan is missing")?;
     if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 * 1024
@@ -3403,6 +3421,200 @@ mod tests {
         assert_eq!(closure, back);
     }
 
+    /// Recursively restore owner rwx so a fixture tree that was deliberately
+    /// made read-only (or permission-stripped) for a test can still be
+    /// cleaned up. Mirrors the equivalent helper in `local_validation.rs`'s
+    /// own candidate fixtures.
+    #[cfg(unix)]
+    fn make_tree_removable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_dir() {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    make_tree_removable(&entry.path());
+                }
+            }
+        } else {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    /// Build a fresh one-commit repo with a ready change manifest and capture
+    /// a real Candidate over it — the same lightweight fixture pattern
+    /// `local_validation.rs` uses for its own candidate/transaction tests,
+    /// reused here so `build_candidate_closure_plan` is exercised against a
+    /// genuine retained Candidate rather than a hand-rolled stand-in.
+    fn candidate_closure_fixture(
+        tag: &str,
+        change: &str,
+        manifest_paths: &[&str],
+    ) -> (PathBuf, crate::candidate::CandidateProjection) {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-closure-plan-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        std::fs::create_dir_all(root.join(".mpd")).unwrap();
+        std::fs::write(root.join(".mpd/.gitignore"), b"build-output/\nstate/\n").unwrap();
+        let paths_json = manifest_paths
+            .iter()
+            .map(|p| format!("{p:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/manifest.json")),
+            format!("{{\"version\":1,\"paths\":[{paths_json}],\"shared_paths\":[]}}"),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "closure-fixture@example.invalid"]);
+        git(&["config", "user.name", "Closure Fixture"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let captured = crate::candidate::capture_candidate(&root, change, &"a".repeat(64))
+            .expect("capture candidate closure fixture");
+        (root, captured.projection)
+    }
+
+    #[test]
+    fn build_candidate_closure_plan_rejects_a_durable_doc_path_outside_the_manifest() {
+        // D2 / Cond 3: the reproduced "durable-doc path outside manifest"
+        // panic input. `build_candidate_closure_plan` must return a clean
+        // `Err` (it never panicked itself — the panic was cli.rs's
+        // `.expect()` on this exact `Result`), naming the offending path.
+        let change = "docfix";
+        let (root, candidate) = candidate_closure_fixture(
+            "doc-outside-manifest",
+            change,
+            &[&format!("openspec/changes/{change}/**")],
+        );
+        let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
+        let archive_closure = ArchiveClosure {
+            base_commit: candidate.capture.subject.base_commit.clone(),
+            archive_path: format!("openspec/changes/archive/2026-01-01-{change}"),
+            transaction_id: Digest::of_bytes(b"txn"),
+            candidate_id: Some(candidate.capture.subject.id.clone()),
+            allowed_paths: vec![format!("openspec/changes/{change}/**")],
+            system_paths: vec![format!("openspec/changes/archive/2026-01-01-{change}")],
+            post_archive_digest: Digest::of_bytes(b"post"),
+            archived_at: 1_752_000_000,
+        };
+        let documentation = ReviewedDocumentationPostimages {
+            doc_validation_receipt_id: "d".repeat(64),
+            // Not covered by the manifest's declared scope
+            // (`openspec/changes/docfix/**` only) — the exact reproduced input.
+            files: vec![ClosureFilePostimage::regular(
+                format!("docs/{change}.md"),
+                b"# doc\n".to_vec(),
+            )],
+        };
+        let archive = DeterministicArchivePostimages {
+            spec_writes: Vec::new(),
+            ledger: ClosureFilePostimage::regular(
+                format!(".mpd/state/{change}.json"),
+                b"{}".to_vec(),
+            ),
+        };
+        let result = build_candidate_closure_plan(
+            &candidate_root,
+            &candidate,
+            &archive_closure,
+            &[],
+            &documentation,
+            &archive,
+        );
+        let error =
+            result.expect_err("a doc path outside the manifest must be a clean Err, never a panic");
+        assert!(
+            error.contains("durable-doc path"),
+            "must name the reproduced defect: {error}"
+        );
+        #[cfg(unix)]
+        make_tree_removable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_candidate_closure_plan_reports_a_retained_manifest_read_failure_without_panicking() {
+        // D2 / Cond 3: the reproduced "retained-manifest read failure" panic
+        // input — the clone-private retained `manifest.json` becomes
+        // unreadable after capture. `build_candidate_closure_plan` must
+        // surface this as a clean `Err`, never a panic.
+        use std::os::unix::fs::PermissionsExt;
+        let change = "retained";
+        let (root, candidate) = candidate_closure_fixture("retained-manifest", change, &["**"]);
+        let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
+        let retained_manifest =
+            candidate_root.join(format!("openspec/changes/{change}/manifest.json"));
+        std::fs::set_permissions(&retained_manifest, std::fs::Permissions::from_mode(0o000))
+            .expect("strip read permission from the retained manifest");
+
+        let archive_closure = ArchiveClosure {
+            base_commit: candidate.capture.subject.base_commit.clone(),
+            archive_path: format!("openspec/changes/archive/2026-01-01-{change}"),
+            transaction_id: Digest::of_bytes(b"txn"),
+            candidate_id: Some(candidate.capture.subject.id.clone()),
+            allowed_paths: vec!["**".to_string()],
+            system_paths: vec![format!("openspec/changes/archive/2026-01-01-{change}")],
+            post_archive_digest: Digest::of_bytes(b"post"),
+            archived_at: 1_752_000_000,
+        };
+        let documentation = ReviewedDocumentationPostimages {
+            doc_validation_receipt_id: "d".repeat(64),
+            files: Vec::new(),
+        };
+        let archive = DeterministicArchivePostimages {
+            spec_writes: Vec::new(),
+            ledger: ClosureFilePostimage::regular(
+                format!(".mpd/state/{change}.json"),
+                b"{}".to_vec(),
+            ),
+        };
+        let result = build_candidate_closure_plan(
+            &candidate_root,
+            &candidate,
+            &archive_closure,
+            &[],
+            &documentation,
+            &archive,
+        );
+        let error =
+            result.expect_err("an unreadable retained manifest must be a clean Err, never a panic");
+        assert!(
+            error.contains("retained manifest"),
+            "must name the reproduced defect: {error}"
+        );
+
+        std::fs::set_permissions(&retained_manifest, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        make_tree_removable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A pre-`system_paths` archive-closure record (schema drift within this
     /// unreleased feature, or a hand-crafted legacy fixture) must still parse
     /// — `system_paths` degrades to empty rather than failing to load.
@@ -4734,6 +4946,63 @@ mod candidate_closure_tests {
             expected_tree_digest: closure_tree_digest(&entries).unwrap(),
             entries,
         }
+    }
+
+    /// D3 (Cond 4): `candidate_closure_plan_recorded` must report "not
+    /// recorded" for every distinct way a plan can be genuinely absent — no
+    /// `.git/mpd` at all, `.git/mpd` present but no `closure-plans`
+    /// subdirectory, and the subdirectory present but the specific
+    /// transaction's file missing — and only "recorded" once a real plan has
+    /// been saved for that exact transaction ID. This is the regression
+    /// class an e2e run caught: a repo that has never captured any Candidate
+    /// has no `.git/mpd/closure-plans` directory at all, which
+    /// `load_candidate_closure_plan` reports via a DIFFERENT message
+    /// ("...directory is unavailable") than the specific-file-missing case
+    /// ("Candidate closure plan is missing") — a caller keying only on the
+    /// latter string would wrongly treat a legacy repo as tampered-with.
+    #[test]
+    fn candidate_closure_plan_recorded_covers_every_not_recorded_shape() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-closure-plan-recorded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        let txn = "d".repeat(64);
+
+        // No `.git/mpd` at all — a repo that has never captured any Candidate.
+        assert!(!candidate_closure_plan_recorded(&root, &txn));
+        assert!(load_candidate_closure_plan(&root, &txn).is_err());
+
+        // `.git/mpd` exists (e.g. from unrelated policy state), but never a
+        // `closure-plans` subdirectory.
+        std::fs::create_dir_all(root.join(".git/mpd")).unwrap();
+        assert!(!candidate_closure_plan_recorded(&root, &txn));
+
+        // `closure-plans` exists, but not this transaction's file.
+        std::fs::create_dir_all(root.join(".git/mpd/closure-plans")).unwrap();
+        assert!(!candidate_closure_plan_recorded(&root, &txn));
+
+        // A real plan saved for this exact transaction: now recorded.
+        let entries = vec![tree_entry("README.md", 0o100644, b"base\n")];
+        let mut candidate_plan = plan(entries, &"1".repeat(40));
+        candidate_plan.archive_transaction_id = txn.clone();
+        candidate_plan.expected_tree_digest = closure_tree_digest(&candidate_plan.entries).unwrap();
+        save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+        assert!(candidate_closure_plan_recorded(&root, &txn));
+        assert_eq!(
+            load_candidate_closure_plan(&root, &txn).unwrap(),
+            candidate_plan
+        );
+
+        // A different transaction ID is still "not recorded".
+        assert!(!candidate_closure_plan_recorded(&root, &"e".repeat(64)));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

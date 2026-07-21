@@ -71,6 +71,12 @@ enum Command {
         /// sets. Gate-enforces judgment artifacts; survives session death.
         #[arg(long)]
         strict: bool,
+        /// Defect-escape provenance: the archived change this fix was opened to
+        /// address a defect that escaped from. Requires --fix; validated before
+        /// anything is created (the archive must actually exist), then stored
+        /// write-once — display/measurement data only, never a gate input.
+        #[arg(long = "introduced-by", requires = "fix")]
+        introduced_by: Option<String>,
     },
     /// Begin a change under the strict tier: begin + strict + a seeded judgment
     /// stub + the harness call-loop contract. The way a harness drives mpd.
@@ -92,6 +98,12 @@ enum Command {
         /// Credible threat boundary for this change.
         #[arg(long = "threat-profile")]
         threat_profile: Option<String>,
+        /// Defect-escape provenance: the archived change this fix was opened to
+        /// address a defect that escaped from. Requires --fix; validated before
+        /// anything is created (the archive must actually exist), then stored
+        /// write-once — display/measurement data only, never a gate input.
+        #[arg(long = "introduced-by", requires = "fix")]
+        introduced_by: Option<String>,
     },
     /// Scaffold a phase's judgment-artifact template into the change dir (the
     /// strict-mode escape path — fills a stub you then author).
@@ -328,6 +340,18 @@ enum Command {
         /// Change (defaults to the current change).
         #[arg(long)]
         change: Option<String>,
+    },
+    /// Read-only outcome measurement over every recorded gate ledger:
+    /// per-change and aggregate attempts, wall-clock, reconciliations,
+    /// rewinds, failure classes, weakened-tuning incidence, deferrals, and
+    /// defect-escape provenance. Never mutates any ledger.
+    Stats {
+        /// Restrict the report to exactly one change (by name).
+        #[arg(long)]
+        change: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect or freshly verify closure commit parity with its configured remote ref.
     Publish {
@@ -642,7 +666,17 @@ pub fn run() -> i32 {
             risk,
             threat_profile,
             strict,
-        } => cmd_begin(name, ui, fix, chore, risk, threat_profile, strict),
+            introduced_by,
+        } => cmd_begin(
+            name,
+            ui,
+            fix,
+            chore,
+            risk,
+            threat_profile,
+            strict,
+            introduced_by,
+        ),
         Command::Conduct {
             name,
             ui,
@@ -650,7 +684,8 @@ pub fn run() -> i32 {
             chore,
             risk,
             threat_profile,
-        } => cmd_conduct(name, ui, fix, chore, risk, threat_profile),
+            introduced_by,
+        } => cmd_conduct(name, ui, fix, chore, risk, threat_profile, introduced_by),
         Command::Brief { phase, change } => cmd_brief(phase, change),
         Command::Status {
             change,
@@ -789,6 +824,7 @@ pub fn run() -> i32 {
             (false, false) => cmd_archive(change, skip_specs, yes),
         },
         Command::Manifest { change } => cmd_manifest(change),
+        Command::Stats { change, json } => cmd_stats(change, json),
         Command::Publish { verify, json } => cmd_publish(verify, json),
         Command::Closure { command } => cmd_closure(command),
         Command::Use { change } => cmd_use(change),
@@ -860,6 +896,73 @@ fn cmd_init(test: Option<String>) -> CmdResult {
     Ok(0)
 }
 
+/// D8 / Cond 8, 18: validate a `--introduced-by <archived-change>` argument
+/// BEFORE anything is created. The referenced change must be a real archive:
+/// either its ledger (kept at `.mpd/state/<name>.json` even after archive)
+/// has `archive_closure` set, or a legacy pre-closure dated archive directory
+/// `openspec/changes/archive/<YYYY-MM-DD>-<name>` exists — exact
+/// decomposition only, never substring/glob matching.
+fn validate_introduced_by(root: &Path, name: &str) -> Result<String, String> {
+    openspec_core::validate_change_name(name)?;
+    if let Ok(ledger) = ledger::load(root, name) {
+        if ledger.archive_closure.is_some() {
+            return Ok(name.to_string());
+        }
+    }
+    if legacy_dated_archive_exists(root, name) {
+        return Ok(name.to_string());
+    }
+    Err(format!(
+        "cannot resolve --introduced-by {name:?}: no archived ledger (`archive_closure`) and no \
+         dated archive directory `openspec/changes/archive/<YYYY-MM-DD>-{name}` was found"
+    ))
+}
+
+/// Whether `openspec/changes/archive/` contains a directory whose name
+/// decomposes EXACTLY as `<YYYY-MM-DD>-<name>` — a bounded, non-recursive
+/// listing, never a glob or substring search.
+fn legacy_dated_archive_exists(root: &Path, name: &str) -> bool {
+    let archive_dir = root.join("openspec").join("changes").join("archive");
+    let Ok(entries) = std::fs::read_dir(&archive_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if dated_archive_matches(&dir_name, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Exact `<YYYY-MM-DD>-<name>` decomposition: stripping the literal `-<name>`
+/// suffix must leave EXACTLY a 10-character `YYYY-MM-DD` date, nothing more
+/// and nothing less — never a prefix/suffix/substring match.
+fn dated_archive_matches(dir_name: &str, name: &str) -> bool {
+    match dir_name.strip_suffix(&format!("-{name}")) {
+        Some(rest) => is_valid_date_prefix(rest),
+        None => false,
+    }
+}
+
+fn is_valid_date_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_begin(
     name: String,
@@ -869,6 +972,7 @@ fn cmd_begin(
     risk: Option<String>,
     threat_profile: Option<String>,
     strict: bool,
+    introduced_by: Option<String>,
 ) -> CmdResult {
     let kind = match (fix, chore) {
         (false, false) => ChangeKind::Feature,
@@ -888,6 +992,11 @@ fn cmd_begin(
             stage_label(view.stage)
         ));
     }
+    // D8 Cond 8: validate BEFORE anything is created — no ledger, no
+    // scaffold, no `.mpd/current` change on a failure.
+    let introduced_by = introduced_by
+        .map(|origin| validate_introduced_by(&root, &origin))
+        .transpose()?;
     let cfg = Config::load(&root);
     let risk = match risk {
         Some(v) => v.parse::<RiskLevel>()?,
@@ -927,12 +1036,22 @@ fn cmd_begin(
         "Governance: risk {}, threat profile {}.",
         risk, threat_profile
     );
+    // D8: write-once at begin, additive-defaulted on load, never mutated by
+    // any later verb (Cond 19 — display/measurement data only).
+    if let Some(origin) = &introduced_by {
+        ledger.introduced_by = Some(origin.clone());
+        println!("Introduced by: {origin} (defect-escape provenance).");
+    }
     // The strict tier is a durable, per-change bit (`conduct` and `begin --strict`
     // are the only setters). Turn it on, persist it, and seed the current phase's
     // judgment stub so the very first gate has an artifact to author.
     if strict {
         ledger.set_strict();
+    }
+    if strict || introduced_by.is_some() {
         ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+    }
+    if strict {
         if let Some(created) = scaffold::seed_judgment_template(&root, &name, ledger.phase)
             .map_err(|e| e.to_string())?
         {
@@ -959,9 +1078,19 @@ fn cmd_conduct(
     chore: bool,
     risk: Option<String>,
     threat_profile: Option<String>,
+    introduced_by: Option<String>,
 ) -> CmdResult {
     let name_for_contract = name.clone();
-    let code = cmd_begin(name, ui, fix, chore, risk, threat_profile, true)?;
+    let code = cmd_begin(
+        name,
+        ui,
+        fix,
+        chore,
+        risk,
+        threat_profile,
+        true,
+        introduced_by,
+    )?;
     print_conduct_contract(&name_for_contract);
     // Risk nudge (once per change; conduct is a once-per-change command): if the
     // conducted change resolved below high risk, remind that novel/risky surface
@@ -1937,6 +2066,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             "gates": gates,
             "tasks": { "done": task_accounting.done, "deferred": task_accounting.deferred, "open": task_accounting.open.len(), "stale": task_accounting.stale, "total": task_accounting.total, "legacy_done": tasks.done, "legacy_total": tasks.total },
             "ready_to_archive": ready,
+            "introduced_by": ledger.introduced_by,
             "blocking_reasons": reasons,
             "history": serde_json::to_value(&ledger.history).unwrap_or(serde_json::Value::Null),
             "governance": ledger.governance,
@@ -1965,6 +2095,9 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             ledger.phase.label(),
             if ledger.strict { "strict" } else { "manual" }
         );
+        if let Some(origin) = &ledger.introduced_by {
+            println!("Introduced by: {}", harness::terminal_safe(origin));
+        }
         println!(
             "Governance: requested {}, derived {}, effective {}; threat profile {} — review attempt {}/{}",
             risk.requested,
@@ -1997,6 +2130,12 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     }
 
     println!("Change: {}  (ui: {})", ledger.change, ledger.ui);
+    if let Some(origin) = &ledger.introduced_by {
+        println!(
+            "Introduced by: {} (defect-escape provenance)",
+            harness::terminal_safe(origin)
+        );
+    }
     println!(
         "Governance: requested {}, derived {}, effective {}; threat profile {}",
         risk.requested, risk.derived, risk.effective, ledger.governance.threat_profile
@@ -4018,6 +4157,41 @@ fn canonical_artifact_actor(text: &str) -> Result<String, String> {
 /// Cooperative role separation: a strict gate actor cannot equal the actor on
 /// the latest applicable upstream gate. MPD records and enforces the labels but
 /// does not claim to authenticate a model, session, or human identity.
+/// D6: the phase whose output `phase`'s gate adjudicates, if any. Every
+/// judgment/review phase has exactly one review subject; DesignMock,
+/// Architecture, Build, Documentation, and Deploy are authoring/synthesis/
+/// execution phases with none, and keep the adjacency rule only.
+fn review_subject(phase: Phase) -> Option<Phase> {
+    match phase {
+        Phase::DesignReview => Some(Phase::Architecture),
+        Phase::SecurityPlan => Some(Phase::Architecture),
+        Phase::SecurityCode => Some(Phase::Build),
+        Phase::DesignSignoff => Some(Phase::Build),
+        Phase::Test => Some(Phase::Build),
+        Phase::DocValidation => Some(Phase::Documentation),
+        _ => None,
+    }
+}
+
+/// D6: actor separation is checked by two independent rules, either of which
+/// can refuse a gate:
+///
+/// - **Adjacency** (kept exactly as before): the gate actor must differ from
+///   the actor of the latest applicable upstream gate record.
+/// - **Review subject** (new): a judgment phase's actor must ALSO differ from
+///   the actor recorded on its current review-subject phase's gate — this is
+///   what blocks the alternating-label self-review exploit (Build=A,
+///   SecurityCode=B, DesignSignoff=A passes adjacency at every step, but
+///   DesignSignoff's subject is Build and A==A). "Differ from ALL distinct
+///   upstream actors" would be wrong by construction: the Designer
+///   legitimately records DesignMock/DesignReview/DesignSignoff, Security
+///   records both Security gates, and the Architect records
+///   Architecture+DocValidation — the dual-persona reuse is by design.
+///
+/// Both comparisons read only the current `gates` map (latest record per
+/// phase), which a rewind clears, so the rule naturally scopes to the
+/// change's current attempt cycle. A subject phase with no current record
+/// contributes no comparison.
 fn strict_actor_separation_issue(
     ledger: &ledger::Ledger,
     phase: Phase,
@@ -4033,15 +4207,29 @@ fn strict_actor_separation_issue(
                 .map(|record| (candidate, record))
         })
         .last();
-    let (prior_phase, prior_record) = prior?;
-    if actor != prior_record.by {
-        return None;
+    if let Some((prior_phase, prior_record)) = prior {
+        if actor == prior_record.by {
+            return Some(format!(
+                "{} gate actor {actor:?} matches the latest upstream {} actor (adjacency rule); \
+                 use a cooperatively distinct reviewer label",
+                phase.label(),
+                prior_phase.label()
+            ));
+        }
     }
-    Some(format!(
-        "{} gate actor {actor:?} matches the latest upstream {} actor; use a cooperatively distinct reviewer label",
-        phase.label(),
-        prior_phase.label()
-    ))
+    if let Some(subject_phase) = review_subject(phase) {
+        if let Some(subject_record) = ledger.gates.get(&subject_phase) {
+            if actor == subject_record.by {
+                return Some(format!(
+                    "{} gate actor {actor:?} matches the {} actor it reviews (review-subject \
+                     rule); use a cooperatively distinct reviewer label",
+                    phase.label(),
+                    subject_phase.label()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Read exactly one canonical terminal decision from a judgment artifact.
@@ -4377,6 +4565,36 @@ fn cmd_task(command: TaskCommand) -> CmdResult {
     Ok(0)
 }
 
+/// D3: the AwaitingCommit closure-commit scope is the union of the
+/// transaction's classification rows and a validated closure-plan's expected
+/// post-archive entry paths — this is what makes the FIRST-ever closure
+/// commit (source tree never previously committed) possible, since every
+/// staged source path is an expected plan entry. `plan` is `None` when no
+/// plan was ever recorded for this transaction (see
+/// `closure::candidate_closure_plan_recorded`) — a legacy/non-candidate
+/// closure, so the rows-only scope is kept unchanged. When a plan WAS
+/// recorded, `Err` (malformed, non-canonical, oversized, or bound to a
+/// different transaction) is evidence of tampering or corruption, so this
+/// BLOCKS rather than silently narrowing to rows-only exactly where
+/// suspicion is warranted.
+fn union_closure_scope(
+    mut rows: Vec<String>,
+    plan: Option<Result<closure::CandidateClosurePlan, String>>,
+) -> Result<Vec<String>, String> {
+    match plan {
+        Some(Ok(plan)) => rows.extend(plan.entries.into_iter().map(|entry| entry.path)),
+        Some(Err(error)) => {
+            return Err(format!(
+                "pre-commit blocked: pending Candidate closure plan is invalid: {error}"
+            ));
+        }
+        None => {}
+    }
+    rows.sort();
+    rows.dedup();
+    Ok(rows)
+}
+
 /// Validate the staged governance record used by the pre-commit hook.  This is
 /// intentionally separate from `manifest_view`: the latter is a status UI and
 /// may inspect the worktree, while a hook must make its decision solely from
@@ -4405,9 +4623,15 @@ fn staged_precommit_governance(root: &Path) -> Result<(), String> {
                     scope.push(row.path.clone());
                 }
             }
-            scope.sort();
-            scope.dedup();
-            Some(scope)
+            // D3: union in the validated closure-plan's expected
+            // post-archive entry paths — see `union_closure_scope`. The
+            // loader already enforces no-follow open, the 64 MiB cap,
+            // canonical round-trip, and transaction-id binding — no weaker
+            // parallel read path here.
+            let transaction_id = view.transaction_id.to_hex();
+            let plan = closure::candidate_closure_plan_recorded(root, &transaction_id)
+                .then(|| closure::load_candidate_closure_plan(root, &transaction_id));
+            Some(union_closure_scope(scope, plan)?)
         }
         Some(_) => {
             return Err("pre-commit blocked: pending closure is not ready for its commit".into())
@@ -5363,6 +5587,27 @@ fn cmd_manifest(change: Option<String>) -> CmdResult {
     Ok(0)
 }
 
+/// D7: read-only outcome measurement. Deliberately does NOT call
+/// `resolve_change` — an omitted `--change` means "every ledger under
+/// `.mpd/state/`", never a fallback to the current-change pointer, and
+/// `.mpd/current` is never consulted (Cond 5).
+fn cmd_stats(change: Option<String>, json: bool) -> CmdResult {
+    let root = find_root()?;
+    if let Some(name) = &change {
+        openspec_core::validate_change_name(name)?;
+    }
+    let report = crate::stats::collect(&root, change.as_deref());
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", crate::stats::render_human(&report));
+    }
+    Ok(0)
+}
+
 fn archived_manifest(
     root: &Path,
     ledger: &ledger::Ledger,
@@ -5766,6 +6011,21 @@ fn cmd_closure_abandon(root: &Path, yes: bool, json: bool) -> CmdResult {
     }
 }
 
+/// Resolve the closure-plan `Result` captured out of the archive transaction
+/// callback (D2). This is a pure fail-closed checkpoint — never a panic —
+/// deliberately factored out so the "an invalid Candidate closure input
+/// surfaces as `Err`, not `.expect()`-triggered abort" contract is directly
+/// unit-testable without driving the whole archive transaction.
+fn require_closure_plan(
+    captured: Option<Result<closure::CandidateClosurePlan, String>>,
+) -> Result<Option<closure::CandidateClosurePlan>, String> {
+    match captured {
+        Some(Ok(plan)) => Ok(Some(plan)),
+        Some(Err(error)) => Err(format!("cannot archive: {error}")),
+        None => Ok(None),
+    }
+}
+
 fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult {
     let root = find_root()?;
 
@@ -6075,8 +6335,14 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     let archived_at = ledger::now_epoch_secs();
 
     let ledger_bytes_out: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::new(None);
-    let closure_plan_out: std::cell::RefCell<Option<closure::CandidateClosurePlan>> =
-        std::cell::RefCell::new(None);
+    // D2: the closure plan is captured as a `Result`, never `.expect()`-ed
+    // inside the transaction callback. A validation failure surfaces as a
+    // normal fail-closed error, checked and returned immediately after
+    // `build_plan` returns and BEFORE any durable write it could feed
+    // (`closure::save_candidate_closure_plan`, then `openspec_core::prepare`).
+    let closure_plan_out: std::cell::RefCell<
+        Option<Result<closure::CandidateClosurePlan, String>>,
+    > = std::cell::RefCell::new(None);
     let documentation_postimages = candidate_context
         .as_ref()
         .map(|_| {
@@ -6146,24 +6412,34 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             bytes.push(b'\n');
             *ledger_bytes_out.borrow_mut() = Some(bytes.clone());
             if let Some((candidate, candidate_root, phase_postimages)) = &candidate_context {
-                let closure_plan = closure::build_candidate_closure_plan(
-                    candidate_root,
-                    candidate,
-                    &archive_closure,
-                    phase_postimages,
-                    documentation_postimages
-                        .as_ref()
-                        .expect("modern Candidate closure has documentation evidence"),
-                    &closure::DeterministicArchivePostimages {
-                        spec_writes: spec_postimages.clone(),
-                        ledger: closure::ClosureFilePostimage::regular(
-                            ledger_path_rel.clone(),
-                            bytes.clone(),
+                // Never `.expect()` on input-derived state (design.md D2,
+                // Cond 3): a missing documentation postimage is an internal
+                // contract violation reported through the same captured-Result
+                // channel as every other closure-plan validation failure,
+                // rather than a panic.
+                let closure_result: Result<closure::CandidateClosurePlan, String> =
+                    match documentation_postimages.as_ref() {
+                        Some(documentation) => closure::build_candidate_closure_plan(
+                            candidate_root,
+                            candidate,
+                            &archive_closure,
+                            phase_postimages,
+                            documentation,
+                            &closure::DeterministicArchivePostimages {
+                                spec_writes: spec_postimages.clone(),
+                                ledger: closure::ClosureFilePostimage::regular(
+                                    ledger_path_rel.clone(),
+                                    bytes.clone(),
+                                ),
+                            },
                         ),
-                    },
-                )
-                .expect("archive inputs were validated before the transaction callback");
-                *closure_plan_out.borrow_mut() = Some(closure_plan);
+                        None => Err(
+                            "internal error: modern Candidate closure is missing documentation \
+                             evidence"
+                                .to_string(),
+                        ),
+                    };
+                *closure_plan_out.borrow_mut() = Some(closure_result);
             }
             openspec_core::TargetWrite {
                 target: ledger_path_rel.clone(),
@@ -6179,7 +6455,15 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             .expect("the closure_ledger callback always runs inside build_plan"),
     );
 
-    if let Some(closure_plan) = closure_plan_out.into_inner() {
+    // D2/Cond 13: check the captured closure-plan Result BEFORE either durable
+    // write it could feed — the clone-private plan file
+    // (`closure::save_candidate_closure_plan`) and the archive transaction
+    // itself (`openspec_core::prepare`). At this point nothing has been
+    // journaled or staged, so an `Err` here leaves the tree untouched with no
+    // cleanup required (fail-closed, never a panic).
+    let closure_plan = require_closure_plan(closure_plan_out.into_inner())?;
+
+    if let Some(closure_plan) = closure_plan {
         closure::save_candidate_closure_plan(&root, &closure_plan)?;
     }
 
@@ -7555,17 +7839,141 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
 mod tests {
     use super::{
         canonical_artifact_actor, canonical_artifact_verdict, check_documentation, check_sections,
-        current_validation_status, doctor_expected_pending_remote, doctor_installed_deploy_health,
-        extract_section, has_unfilled_placeholder, parse_exploit, receipt_failure_fact,
+        current_validation_status, dated_archive_matches, doctor_expected_pending_remote,
+        doctor_installed_deploy_health, extract_section, has_unfilled_placeholder,
+        is_valid_date_prefix, parse_exploit, receipt_failure_fact, require_closure_plan,
         resolve_runtime_head, resolve_runtime_ledger, retained_candidate_for_objective_gate,
         runtime_doctor_findings_with_receipt, sandbox_blocker, strict_actor_separation_issue,
-        strict_gate_command, upstream_artifact_pointers, validate_evidence, WorkflowOutcome,
-        REQUIRED_DOC_SECTIONS,
+        strict_gate_command, union_closure_scope, upstream_artifact_pointers, validate_evidence,
+        validate_introduced_by, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
     };
     use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, Verdict};
     use crate::phase::{Applicability, Phase};
     use proptest::prelude::*;
     use std::process::Command;
+
+    // D2 / Cond 3, 13: the two reproduced archive panics
+    // (`.expect("archive inputs were validated before the transaction
+    // callback")` and `.expect("modern Candidate closure has documentation
+    // evidence")`) both flowed into `closure_plan_out`, then were unwrapped
+    // through this exact checkpoint. Testing it directly proves the fix
+    // structurally: an `Err` captured here can never reach a panic, it can
+    // only reach this ordinary `Result` return — checked before either
+    // durable write (`save_candidate_closure_plan`, `openspec_core::prepare`).
+    #[test]
+    fn require_closure_plan_never_panics_on_a_captured_validation_error() {
+        assert_eq!(require_closure_plan(None), Ok(None));
+
+        let plan = crate::closure::CandidateClosurePlan {
+            schema: crate::closure::CANDIDATE_CLOSURE_SCHEMA,
+            candidate_id: "c".repeat(64),
+            candidate_base_commit: "b".repeat(40),
+            archive_path: "openspec/changes/archive/2026-01-01-x".into(),
+            archive_transaction_id: "t".repeat(64),
+            overlay_digest: "o".repeat(64),
+            expected_tree_digest: "e".repeat(64),
+            entries: Vec::new(),
+        };
+        assert_eq!(require_closure_plan(Some(Ok(plan.clone()))), Ok(Some(plan)));
+
+        // The durable-doc-outside-manifest and retained-manifest-read-failure
+        // reproductions both arrive here as a plain `Err(String)` — this must
+        // surface as a normal `Result::Err`, never a panic/abort, and the
+        // underlying diagnostic must survive into the returned message.
+        let err = require_closure_plan(Some(Err(
+            "reviewed documentation postimage \"docs/x.md\" is not a regular declared \
+             durable-doc path"
+                .to_string(),
+        )))
+        .unwrap_err();
+        assert!(
+            err.contains("durable-doc path"),
+            "the failing input's diagnostic must survive: {err}"
+        );
+
+        let err = require_closure_plan(Some(Err(
+            "candidate closure cannot read its retained manifest: permission denied".to_string(),
+        )))
+        .unwrap_err();
+        assert!(
+            err.contains("retained manifest"),
+            "the failing input's diagnostic must survive: {err}"
+        );
+    }
+
+    fn closure_entry(path: &str) -> crate::closure::ClosureTreeEntry {
+        crate::closure::ClosureTreeEntry {
+            path: path.to_string(),
+            mode: 0o100644,
+            byte_len: 4,
+            sha256: "a".repeat(64),
+        }
+    }
+
+    fn closure_plan_with(
+        entries: Vec<crate::closure::ClosureTreeEntry>,
+    ) -> crate::closure::CandidateClosurePlan {
+        crate::closure::CandidateClosurePlan {
+            schema: crate::closure::CANDIDATE_CLOSURE_SCHEMA,
+            candidate_id: "c".repeat(64),
+            candidate_base_commit: "b".repeat(40),
+            archive_path: "openspec/changes/archive/2026-01-01-x".into(),
+            archive_transaction_id: "t".repeat(64),
+            overlay_digest: "o".repeat(64),
+            expected_tree_digest: "e".repeat(64),
+            entries,
+        }
+    }
+
+    #[test]
+    fn union_closure_scope_widens_rows_with_plan_entries_sorted_and_deduped() {
+        // D3 / Cond 4: a valid plan unions its entry paths into the rows-only
+        // scope. A first-ever closure commit (no prior classification rows)
+        // must pass with exactly the plan's entries as scope.
+        let plan = closure_plan_with(vec![
+            closure_entry("crates/mpd/src/a.rs"),
+            closure_entry("README.md"),
+        ]);
+        let scope = union_closure_scope(vec!["README.md".to_string()], Some(Ok(plan))).unwrap();
+        assert_eq!(
+            scope,
+            vec!["README.md".to_string(), "crates/mpd/src/a.rs".to_string()]
+        );
+
+        // First-ever closure commit: empty rows, scope = exactly the plan entries.
+        let plan = closure_plan_with(vec![closure_entry("openspec/specs/x/spec.md")]);
+        let scope = union_closure_scope(Vec::new(), Some(Ok(plan))).unwrap();
+        assert_eq!(scope, vec!["openspec/specs/x/spec.md".to_string()]);
+    }
+
+    #[test]
+    fn union_closure_scope_keeps_rows_only_when_no_plan_was_ever_recorded() {
+        // D3 / Cond 4: no plan recorded (legacy/non-candidate closure, or a
+        // repo that has never saved a Candidate closure plan at all) must
+        // leave the rows-only scope completely unchanged.
+        let rows = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let scope = union_closure_scope(rows.clone(), None).unwrap();
+        assert_eq!(scope, rows);
+    }
+
+    #[test]
+    fn union_closure_scope_blocks_on_any_recorded_but_invalid_plan() {
+        // D3 / Cond 4: a present-but-invalid plan (corrupt, non-canonical,
+        // oversized, or wrong-transaction) must BLOCK, never silently fall
+        // back to rows-only.
+        for reason in [
+            "Candidate closure plan is unsafe or oversized",
+            "Candidate closure plan is malformed",
+            "Candidate closure plan transaction binding differs",
+            "Candidate closure plan is not canonical",
+        ] {
+            let error =
+                union_closure_scope(vec!["a.txt".to_string()], Some(Err(reason.to_string())))
+                    .unwrap_err();
+            assert!(error.contains("invalid"), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
 
     fn doctor_test_dir(label: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -8154,6 +8562,190 @@ mod tests {
             strict_actor_separation_issue(&ledger, Phase::Architecture, "architect-session")
                 .is_none()
         );
+    }
+
+    fn actor_record(by: &str) -> GateRecord {
+        let mut record = doctor_gate_record();
+        record.by = by.into();
+        record
+    }
+
+    /// D6 / Cond 7: every documented persona-reuse pattern must pass BOTH
+    /// rules with distinct-per-persona labels — Designer at
+    /// DesignMock/DesignReview/DesignSignoff, Security at both Security
+    /// gates, and Architect at Architecture+DocValidation.
+    #[test]
+    fn actor_separation_preserves_every_documented_persona_reuse_pattern() {
+        let mut ledger = ledger::Ledger::new("reuse", "mpd", true, ChangeKind::Feature);
+        ledger.strict = true;
+        ledger
+            .gates
+            .insert(Phase::DesignMock, actor_record("Designer"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::Architecture, "Architect").is_none());
+        ledger
+            .gates
+            .insert(Phase::Architecture, actor_record("Architect"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::DesignReview, "Designer").is_none());
+        ledger
+            .gates
+            .insert(Phase::DesignReview, actor_record("Designer"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::SecurityPlan, "Security").is_none());
+        ledger
+            .gates
+            .insert(Phase::SecurityPlan, actor_record("Security"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::Build, "Builder").is_none());
+        ledger.gates.insert(Phase::Build, actor_record("Builder"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::SecurityCode, "Security").is_none());
+        ledger
+            .gates
+            .insert(Phase::SecurityCode, actor_record("Security"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::DesignSignoff, "Designer").is_none());
+        ledger
+            .gates
+            .insert(Phase::DesignSignoff, actor_record("Designer"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::Test, "Tester").is_none());
+        ledger.gates.insert(Phase::Test, actor_record("Tester"));
+        assert!(
+            strict_actor_separation_issue(&ledger, Phase::Documentation, "Documenter").is_none()
+        );
+        ledger
+            .gates
+            .insert(Phase::Documentation, actor_record("Documenter"));
+        // Architect returns for Doc Validation — the second documented
+        // reuse — and must still pass (subject is Documentation=Documenter,
+        // adjacency prior is also Documentation=Documenter; Architect
+        // matches neither).
+        assert!(
+            strict_actor_separation_issue(&ledger, Phase::DocValidation, "Architect").is_none()
+        );
+    }
+
+    /// D6 / Cond 7: the reproduced alternating-label self-review exploit
+    /// (Build=A, SecurityCode=B, DesignSignoff=A) passes adjacency at every
+    /// step (A differs from the immediately prior actor each time) yet lets
+    /// A sign off on A's own Build. The review-subject rule must block it,
+    /// naming both the rule and both actors.
+    #[test]
+    fn actor_separation_blocks_the_alternating_label_self_review_exploit() {
+        let mut ledger = ledger::Ledger::new("exploit", "mpd", true, ChangeKind::Feature);
+        ledger.strict = true;
+        ledger.gates.insert(Phase::Build, actor_record("A"));
+        assert!(strict_actor_separation_issue(&ledger, Phase::SecurityCode, "B").is_none());
+        ledger.gates.insert(Phase::SecurityCode, actor_record("B"));
+        // Adjacency alone would accept this: A differs from the immediately
+        // prior SecurityCode actor B.
+        let issue = strict_actor_separation_issue(&ledger, Phase::DesignSignoff, "A")
+            .expect("the review-subject rule must fire");
+        assert!(issue.contains("review-subject"), "{issue}");
+        assert!(issue.contains("Build"), "{issue}");
+        assert!(issue.contains('A'), "{issue}");
+    }
+
+    /// D6: the adjacency rule still fires exactly as before when two
+    /// directly consecutive phases share the same actor.
+    #[test]
+    fn actor_separation_adjacency_rule_still_fires() {
+        let mut ledger = ledger::Ledger::new("adjacency", "mpd", false, ChangeKind::Chore);
+        ledger.strict = true;
+        ledger
+            .gates
+            .insert(Phase::Architecture, actor_record("Same"));
+        let issue = strict_actor_separation_issue(&ledger, Phase::SecurityPlan, "Same")
+            .expect("adjacency rule must fire");
+        assert!(issue.contains("adjacency"), "{issue}");
+    }
+
+    // D8: `--introduced-by` provenance.
+
+    fn introduced_by_fixture(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-introduced-by-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".mpd/state")).unwrap();
+        std::fs::create_dir_all(root.join("openspec/changes/archive")).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        root
+    }
+
+    #[test]
+    fn dated_archive_decomposition_is_exact_never_substring_or_prefix() {
+        // Cond 18: the date prefix must be exactly 10 valid `YYYY-MM-DD`
+        // characters and the remainder must equal `name` exactly.
+        assert!(dated_archive_matches("2026-07-19-widget", "widget"));
+        // Wrong length / malformed date prefix.
+        assert!(!dated_archive_matches("26-07-19-widget", "widget"));
+        assert!(!dated_archive_matches("2026-7-19-widget", "widget"));
+        // Extra text before the date (prefix confusion).
+        assert!(!dated_archive_matches("old-2026-07-19-widget", "widget"));
+        // A different change name entirely must not match via substring.
+        assert!(!dated_archive_matches("2026-07-19-widget", "widget-2"));
+        assert!(!dated_archive_matches("2026-07-19-widget-2", "widget"));
+        assert!(is_valid_date_prefix("2026-07-19"));
+        assert!(!is_valid_date_prefix("2026-07-1"));
+        assert!(!is_valid_date_prefix("2026/07/19"));
+    }
+
+    #[test]
+    fn validate_introduced_by_rejects_an_invalid_name_and_creates_nothing() {
+        let root = introduced_by_fixture("invalid-name");
+        let error = validate_introduced_by(&root, "Not Valid!").unwrap_err();
+        assert!(!error.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_introduced_by_rejects_a_change_with_no_archive_evidence() {
+        let root = introduced_by_fixture("no-archive");
+        let error = validate_introduced_by(&root, "never-archived").unwrap_err();
+        assert!(error.contains("never-archived"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_introduced_by_accepts_a_ledger_with_archive_closure() {
+        let root = introduced_by_fixture("closure-ledger");
+        let mut ledger = ledger::Ledger::new("modern-thing", "mpd", false, ChangeKind::Feature);
+        ledger.archive_closure = Some(crate::closure::ArchiveClosure {
+            base_commit: "a".repeat(40),
+            archive_path: "openspec/changes/archive/2026-07-19-modern-thing".into(),
+            transaction_id: crate::digest::Digest::of_bytes(b"txn"),
+            candidate_id: None,
+            allowed_paths: vec!["**".to_string()],
+            system_paths: vec![],
+            post_archive_digest: crate::digest::Digest::of_bytes(b"post"),
+            archived_at: 1,
+        });
+        ledger::save(&root, &ledger).unwrap();
+        assert_eq!(
+            validate_introduced_by(&root, "modern-thing").unwrap(),
+            "modern-thing"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_introduced_by_accepts_a_legacy_dated_archive_directory() {
+        let root = introduced_by_fixture("legacy-dir");
+        std::fs::create_dir_all(root.join("openspec/changes/archive/2026-07-19-legacy-thing"))
+            .unwrap();
+        assert_eq!(
+            validate_introduced_by(&root, "legacy-thing").unwrap(),
+            "legacy-thing"
+        );
+        // A near-miss directory (prefix confusion) must not satisfy a
+        // different name.
+        assert!(validate_introduced_by(&root, "thing").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

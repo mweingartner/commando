@@ -20,6 +20,19 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The current ledger schema format this binary writes and fully understands
+/// (D5). Bump this in future changes whenever a new enum variant or
+/// semantics-bearing field would make older readers fail — the
+/// `design-mock-artifact` receipt-kind era is retroactively "format 2" from
+/// this change onward.
+pub const LEDGER_FORMAT: u32 = 2;
+
+/// Default for ledgers written before the `format` field existed — every
+/// pre-existing ledger decodes as format 1.
+fn ledger_format_v1() -> u32 {
+    1
+}
+
 macro_rules! string_enum {
     ($name:ident, $default:ident, { $($variant:ident => $text:literal),+ $(,)? }) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,7 +670,7 @@ pub struct TaskDeferral {
 }
 
 impl TaskDeferral {
-    fn is_active(&self) -> bool {
+    pub(crate) fn is_active(&self) -> bool {
         matches!(self.events.last(), Some(TaskDeferralEvent::Deferred { .. }))
     }
 }
@@ -710,6 +723,12 @@ pub struct GateEvent {
 /// The durable state of one change's trip through the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
+    /// The ledger schema format (D5, `LEDGER_FORMAT`). Additive and
+    /// defaulted to 1 for every ledger written before this field existed;
+    /// `save` always writes the current constant regardless of what was
+    /// loaded, so every ledger this binary touches is stamped current.
+    #[serde(default = "ledger_format_v1")]
+    pub format: u32,
     /// The change name.
     pub change: String,
     /// The schema the change was created under.
@@ -783,6 +802,14 @@ pub struct Ledger {
     pub legacy_repairs: Vec<LegacyRepairEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub freshness_invalidations: Vec<FreshnessInvalidationEvent>,
+    /// D8 defect-escape provenance: the archived change this one was opened
+    /// to fix a defect that escaped from (`mpd conduct --fix --introduced-by
+    /// <archived-change>`). Write-once at begin — no mutation verb edits it
+    /// afterward — and additive/absent on every ledger that doesn't use the
+    /// flag. Display/measurement data only: no readiness, gate, scope, or
+    /// verification decision may read it (Cond 19).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -886,6 +913,7 @@ impl Ledger {
             docs: kind.documents(),
         };
         Ledger {
+            format: LEDGER_FORMAT,
             change: change.into(),
             schema: schema.into(),
             ui,
@@ -906,6 +934,7 @@ impl Ledger {
             first_adoption_restarts: Vec::new(),
             legacy_repairs: Vec::new(),
             freshness_invalidations: Vec::new(),
+            introduced_by: None,
         }
     }
 
@@ -1636,7 +1665,71 @@ pub fn load(root: &Path, change: &str) -> io::Result<Ledger> {
     let path = state_path(root, change);
     let text = openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_str(&text).map_err(|error| ledger_version_probe(&path, &text, error))
+}
+
+/// D5: when full deserialization has already failed, probe-parse the same
+/// bytes as a bare `serde_json::Value` to give an honest, diagnosable error —
+/// never consulted on the happy path, so a ledger that parses is returned
+/// identically to today. `format` is read as an unsigned integer ONLY (Cond
+/// 15): a string, float, negative, or otherwise non-`u32` value is treated as
+/// absent, never a panic or a version claim.
+fn ledger_version_probe(path: &Path, text: &str, original: serde_json::Error) -> io::Error {
+    let original = io::Error::new(io::ErrorKind::InvalidData, original);
+    let Ok(probe) = serde_json::from_str::<serde_json::Value>(text) else {
+        // Not even JSON: the original serde error is preserved unchanged.
+        return original;
+    };
+    let format = probe
+        .get("format")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let path = path.display();
+    match format {
+        Some(found) if found > LEDGER_FORMAT => {
+            // Bounded like every other disk-derived string this binary
+            // surfaces (Cond 15/17 discipline) — a hostile/future ledger's
+            // `change` field is not trusted to be short.
+            const MAX_CHANGE_HINT_CHARS: usize = 200;
+            let change_hint = probe
+                .get("change")
+                .and_then(serde_json::Value::as_str)
+                .map(crate::harness::terminal_safe)
+                .map(|value| {
+                    if value.chars().count() > MAX_CHANGE_HINT_CHARS {
+                        value
+                            .chars()
+                            .take(MAX_CHANGE_HINT_CHARS)
+                            .collect::<String>()
+                            + "…"
+                    } else {
+                        value
+                    }
+                });
+            let message = match change_hint {
+                Some(change) => format!(
+                    "{path}: ledger for change {change:?} requires a newer mpd \
+                     (ledger format {found}, this binary supports up to {LEDGER_FORMAT})"
+                ),
+                None => format!(
+                    "{path}: this ledger requires a newer mpd \
+                     (ledger format {found}, this binary supports up to {LEDGER_FORMAT})"
+                ),
+            };
+            io::Error::new(io::ErrorKind::InvalidData, message)
+        }
+        // `format` parses but is <= LEDGER_FORMAT, or is absent entirely: we
+        // cannot distinguish corruption from forward-skew for pre-format
+        // ledgers, so the original serde error is kept, only given path
+        // context and an honest hint.
+        _ => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{path}: {original}\n  hint: this ledger may have been written by a newer or \
+                 different mpd"
+            ),
+        ),
+    }
 }
 
 /// Load a ledger together with the digest of the exact observed file image.
@@ -1667,7 +1760,7 @@ pub fn load_observed_exact(root: &Path, change: &str) -> io::Result<(Ledger, Led
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let digest = openspec_core::digest::Digest::of_bytes(text.as_bytes()).to_hex();
     let ledger =
-        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        serde_json::from_str(&text).map_err(|error| ledger_version_probe(&path, &text, error))?;
     Ok((
         ledger,
         LedgerObservation {
@@ -1799,7 +1892,17 @@ where
 }
 
 fn serialized_ledger(ledger: &Ledger) -> io::Result<String> {
-    let mut json = serde_json::to_string_pretty(ledger)
+    // D5: every durable write stamps the current format, regardless of what
+    // was loaded (a legacy ledger's defaulted `format: 1` never survives a
+    // resave under this binary).
+    let stamped = if ledger.format == LEDGER_FORMAT {
+        None
+    } else {
+        let mut stamped = ledger.clone();
+        stamped.format = LEDGER_FORMAT;
+        Some(stamped)
+    };
+    let mut json = serde_json::to_string_pretty(stamped.as_ref().unwrap_or(ledger))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     json.push('\n');
     Ok(json)
@@ -2588,6 +2691,172 @@ mod tests {
         let json = serde_json::to_string(&l).unwrap();
         let back: Ledger = serde_json::from_str(&json).unwrap();
         assert_eq!(l, back);
+    }
+
+    // D5: ledger version-skew guardrail.
+
+    #[test]
+    fn legacy_ledger_without_a_format_field_defaults_to_format_one() {
+        let json = r#"{
+            "change": "c", "schema": "mpd", "ui": false, "kind": "fix",
+            "phase": "build",
+            "gates": { "architecture": { "verdict": "pass", "by": "Architect", "at": "2026-07-11" } },
+            "conditions": []
+        }"#;
+        let l: Ledger = serde_json::from_str(json).unwrap();
+        assert_eq!(l.format, 1);
+    }
+
+    #[test]
+    fn new_ledger_is_stamped_with_the_current_format() {
+        let l = Ledger::new("c", "mpd", false, ChangeKind::Chore);
+        assert_eq!(l.format, LEDGER_FORMAT);
+    }
+
+    #[test]
+    fn save_always_stamps_the_current_format_even_over_a_legacy_in_memory_value() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-format-stamp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_locking_fixture(&root);
+        let mut ledger = Ledger::new("format-stamp", "mpd", false, ChangeKind::Chore);
+        // Simulate a ledger loaded from a pre-format-field file (defaulted to
+        // 1) that is now being resaved by this binary.
+        ledger.format = 1;
+        save(&root, &ledger).unwrap();
+        let raw = std::fs::read_to_string(state_path(&root, "format-stamp")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["format"], LEDGER_FORMAT);
+        // The in-memory value the caller holds is untouched — only the
+        // durable bytes are stamped.
+        assert_eq!(ledger.format, 1);
+        let reloaded = load(&root, "format-stamp").unwrap();
+        assert_eq!(reloaded.format, LEDGER_FORMAT);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_ledger_that_parses_is_returned_identically_regardless_of_format() {
+        // Cond 6: the probe runs ONLY on the failure path. A ledger that
+        // deserializes successfully — whatever its `format` value — must be
+        // returned exactly as today.
+        let root = std::env::temp_dir().join(format!(
+            "mpd-ledger-format-happy-path-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_locking_fixture(&root);
+        let ledger = Ledger::new("happy-path", "mpd", false, ChangeKind::Fix);
+        save(&root, &ledger).unwrap();
+        assert_eq!(load(&root, "happy-path").unwrap(), ledger);
+        let (observed_ledger, _) = load_observed(&root, "happy-path").unwrap();
+        assert_eq!(observed_ledger, ledger);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn format_exceeding_this_binary_produces_the_newer_mpd_message() {
+        // A future format introduces a genuinely incompatible shape (here:
+        // `phase`/`gates` are missing) — deserialization fails, and the
+        // probe sees `format: 99 > LEDGER_FORMAT`.
+        let json = r#"{"format": 99, "change": "future-thing", "schema": "mpd", "ui": false, "kind": "fix"}"#;
+        let error = serde_json::from_str::<Ledger>(json).unwrap_err();
+        let wrapped =
+            ledger_version_probe(Path::new("/repo/.mpd/state/future-thing.json"), json, error);
+        let message = wrapped.to_string();
+        assert!(
+            message.contains("requires a newer mpd"),
+            "message={message}"
+        );
+        assert!(message.contains("ledger format 99"), "message={message}");
+        assert!(
+            message.contains(&format!("up to {LEDGER_FORMAT}")),
+            "message={message}"
+        );
+        assert!(message.contains("future-thing"), "message={message}");
+        assert!(
+            message.contains("/repo/.mpd/state/future-thing.json"),
+            "message={message}"
+        );
+    }
+
+    #[test]
+    fn format_at_or_below_current_keeps_the_original_error_with_a_hint() {
+        for format_value in ["1", "2", &LEDGER_FORMAT.to_string()] {
+            let json = format!(
+                r#"{{"format": {format_value}, "change": "c", "schema": "mpd", "ui": false}}"#
+            );
+            let error = serde_json::from_str::<Ledger>(&json).unwrap_err();
+            let original_message = error.to_string();
+            let wrapped = ledger_version_probe(Path::new("/repo/.mpd/state/c.json"), &json, error);
+            let message = wrapped.to_string();
+            assert!(
+                !message.contains("requires a newer mpd"),
+                "message={message}"
+            );
+            assert!(message.contains(&original_message), "message={message}");
+            assert!(
+                message.contains("newer or different mpd"),
+                "message={message}"
+            );
+            assert!(
+                message.contains("/repo/.mpd/state/c.json"),
+                "message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_format_keeps_the_original_error_with_a_hint() {
+        let json = r#"{"change": "c", "schema": "mpd", "ui": false}"#;
+        let error = serde_json::from_str::<Ledger>(json).unwrap_err();
+        let original_message = error.to_string();
+        let wrapped = ledger_version_probe(Path::new("/repo/.mpd/state/c.json"), json, error);
+        let message = wrapped.to_string();
+        assert!(
+            !message.contains("requires a newer mpd"),
+            "message={message}"
+        );
+        assert!(message.contains(&original_message), "message={message}");
+        assert!(
+            message.contains("newer or different mpd"),
+            "message={message}"
+        );
+    }
+
+    #[test]
+    fn non_u32_format_values_are_treated_as_absent() {
+        // Cond 15: a string, float, or negative `format` must never be read
+        // as a version claim — it degrades to the original-error path.
+        for bad_format in [r#""5""#, "5.5", "-1", "true", "null"] {
+            let json = format!(
+                r#"{{"format": {bad_format}, "change": "c", "schema": "mpd", "ui": false}}"#
+            );
+            let error = serde_json::from_str::<Ledger>(&json).unwrap_err();
+            let wrapped = ledger_version_probe(Path::new("/repo/.mpd/state/c.json"), &json, error);
+            let message = wrapped.to_string();
+            assert!(
+                !message.contains("requires a newer mpd"),
+                "format={bad_format}: message={message}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_failure_on_non_json_leaves_the_original_error_unchanged() {
+        let text = "not json at all";
+        let error = serde_json::from_str::<Ledger>(text).unwrap_err();
+        let original_message = error.to_string();
+        let wrapped = ledger_version_probe(Path::new("/repo/.mpd/state/c.json"), text, error);
+        assert_eq!(wrapped.to_string(), original_message);
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod sandbox;
 #[cfg(target_os = "macos")]
 mod sandbox_macos;
 mod scaffold;
+mod stats;
 
 use std::process::ExitCode;
 

@@ -1,24 +1,6 @@
-# Change Manifest
+# Change Manifest Delta
 
-## Requirements
-
-### Requirement: Declared change scope
-
-Every new change SHALL carry a versioned manifest of repository-relative path
-patterns, and MPD SHALL treat its own active and generated archive paths as
-explicit system scope.
-
-#### Scenario: Staged path is outside scope
-
-- **WHEN** the Git index contains a changed path outside declared/system scope
-- **THEN** manifest state SHALL be blocked, the path SHALL be reported, and MPD
-  SHALL NOT alter the index
-
-#### Scenario: Path cannot be represented safely
-
-- **WHEN** a changed Git path is non-UTF-8, absolute, escaping, or otherwise
-  non-canonical
-- **THEN** closure SHALL fail closed with a path-safety blocker
+## MODIFIED Requirements
 
 ### Requirement: Archived closure commit
 
