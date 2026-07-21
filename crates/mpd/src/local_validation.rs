@@ -6336,6 +6336,17 @@ fn write_exclusive_private_file(path: &Path, bytes: &[u8]) -> Result<(), String>
     file.sync_all().map_err(|error| error.to_string())
 }
 
+/// Push-authorization domain-separation tags (not secrets — see Cond 6/15 of
+/// `secret-fixture-hygiene`). Hoisted to `concat!`-built consts so the
+/// compiled bytes — and therefore `push_authorization_id` — are unchanged
+/// from the un-split byte-string literals they replace: `concat!` is
+/// compile-time concatenation, so `OUTGOING_SCAN_TAG.as_bytes()` and
+/// `SECRET_RULES_TAG.as_bytes()` produce identical bytes to before this
+/// hoist. Pinned by
+/// `push_authorization_digest_tags_are_pinned_to_their_pre_refactor_bytes`.
+const OUTGOING_SCAN_TAG: &str = concat!("mpd-builtin-", "outgoing-secret-scan-v2");
+const SECRET_RULES_TAG: &str = concat!("mpd-builtin-", "secret-rules-v1");
+
 /// Authorize one complete pre-push invocation without mutating the repository.
 /// `remote_name` and `remote_location` are bounded display context only: object
 /// discovery comes solely from Git's supplied object names and local object
@@ -6516,8 +6527,8 @@ pub fn authorize_pre_push(
         // only `scanner_digest` bumps. Bumping `rules_digest` too would be
         // dishonest: nothing about the rule set actually changed (Cond 10 —
         // scanner digests are honest, not incremented reflexively).
-        scanner_digest: Digest::of_bytes(b"mpd-builtin-outgoing-secret-scan-v2").to_hex(),
-        rules_digest: Digest::of_bytes(b"mpd-builtin-secret-rules-v1").to_hex(),
+        scanner_digest: Digest::of_bytes(OUTGOING_SCAN_TAG.as_bytes()).to_hex(),
+        rules_digest: Digest::of_bytes(SECRET_RULES_TAG.as_bytes()).to_hex(),
         trusted_policy_digest,
         effective_policy_digest,
     };
@@ -11810,17 +11821,42 @@ mod tests {
 
     #[test]
     fn durable_log_summary_never_contains_raw_credentials_or_high_entropy_canaries() {
-        let secret = b"password=hunter2 MPD_SECRET_CANARY AKIAIOSFODNN7EXAMPLE \
-            xoxb-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture";
+        // Assembled from split literals (design D3) so this fixture stays
+        // scanner-clean as source text; the runtime bytes are byte-for-byte
+        // the fixture this replaces — see the redaction assertions below,
+        // each of which keeps its exact prior meaning.
+        let aws = format!("AKIA{}", "IOSFODNN7EXAMPLE");
+        let slack = format!("xox{}", "b-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture");
+        let secret = format!("password=hunter{} MPD_SECRET_CANARY {aws} {slack}", 2);
         let high_entropy = b"c5f7c4b930504fe89d9cb853a3a710d7b6d632e456af0de99e84f8d20e7f4301";
-        let summary = redact_output(secret, high_entropy);
+        let summary = redact_output(secret.as_bytes(), high_entropy);
         let rendered = String::from_utf8(summary).unwrap();
         assert!(!rendered.contains("hunter2"));
         assert!(!rendered.contains("MPD_SECRET_CANARY"));
-        assert!(!rendered.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(!rendered.contains("xoxb-"));
+        assert!(!rendered.contains(&aws));
+        assert!(!rendered.contains(&format!("xox{}", "b-")));
         assert!(!rendered.contains(std::str::from_utf8(high_entropy).unwrap()));
         assert!(rendered.contains("\"raw_output_retained\":false"));
+    }
+
+    #[test]
+    fn push_authorization_digest_tags_are_pinned_to_their_pre_refactor_bytes() {
+        // Condition 15: these hex values were computed independently, via
+        // `shasum -a 256`, from the exact PRE-CHANGE byte-string literals
+        // that `OUTGOING_SCAN_TAG`/`SECRET_RULES_TAG` above replace — before
+        // those consts existed. They are not derived from the refactored
+        // code, so this assertion cannot bless a corrupted split; a mismatch
+        // means push-authorization identity moved.
+        let expected_outgoing = "1692455ed0b33838a5118fab8cc4cc97b8d148df2bd0539c042a348930dca302";
+        let expected_rules = "373fb2d875bb435747854a9e2e09791d8a07e67192a00d5d17f9ed089721bfa6";
+        assert_eq!(
+            Digest::of_bytes(OUTGOING_SCAN_TAG.as_bytes()).to_hex(),
+            expected_outgoing
+        );
+        assert_eq!(
+            Digest::of_bytes(SECRET_RULES_TAG.as_bytes()).to_hex(),
+            expected_rules
+        );
     }
 
     #[test]
@@ -13094,16 +13130,12 @@ mod tests {
         );
 
         // Tag messages are separate transferred metadata, even when the tagged
-        // commit tree itself is clean.
+        // commit tree itself is clean. Assembled from split literals so this
+        // fixture stays scanner-clean as source text (design D3); the
+        // runtime message is unchanged.
+        let tag_message = format!("token = {}{}", "abc123abc123", "abc123abc123");
         assert!(Command::new("git")
-            .args([
-                "tag",
-                "-a",
-                "leaky",
-                "-m",
-                "token = abc123abc123abc123abc123",
-                &baseline
-            ])
+            .args(["tag", "-a", "leaky", "-m", &tag_message, &baseline])
             .current_dir(&root)
             .status()
             .unwrap()
@@ -13122,13 +13154,10 @@ mod tests {
         // Commit messages are transferred metadata too. A pre-existing
         // receipt-like note is deliberately irrelevant: every invocation must
         // perform this fixed outgoing scan before source receipt reuse.
+        // Assembled from split literals (design D3); runtime message unchanged.
+        let commit_message = format!("token = {}{}", "abc123abc123", "abc123abc123");
         assert!(Command::new("git")
-            .args([
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "token = abc123abc123abc123abc123"
-            ])
+            .args(["commit", "--allow-empty", "-qm", &commit_message])
             .current_dir(&root)
             .status()
             .unwrap()

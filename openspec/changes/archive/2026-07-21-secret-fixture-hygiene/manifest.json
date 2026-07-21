@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "paths": [
+    ".claude/pipeline-gates.json",
+    ".mpd/secret-allowlist.json",
+    ".mpd/state/secret-fixture-hygiene.json",
+    "crates/mpd/**",
+    "docs/secret-fixture-hygiene.md",
+    "openspec/changes/secret-fixture-hygiene/**",
+    "openspec/specs/**"
+  ],
+  "shared_paths": []
+}

@@ -104,13 +104,21 @@ fn scan_line_windows(line: &str) -> Option<&'static str> {
 
 /// Inspect one line, returning the first matching rule.
 fn scan_line(line: &str) -> Option<&'static str> {
-    if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
+    // These two rules match bare prefixes with no tail-length requirement, so
+    // (uniquely among the rules below) their own definition literals would
+    // self-match as source text. `concat!` is compile-time concatenation: the
+    // compiled `&'static str` patterns are byte-identical to the un-split
+    // literals — this changes no matcher behavior (design D1).
+    if line.contains(concat!("-----", "BEGIN")) && line.contains(concat!("PRIVATE", " KEY")) {
         return Some("private-key-block");
     }
     if has_aws_access_key(line) {
         return Some("aws-access-key-id");
     }
-    if line.contains("xoxb-") || line.contains("xoxp-") || line.contains("xoxa-") {
+    if line.contains(concat!("xox", "b-"))
+        || line.contains(concat!("xox", "p-"))
+        || line.contains(concat!("xox", "a-"))
+    {
         return Some("slack-token");
     }
     if contains_prefixed_token(line, "ghp_", 36) || contains_prefixed_token(line, "github_pat_", 22)
@@ -316,13 +324,37 @@ pub fn scan_paths(paths: &[PathBuf]) -> io::Result<Vec<Finding>> {
     Ok(findings)
 }
 
+/// Path+rule scoped exceptions to the scanner-clean source invariant enforced
+/// by `first_party_source_is_scanner_clean` below. Empty by design. Any
+/// addition needs a comment justifying why the text cannot be split, and must
+/// never cover a full-token-shaped literal.
+#[cfg(test)]
+const SOURCE_HYGIENE_ALLOW: &[(&str, &str)] = &[];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Fixture secrets are assembled from split literals so the source file
-    // itself contains no contiguous credential pattern (keeps generic secret
-    // scanners — including the commit gate — from flagging the test data).
+    // Doctrine: every source line under `crates/**` must scan clean under
+    // this module's own detection — fixtures, assertions, rule-definition
+    // literals, and production constants alike (design `secret-fixture-hygiene`,
+    // decision D1). Two rules match bare prefixes with no tail requirement
+    // (slack-token, private-key-block), so even *this file's own rule
+    // definitions* would self-match as plain text; every rule literal below
+    // is therefore split with `concat!` (compile-time, byte-identical
+    // runtime value), and every fixture is assembled at runtime — e.g.
+    // `format!("key = AKIA{}", "IOSFODNN7EXAMPLE")` and
+    // `concat!("-----BEGIN RSA PRI", "VATE KEY-----")` — so the secret-shaped
+    // value never appears contiguously in source text while the runtime
+    // value still exercises detection at full strength. This is enforced
+    // mechanically, not just by convention: `first_party_source_is_scanner_clean`
+    // (below) walks every regular file under `crates/` and feeds it to this
+    // module's own production `scan_paths`, asserting zero findings against
+    // an empty `SOURCE_HYGIENE_ALLOW`. When adding a new fixture or rule
+    // literal, split it the same way or the test suite will fail with the
+    // exact `path:line rule` of the offending text.
 
     #[test]
     fn detects_aws_key() {
@@ -354,7 +386,7 @@ mod tests {
     fn ignores_ordinary_code() {
         assert_eq!(scan_line("let token = next_token();"), None);
         assert_eq!(scan_line("// remember to rotate the password"), None);
-        assert_eq!(scan_line("fn secret() -> u32 { 42 }"), None);
+        assert_eq!(scan_line(concat!("fn secret() -> u32 ", "{ 42 }")), None);
         assert_eq!(scan_line("if provided_token == expected_token {"), None);
     }
 
@@ -370,14 +402,28 @@ mod tests {
 
     #[test]
     fn detects_unquoted_env_assignment() {
+        let aws_style = format!("AWS_SECRET={}", "hunter2verylongvalue1234567");
+        assert_eq!(scan_line(&aws_style), Some("generic-secret-assignment"));
+        let password_style = format!("password: {}", "hunter2verylongvalue1234567");
         assert_eq!(
-            scan_line("AWS_SECRET=hunter2verylongvalue1234567"),
+            scan_line(&password_style),
             Some("generic-secret-assignment")
         );
-        assert_eq!(
-            scan_line("password: hunter2verylongvalue1234567"),
-            Some("generic-secret-assignment")
-        );
+    }
+
+    #[test]
+    fn detects_slack_tokens_for_every_prefix() {
+        // Condition 11: slack-token had zero positive-detection coverage
+        // before this change, so a typo while splitting the rule literal at
+        // :113 could silently disable it with no failing test. Each prefix
+        // is assembled at runtime from split fragments so the fixture itself
+        // stays scanner-clean as source text.
+        let xoxb = format!("xox{}", "b-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture");
+        assert_eq!(scan_line(&xoxb), Some("slack-token"));
+        let xoxp = format!("xox{}", "p-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture");
+        assert_eq!(scan_line(&xoxp), Some("slack-token"));
+        let xoxa = format!("xox{}", "a-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture");
+        assert_eq!(scan_line(&xoxa), Some("slack-token"));
     }
 
     #[test]
@@ -401,5 +447,232 @@ mod tests {
             Some("key-material-file")
         );
         assert_eq!(suspicious_filename(Path::new("src/main.rs")), None);
+    }
+
+    /// Recursively collect every regular file under `dir`, skipping any path
+    /// with a `target` component and skipping symlinks and other non-regular
+    /// entries. `read_dir`/`file_type` errors propagate (fail-closed — see
+    /// Condition 9): an unreadable directory must fail the test, never be
+    /// silently treated as empty.
+    fn walk_regular_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.components().any(|c| c.as_os_str() == "target") {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                walk_regular_files(&path, out)?;
+            } else if file_type.is_file() {
+                out.push(path);
+            }
+            // Other non-regular entry kinds (fifo, socket, ...) are skipped —
+            // `scan_paths` itself refuses non-regular paths handed to it, so
+            // this walker never hands it one in the first place.
+        }
+        Ok(())
+    }
+
+    /// What one guard run yields: the walked file list (for vacuity checks)
+    /// and the findings that survived the allow filter.
+    type GuardOutcome = (Vec<PathBuf>, Vec<Finding>);
+
+    /// The guard machinery, reusable against any root: walk (fail-closed),
+    /// scan with the PRODUCTION `scan_paths`, filter through an allow slice
+    /// scoped as (path-suffix, rule). Both the real guard
+    /// (`first_party_source_is_scanner_clean`) and its efficacy proof
+    /// (`guard_catches_a_reintroduced_contiguous_secret`) drive this exact
+    /// code path, so the proof cannot drift from the guard it certifies.
+    fn run_scanner_clean_guard(root: &Path, allow: &[(&str, &str)]) -> io::Result<GuardOutcome> {
+        let mut files = Vec::new();
+        walk_regular_files(root, &mut files)?;
+        files.sort();
+        let findings = scan_paths(&files)?;
+        let remaining = findings
+            .into_iter()
+            .filter(|f| {
+                !allow
+                    .iter()
+                    .any(|(suffix, rule)| f.path.ends_with(suffix) && f.rule == *rule)
+            })
+            .collect();
+        Ok((files, remaining))
+    }
+
+    /// The self-enforcing guard (design decision D2, Conditions 2/3/9/13/14):
+    /// walk every regular file under `crates/`, scan it with the PRODUCTION
+    /// detector (`scan_paths` — never `checks::scan_secrets`, whose
+    /// `unwrap_or_default()` fail-open would silently turn a scan error into
+    /// a clean report), and assert zero findings survive the (empty, by
+    /// design) `SOURCE_HYGIENE_ALLOW`.
+    #[test]
+    fn first_party_source_is_scanner_clean() {
+        // CARGO_MANIFEST_DIR is `<repo>/crates/mpd`; its grandparent is the
+        // repo root, and `<repo>/crates` is the tree this guard protects.
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("CARGO_MANIFEST_DIR must have a repo root two levels up");
+        let crates_root = repo_root.join("crates");
+
+        let (files, remaining) = run_scanner_clean_guard(&crates_root, SOURCE_HYGIENE_ALLOW)
+            .expect("walking and scanning crates/ for the scanner-clean guard must not fail");
+
+        // Condition 14 — vacuous-pass guard: a root-resolution drift that
+        // silently walks nothing (or the wrong tree) must not read as green.
+        assert!(
+            !files.is_empty(),
+            "scanner-clean guard walked zero files under {} — root resolution likely drifted",
+            crates_root.display()
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("checks/secrets.rs")),
+            "scanner-clean guard's walk did not include checks/secrets.rs itself — \
+             root resolution likely drifted (Condition 14)"
+        );
+
+        if !remaining.is_empty() {
+            for f in &remaining {
+                eprintln!(
+                    "{}:{} {} — assemble the value from split literals; see the \
+                     doctrine comment at the top of this test module",
+                    f.path, f.line, f.rule
+                );
+            }
+            panic!(
+                "{} scanner-matchable finding(s) in first-party source under crates/ \
+                 (see stderr for path:line rule + remediation)",
+                remaining.len()
+            );
+        }
+    }
+
+    /// Guard efficacy (the guard itself must be falsifiable): drive the exact
+    /// machinery of `first_party_source_is_scanner_clean` over a synthetic
+    /// tree carrying a reintroduced contiguous Slack-shaped value — the
+    /// incident class — and prove the guard reports it, that the `target/`
+    /// exclusion holds, that an allow entry excuses only its exact
+    /// (path-suffix, rule) pair, and that a failed walk errors rather than
+    /// reading as clean (Condition 9). The planted value is assembled at
+    /// runtime from split fragments so this source file stays scanner-clean;
+    /// the temp file on disk carries the contiguous bytes the guard must see.
+    #[test]
+    fn guard_catches_a_reintroduced_contiguous_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-hygiene-guard-efficacy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("fake-crate").join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("clean.rs"), "fn quiet() {}\n").unwrap();
+        let planted = format!(
+            "let leaked = \"xox{}\";\n",
+            "b-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture"
+        );
+        std::fs::write(src.join("leaky.rs"), &planted).unwrap();
+        // The same bytes under a `target/` component are deliberately outside
+        // the guard's ground (design D2): build artifacts are excluded.
+        let target = root.join("fake-crate").join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("artifact.rs"), &planted).unwrap();
+
+        let (files, remaining) = run_scanner_clean_guard(&root, SOURCE_HYGIENE_ALLOW)
+            .expect("guard walk+scan over the synthetic tree");
+        assert_eq!(
+            files.len(),
+            2,
+            "walk must see exactly the two regular non-target files"
+        );
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the shipped guard configuration must report exactly the plant"
+        );
+        assert!(remaining[0].path.ends_with("leaky.rs"));
+        assert_eq!(remaining[0].line, 1);
+        assert_eq!(remaining[0].rule, "slack-token");
+
+        // Allow-filter scope: the exact (path-suffix, rule) pair excuses the
+        // plant; a same-path entry for a different rule excuses nothing.
+        let excused = run_scanner_clean_guard(&root, &[("leaky.rs", "slack-token")])
+            .unwrap()
+            .1;
+        assert!(excused.is_empty());
+        let wrong_rule = run_scanner_clean_guard(&root, &[("leaky.rs", "aws-access-key-id")])
+            .unwrap()
+            .1;
+        assert_eq!(wrong_rule.len(), 1);
+
+        // Fail-closed: a root whose walk errors must surface the error, never
+        // report an empty (clean-looking) outcome.
+        assert!(
+            run_scanner_clean_guard(&root.join("no-such-dir"), SOURCE_HYGIENE_ALLOW).is_err(),
+            "guard must fail closed when the walk itself fails"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Regression pin, discovered by `detection_is_invariant_to_token_position`
+    /// (persisted seed: `proptest-regressions/checks/secrets.txt`): when the
+    /// first scan window truncates a `ghp_` tail below its 36-char minimum
+    /// AND the line carries a secret-ish keyword, the generic rule fires in
+    /// that window before a later window can see the full curated token. The
+    /// LABEL softens; detection never disappears — either way a finding is
+    /// produced and the commit blocks. Pin the exact behavior so a future
+    /// "fix" cannot turn the softened label into a miss.
+    #[test]
+    fn window_truncated_keyworded_token_still_blocks_as_generic() {
+        let pad = MAX_SCAN_LINE - 45; // first window cuts the tail to 35 chars
+        let line = format!("{}token=ghp_{}", "x".repeat(pad), "a1".repeat(20));
+        assert_eq!(scan_line_windows(&line), Some("generic-secret-assignment"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        /// Metamorphic position-invariance (seeded + reproducible: failures
+        /// persist under `crates/mpd/proptest-regressions/`): a detectable
+        /// value is found — under its own rule — no matter how much padding
+        /// precedes it, including when the line exceeds `MAX_SCAN_LINE` and
+        /// the match must come from a later window via the
+        /// `SCAN_WINDOW_OVERLAP` straddle region. Guards the windowing logic
+        /// and re-exercises the split rule literals at arbitrary offsets.
+        /// The straddle band around the first window boundary is sampled
+        /// explicitly, not left to chance. (Fixtures here carry no generic
+        /// keyword, so no other rule can pre-empt the expected label at a
+        /// truncation boundary; the keyworded variant of that edge is pinned
+        /// by `window_truncated_keyworded_token_still_blocks_as_generic`.)
+        #[test]
+        fn detection_is_invariant_to_token_position(
+            pad in prop_oneof![
+                0usize..(MAX_SCAN_LINE * 2),
+                (MAX_SCAN_LINE - 64)..(MAX_SCAN_LINE + 64),
+            ],
+            which in 0usize..3,
+        ) {
+            let (fixture, expected) = match which {
+                0 => (
+                    format!("xox{}", "b-EXAMPLE-PLACEHOLDER-notarealslacktokenfixture"),
+                    "slack-token",
+                ),
+                1 => (
+                    format!("key = AKIA{}", "IOSFODNN7EXAMPLE"),
+                    "aws-access-key-id",
+                ),
+                _ => (format!("ghp_{}", "a1".repeat(20)), "github-token"),
+            };
+            let line = format!("{}{}", "x".repeat(pad), fixture);
+            prop_assert_eq!(scan_line_windows(&line), Some(expected));
+        }
     }
 }
