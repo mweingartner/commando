@@ -4666,6 +4666,238 @@ fn union_closure_scope(
     Ok(rows)
 }
 
+/// D2 Condition 11 (security-plan): whether the staged diff itself removes
+/// `path` — the archived-closure fallback's unforgeable trigger signature.
+/// Status `D` (destination deleted) or `R` (renamed away, i.e.
+/// `orig_path == path`) trigger; status `C` (copy) never does — the path
+/// remains present as a copy source's *sibling*, and `path` itself still
+/// exists post-copy only when `path` is the copy's origin, which a rename/
+/// copy of a protected artifact already blocks in the ordinary path. Exact
+/// equality only, never a prefix/suffix match.
+fn stages_removal_of(entries: &[git::DiffEntry], path: &str) -> bool {
+    entries.iter().any(|entry| match entry.status {
+        'D' => entry.path == path,
+        'R' => entry.orig_path.as_deref() == Some(path),
+        _ => false,
+    })
+}
+
+/// D5 (Conditions 8/11): if some staged `D`-destination or `R`-origin path is
+/// exactly `openspec/changes/<X>/manifest.json` for a name `X` that itself
+/// passes `validate_change_name`, return `X`. Used only to enrich guidance
+/// text — e.g. when there is no resolvable coordinator, or when the ordinary
+/// coverage check trips on a *different* change's own manifest path — never
+/// to select which ledger authorizes a commit: a staged-path-derived name
+/// may appear only in error text (Condition 11).
+fn removed_manifest_change_name(entries: &[git::DiffEntry]) -> Option<String> {
+    entries.iter().find_map(|entry| {
+        let candidate = match entry.status {
+            'D' => Some(entry.path.as_str()),
+            'R' => entry.orig_path.as_deref(),
+            _ => None,
+        };
+        candidate.and_then(|path| {
+            let name = path
+                .strip_prefix("openspec/changes/")?
+                .strip_suffix("/manifest.json")?;
+            if name.is_empty() || name.contains('/') {
+                return None;
+            }
+            openspec_core::validate_change_name(name)
+                .ok()
+                .map(|()| name.to_string())
+        })
+    })
+}
+
+/// D5: the recovery-guidance sentence appended when a closure-shaped staged
+/// diff (a manifest deletion) is detected for change `name` but its pending
+/// transaction is not (or is no longer) the active coordinator. Never
+/// suggests `mpd archive --recover` — that requires the pointer `abandon`
+/// deleted — and never directs the operator to re-create the active
+/// manifest (the opposite of what closed the footgun this fallback exists
+/// for). `name` has already passed `validate_change_name`; `terminal_safe`
+/// is applied anyway per Condition 8's blanket hygiene rule.
+fn closure_recovery_hint(name: &str) -> String {
+    let name = harness::terminal_safe(name);
+    format!(
+        " A closure-shaped staged change for {name:?} was detected without its pending \
+         transaction; the closure commit belongs before `mpd archive --abandon --yes`. To \
+         commit it now: run `mpd use {name}` and retry. Do not re-create \
+         openspec/changes/{name}/manifest.json."
+    )
+}
+
+/// Cond 12 (security-plan): bound + sanitize a ledger-record- or
+/// closure-plan-derived string before it reaches hook output. Neither is
+/// staged content, but the worktree ledger (and the closure plan it names)
+/// is owner-writable and therefore attacker-controlled text under this arm's
+/// own threat model — mirrors the `ledger_version_probe` precedent
+/// (`ledger.rs:1690-1708`).
+fn bounded_record_hint(value: &str) -> String {
+    const MAX_RECORD_HINT_CHARS: usize = 200;
+    let safe = harness::terminal_safe(value);
+    if safe.chars().count() > MAX_RECORD_HINT_CHARS {
+        safe.chars().take(MAX_RECORD_HINT_CHARS).collect::<String>() + "…"
+    } else {
+        safe
+    }
+}
+
+/// D1/D2 (Conditions 2-6, 14): the archived-closure fallback's sole
+/// authority. Call only once the ELSE branch's exhaustive trigger holds (no
+/// pending closure; the resolved change's OWN active manifest is being
+/// removed by the staged diff; its worktree ledger carries an
+/// `archive_closure` record — see `stages_removal_of`). Returns the
+/// authorized scope — `record.system_paths` unioned with the retained
+/// Candidate closure plan's validated entries, via the SAME
+/// `union_closure_scope` the AwaitingCommit branch uses — or a fail-closed
+/// block reason. Reuses only the existing hardened loader
+/// (`load_candidate_closure_plan`: no-follow open, 64 MiB cap, canonical
+/// round-trip, transaction-id binding); never reads the archived manifest
+/// (index or worktree) or any other worktree file, so nothing but this
+/// record+plan pair can ever authorize (Condition 14) — an additional check
+/// may only narrow/block, never widen.
+fn archived_closure_fallback_scope(
+    root: &Path,
+    record: &ArchiveClosure,
+) -> Result<Vec<String>, String> {
+    if record.system_paths.is_empty() {
+        // D2.5: a pre-`system_paths` legacy record degrades to empty and
+        // must fail closed here, exactly as `manifest_view` does.
+        return Err(
+            "pre-commit blocked: archived closure record has no concrete recorded scope \
+             (legacy record predates system_paths); this commit cannot be authorized from it"
+                .to_string(),
+        );
+    }
+    let plan = match &record.candidate_id {
+        Some(candidate_id) => {
+            let transaction_id = record.transaction_id.to_hex();
+            let plan =
+                closure::load_candidate_closure_plan(root, &transaction_id).map_err(|_| {
+                    format!(
+                        "pre-commit blocked: archived closure plan for candidate {} is missing or \
+                     invalid; refusing to authorize this commit",
+                        bounded_record_hint(candidate_id)
+                    )
+                })?;
+            // D2.6/Cond 5: mirror `verify_commit_coherence`'s binding check
+            // (`closure.rs:3284-3288`) field-for-field. Any mismatch blocks —
+            // never a silent narrowing to `system_paths` alone.
+            if &plan.candidate_id != candidate_id
+                || plan.candidate_base_commit != record.base_commit
+                || plan.archive_path != record.archive_path
+                || plan.archive_transaction_id != transaction_id
+            {
+                return Err(format!(
+                    "pre-commit blocked: archived closure plan binding differs from the \
+                     archive record (archive path {}); refusing to authorize this commit",
+                    bounded_record_hint(&record.archive_path)
+                ));
+            }
+            Some(Ok(plan))
+        }
+        // D2.6: a legacy (pre-Candidate) archive expected no plan; keep the
+        // concrete-footprint scope alone, matching `union_closure_scope`'s
+        // `None` semantics.
+        None => None,
+    };
+    // Reuse the identical widen-or-block scope union the AwaitingCommit
+    // branch runs, with `system_paths` as the rows argument (D1).
+    union_closure_scope(record.system_paths.clone(), plan)
+        .map_err(|error| format!("pre-commit blocked: {error}"))
+}
+
+/// The ELSE branch's ordinary (non-closure) authority: the resolved change's
+/// own active manifest + ledger, read from authoritative index postimages
+/// (never the worktree) so an unstaged edit can never broaden the decision.
+/// Factored out so it runs byte-identically from every call site — no
+/// pending closure and no fallback trigger, or no pending closure with a
+/// fallback trigger whose ledger carries no archive record (security-plan
+/// Condition 10) — with no risk of the copies drifting apart.
+fn ordinary_else_governance(
+    root: &Path,
+    change: &str,
+    entries: &[git::DiffEntry],
+    manifest_path: &str,
+    tasks_path: &str,
+    ledger_path: &str,
+    judgment_paths: &[String],
+) -> Result<ledger::Ledger, String> {
+    let protected = |path: &str| {
+        path == manifest_path
+            || path == tasks_path
+            || path == ledger_path
+            || judgment_paths.iter().any(|candidate| candidate == path)
+    };
+    for entry in entries {
+        if entry.status == 'D' && protected(&entry.path) {
+            return Err(format!(
+                "pre-commit blocked: deletion of required governance artifact {}",
+                entry.path
+            ));
+        }
+        if matches!(entry.status, 'R' | 'C') && entry.orig_path.as_deref().is_some_and(protected) {
+            return Err("pre-commit blocked: rename/copy of required governance artifact".into());
+        }
+    }
+
+    // The manifest and ledger are read from `:<path>` even when they are not
+    // part of this staged diff, so an unstaged worktree edit cannot broaden
+    // a hook decision. A missing index object is a coherence failure, not a
+    // reason to fall back to the worktree.
+    let manifest_bytes = git::staged_blob(root, manifest_path).map_err(|_| {
+        "pre-commit blocked: active manifest is absent or unreadable in the index".to_string()
+    })?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes)
+        .map_err(|_| "pre-commit blocked: active manifest is not UTF-8")?;
+    let manifest: closure::ChangeManifest = serde_json::from_str(manifest_text)
+        .map_err(|_| "pre-commit blocked: active manifest is malformed")?;
+    if !manifest.validate().is_empty() {
+        return Err("pre-commit blocked: active manifest has invalid scope".into());
+    }
+    let ledger_bytes = git::staged_blob(root, ledger_path).map_err(|_| {
+        "pre-commit blocked: active ledger is absent or unreadable in the index".to_string()
+    })?;
+    let ledger: ledger::Ledger = serde_json::from_slice(&ledger_bytes)
+        .map_err(|_| "pre-commit blocked: active ledger is malformed")?;
+    if ledger.change != change || !ledger.integrity_blockers().is_empty() {
+        return Err("pre-commit blocked: active ledger is incoherent".into());
+    }
+
+    let system = closure::active_system_scope(root, change);
+    for entry in entries {
+        for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
+            let policy_path = path == ".mpd/config.json"
+                || path.starts_with(".mpd/directives/")
+                || path == ".githooks/pre-commit"
+                || path == ".githooks/pre-push";
+            if !policy_path && !manifest.covers(path, &system) {
+                let mut message = format!(
+                    "pre-commit blocked: staged path falls outside active manifest scope: {}",
+                    harness::terminal_safe(path)
+                );
+                // D5: if the out-of-scope path is itself a DIFFERENT
+                // change's own active-manifest path, the operator very
+                // likely coordinated the wrong change for a closure commit.
+                // Text only — never used to pick an authority (Condition
+                // 11) — so this cannot widen what gets authorized.
+                if let Some(other) = path
+                    .strip_prefix("openspec/changes/")
+                    .and_then(|rest| rest.strip_suffix("/manifest.json"))
+                    .filter(|name| *name != change && !name.contains('/'))
+                    .filter(|name| openspec_core::validate_change_name(name).is_ok())
+                {
+                    message.push_str(&closure_recovery_hint(other));
+                }
+                return Err(message);
+            }
+        }
+    }
+    Ok(ledger)
+}
+
 /// Validate the staged governance record used by the pre-commit hook.  This is
 /// intentionally separate from `manifest_view`: the latter is a status UI and
 /// may inspect the worktree, while a hook must make its decision solely from
@@ -4714,8 +4946,30 @@ fn staged_precommit_governance(root: &Path) -> Result<(), String> {
         .map(|view| view.change.clone())
         .map(Ok)
         .unwrap_or_else(|| {
-            resolve_change(root, None)
-                .map_err(|_| "pre-commit blocked: no active change coordinator".to_string())
+            resolve_change(root, None).map_err(|_| {
+                // D5: no active coordinator is the exact post-abandon state
+                // this fallback exists to recover from. If the staged diff
+                // is closure-shaped (removes some change X's own active
+                // manifest), name X and point at the recovery command
+                // instead of the bare generic message — never suggesting
+                // `mpd archive --recover` (recover needs the pointer
+                // `abandon` deleted) and never re-creating the manifest.
+                // Best-effort only: a failure reading the staged diff here
+                // just falls back to the generic message, which is what the
+                // main flow's own `diff_cached_name_status` call below would
+                // then also report.
+                let hint = git::diff_cached_name_status(root)
+                    .ok()
+                    .as_deref()
+                    .and_then(removed_manifest_change_name);
+                match hint {
+                    Some(name) => format!(
+                        "pre-commit blocked: no active change coordinator.{}",
+                        closure_recovery_hint(&name)
+                    ),
+                    None => "pre-commit blocked: no active change coordinator".to_string(),
+                }
+            })
         })?;
     let entries = git::diff_cached_name_status(root)
         .map_err(|error| format!("pre-commit blocked: cannot parse staged changes: {error}"))?;
@@ -4765,68 +5019,74 @@ fn staged_precommit_governance(root: &Path) -> Result<(), String> {
             }
         }
         None
-    } else {
-        let protected = |path: &str| {
-            path == manifest_path
-                || path == tasks_path
-                || path == ledger_path
-                || judgment_paths.iter().any(|candidate| candidate == path)
-        };
-        for entry in &entries {
-            if entry.status == 'D' && protected(&entry.path) {
-                return Err(format!(
-                    "pre-commit blocked: deletion of required governance artifact {}",
-                    entry.path
-                ));
-            }
-            if matches!(entry.status, 'R' | 'C')
-                && entry.orig_path.as_deref().is_some_and(protected)
-            {
+    } else if stages_removal_of(&entries, &manifest_path) {
+        // D2/Condition 10: the fallback trigger's unforgeable manifest-
+        // removal signature holds for the RESOLVED change — never a
+        // staged-path-derived name (Condition 11). Resolve the archive
+        // record from the worktree ledger: the one authority
+        // `abandon_apply` never touches (`transaction.rs:1536-1561`).
+        match ledger::load(root, &change) {
+            Ok(ledger_doc) => match ledger_doc.archive_closure {
+                Some(record) => {
+                    // D2.5/D2.6, Condition 4/5/14: the record+plan pair is
+                    // the sole authorizing input; any failure here blocks,
+                    // never narrows, never falls through to the ordinary
+                    // manifest read.
+                    let scope = archived_closure_fallback_scope(root, &record)?;
+                    for entry in &entries {
+                        for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
+                            let policy_path = path == ".mpd/config.json"
+                                || path.starts_with(".mpd/directives/")
+                                || path == ".githooks/pre-commit"
+                                || path == ".githooks/pre-push";
+                            if !policy_path && !closure::covers_concrete_paths(&scope, path) {
+                                return Err(format!(
+                                    "pre-commit blocked: staged path falls outside archived \
+                                     closure scope: {}",
+                                    harness::terminal_safe(path)
+                                ));
+                            }
+                        }
+                    }
+                    None
+                }
+                // Condition 10: no archive record — the ordinary path runs
+                // byte-identical and blocks via its own protected-artifact
+                // check (spec scenario "Closure-shaped commit without an
+                // archive record"). Never a fallback-specific message here.
+                None => Some(ordinary_else_governance(
+                    root,
+                    &change,
+                    &entries,
+                    &manifest_path,
+                    &tasks_path,
+                    &ledger_path,
+                    &judgment_paths,
+                )?),
+            },
+            // Condition 10: a worktree ledger that cannot even be read is a
+            // distinct, specific failure — never falls through to the
+            // ordinary (index-based) manifest read, which could disagree
+            // with what was just observed in the worktree.
+            Err(_) => {
                 return Err(
-                    "pre-commit blocked: rename/copy of required governance artifact".into(),
+                    "pre-commit blocked: staged diff removes the active manifest for a change \
+                     whose ledger cannot be read; refusing to authorize this commit from an \
+                     unreadable archive record"
+                        .to_string(),
                 );
             }
         }
-
-        // The manifest and ledger are read from `:<path>` even when they are
-        // not part of this staged diff, so an unstaged worktree edit cannot
-        // broaden a hook decision. A missing index object is a coherence
-        // failure, not a reason to fall back to the worktree.
-        let manifest_bytes = git::staged_blob(root, &manifest_path).map_err(|_| {
-            "pre-commit blocked: active manifest is absent or unreadable in the index".to_string()
-        })?;
-        let manifest_text = std::str::from_utf8(&manifest_bytes)
-            .map_err(|_| "pre-commit blocked: active manifest is not UTF-8")?;
-        let manifest: closure::ChangeManifest = serde_json::from_str(manifest_text)
-            .map_err(|_| "pre-commit blocked: active manifest is malformed")?;
-        if !manifest.validate().is_empty() {
-            return Err("pre-commit blocked: active manifest has invalid scope".into());
-        }
-        let ledger_bytes = git::staged_blob(root, &ledger_path).map_err(|_| {
-            "pre-commit blocked: active ledger is absent or unreadable in the index".to_string()
-        })?;
-        let ledger: ledger::Ledger = serde_json::from_slice(&ledger_bytes)
-            .map_err(|_| "pre-commit blocked: active ledger is malformed")?;
-        if ledger.change != change || !ledger.integrity_blockers().is_empty() {
-            return Err("pre-commit blocked: active ledger is incoherent".into());
-        }
-
-        let system = closure::active_system_scope(root, &change);
-        for entry in &entries {
-            for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
-                let policy_path = path == ".mpd/config.json"
-                    || path.starts_with(".mpd/directives/")
-                    || path == ".githooks/pre-commit"
-                    || path == ".githooks/pre-push";
-                if !policy_path && !manifest.covers(path, &system) {
-                    return Err(format!(
-                        "pre-commit blocked: staged path falls outside active manifest scope: {}",
-                        harness::terminal_safe(path)
-                    ));
-                }
-            }
-        }
-        Some(ledger)
+    } else {
+        Some(ordinary_else_governance(
+            root,
+            &change,
+            &entries,
+            &manifest_path,
+            &tasks_path,
+            &ledger_path,
+            &judgment_paths,
+        )?)
     };
 
     for entry in &entries {
@@ -6099,6 +6359,16 @@ fn cmd_closure_abandon(root: &Path, yes: bool, json: bool) -> CmdResult {
                 println!(
                     "Abandoned the pending closure (removed only its own ignored metadata; \
                      repository targets are untouched)."
+                );
+                // D7: reiterate the intended order. Abandon is post-commit
+                // housekeeping — if the closure commit has not been made
+                // yet, the archived change can still be committed via
+                // `mpd use <change>` followed by `git commit` (the
+                // pre-commit gate authorizes it from the archive record).
+                println!(
+                    "If the closure commit has not been made yet: it still can be — run \
+                     `mpd use <change>` then `git commit` (do not re-create the active \
+                     manifest)."
                 );
             }
             Ok(0)
@@ -7944,15 +8214,16 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_artifact_actor, canonical_artifact_verdict, check_documentation, check_sections,
+        archived_closure_fallback_scope, bounded_record_hint, canonical_artifact_actor,
+        canonical_artifact_verdict, check_documentation, check_sections, closure_recovery_hint,
         current_validation_status, dated_archive_matches, doctor_expected_pending_remote,
         doctor_installed_deploy_health, extract_section, has_unfilled_placeholder,
-        is_valid_date_prefix, parse_exploit, receipt_failure_fact, require_closure_plan,
-        resolve_runtime_head, resolve_runtime_ledger, retained_candidate_for_objective_gate,
-        runtime_doctor_findings_with_receipt, sandbox_blocker, strict_actor_separation_issue,
-        strict_gate_command, union_closure_scope, upstream_artifact_pointers,
-        validate_candidate_report_binding, validate_evidence, validate_introduced_by,
-        WorkflowOutcome, REQUIRED_DOC_SECTIONS,
+        is_valid_date_prefix, parse_exploit, receipt_failure_fact, removed_manifest_change_name,
+        require_closure_plan, resolve_runtime_head, resolve_runtime_ledger,
+        retained_candidate_for_objective_gate, runtime_doctor_findings_with_receipt,
+        sandbox_blocker, stages_removal_of, strict_actor_separation_issue, strict_gate_command,
+        union_closure_scope, upstream_artifact_pointers, validate_candidate_report_binding,
+        validate_evidence, validate_introduced_by, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
     };
     use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, Verdict};
     use crate::phase::{Applicability, Phase};
@@ -8080,6 +8351,311 @@ mod tests {
             assert!(error.contains("invalid"), "{error}");
             assert!(error.contains(reason), "{error}");
         }
+    }
+
+    fn diff_entry(status: char, path: &str, orig_path: Option<&str>) -> crate::git::DiffEntry {
+        crate::git::DiffEntry {
+            status,
+            score: None,
+            path: path.to_string(),
+            orig_path: orig_path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stages_removal_of_matches_delete_and_rename_origin_never_copy() {
+        // D2 Condition 11: exact equality only. `D` (destination) or `R`
+        // (origin) trigger; `C` (copy) never does — the path remains
+        // present as the copy's own destination, so a copy of the manifest
+        // never counts as "removed".
+        let target = "openspec/changes/thing/manifest.json";
+        assert!(stages_removal_of(&[diff_entry('D', target, None)], target));
+        assert!(stages_removal_of(
+            &[diff_entry(
+                'R',
+                "openspec/changes/archive/2026-01-01-thing/manifest.json",
+                Some(target)
+            )],
+            target
+        ));
+        assert!(!stages_removal_of(
+            &[diff_entry(
+                'C',
+                "openspec/changes/other/manifest.json",
+                Some(target)
+            )],
+            target
+        ));
+        assert!(!stages_removal_of(&[diff_entry('M', target, None)], target));
+        // A near-match must never trigger — byte-exact equality only, never
+        // a prefix/suffix match.
+        assert!(!stages_removal_of(
+            &[diff_entry(
+                'D',
+                "openspec/changes/thing-evil/manifest.json",
+                None
+            )],
+            target
+        ));
+        assert!(!stages_removal_of(&[], target));
+    }
+
+    #[test]
+    fn removed_manifest_change_name_extracts_only_a_validated_single_component_name() {
+        // D5/Condition 8, 11: used only to enrich guidance text, so it must
+        // reject anything `validate_change_name` would — path traversal,
+        // multi-component paths, and invalid characters all return `None`
+        // rather than a name that could ever double as an authority.
+        assert_eq!(
+            removed_manifest_change_name(&[diff_entry(
+                'D',
+                "openspec/changes/some-thing/manifest.json",
+                None
+            )]),
+            Some("some-thing".to_string())
+        );
+        assert_eq!(
+            removed_manifest_change_name(&[diff_entry(
+                'R',
+                "openspec/changes/archive/2026-01-01-some-thing/manifest.json",
+                Some("openspec/changes/some-thing/manifest.json")
+            )]),
+            Some("some-thing".to_string())
+        );
+        // A copy never counts — the manifest is still present at its path.
+        assert_eq!(
+            removed_manifest_change_name(&[diff_entry(
+                'C',
+                "openspec/changes/copy-of-thing/manifest.json",
+                Some("openspec/changes/some-thing/manifest.json")
+            )]),
+            None
+        );
+        assert_eq!(
+            removed_manifest_change_name(&[diff_entry(
+                'D',
+                "openspec/changes/../../etc/manifest.json",
+                None
+            )]),
+            None
+        );
+        assert_eq!(
+            removed_manifest_change_name(&[diff_entry(
+                'D',
+                "openspec/changes/a/b/manifest.json",
+                None
+            )]),
+            None
+        );
+        assert_eq!(
+            removed_manifest_change_name(&[diff_entry(
+                'D',
+                "openspec/changes/Evil_Name/manifest.json",
+                None
+            )]),
+            None
+        );
+        assert_eq!(removed_manifest_change_name(&[]), None);
+    }
+
+    #[test]
+    fn closure_recovery_hint_names_the_change_suggests_use_never_recover_or_recreate() {
+        let hint = closure_recovery_hint("some-thing");
+        assert!(hint.contains("mpd use some-thing"), "{hint}");
+        assert!(hint.contains("archive --abandon --yes"), "{hint}");
+        // D5/Condition 3.2: never suggest `archive --recover` for this state
+        // — recover requires the pointer abandon already deleted.
+        assert!(!hint.contains("archive --recover"), "{hint}");
+        assert!(hint.contains("Do not re-create"), "{hint}");
+    }
+
+    #[test]
+    fn bounded_record_hint_strips_control_bytes_and_truncates_long_input() {
+        // Cond 12 (security-plan): the worktree ledger/plan are attacker-
+        // controlled text under this arm's own threat model — control
+        // characters (terminal escape/spoofing) must never survive, and
+        // length is bounded exactly like the `ledger_version_probe`
+        // precedent (`ledger.rs:1690-1708`).
+        let hostile = format!("safe-prefix\u{7}\u{1b}[31mtail{}", "x".repeat(300));
+        let safe = bounded_record_hint(&hostile);
+        assert!(!safe.contains('\u{7}'), "{safe}");
+        assert!(!safe.contains('\u{1b}'), "{safe}");
+        assert!(safe.contains("safe-prefix"), "{safe}");
+        assert!(safe.ends_with('…'), "{safe}");
+        assert!(safe.chars().count() <= 201, "{safe}");
+
+        let short = bounded_record_hint("short-value");
+        assert_eq!(short, "short-value");
+    }
+
+    fn closure_test_root(label: &str) -> std::path::PathBuf {
+        let root = doctor_test_dir(label);
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        root
+    }
+
+    fn test_candidate_plan(
+        candidate_id: &str,
+        candidate_base_commit: &str,
+        archive_path: &str,
+        archive_transaction_id: &str,
+        entries: Vec<crate::closure::ClosureTreeEntry>,
+    ) -> crate::closure::CandidateClosurePlan {
+        // `expected_tree_digest` must be the REAL digest of `entries` —
+        // `validate_candidate_closure_plan` (run by both `save_` and
+        // `load_candidate_closure_plan`) rejects a stale one, so a
+        // hand-picked placeholder would never round-trip through disk.
+        let expected_tree_digest = crate::closure::closure_tree_digest(&entries).unwrap();
+        crate::closure::CandidateClosurePlan {
+            schema: crate::closure::CANDIDATE_CLOSURE_SCHEMA,
+            candidate_id: candidate_id.to_string(),
+            candidate_base_commit: candidate_base_commit.to_string(),
+            archive_path: archive_path.to_string(),
+            archive_transaction_id: archive_transaction_id.to_string(),
+            overlay_digest: "0".repeat(64),
+            expected_tree_digest,
+            entries,
+        }
+    }
+
+    fn test_archive_record(
+        candidate_id: Option<&str>,
+        base_commit: &str,
+        archive_path: &str,
+        transaction_id_hex: &str,
+        system_paths: Vec<String>,
+    ) -> crate::closure::ArchiveClosure {
+        crate::closure::ArchiveClosure {
+            base_commit: base_commit.to_string(),
+            archive_path: archive_path.to_string(),
+            transaction_id: crate::digest::Digest::from_hex(transaction_id_hex).unwrap(),
+            candidate_id: candidate_id.map(str::to_string),
+            allowed_paths: system_paths.clone(),
+            system_paths,
+            post_archive_digest: crate::digest::Digest::of_bytes(b"test-postimage"),
+            archived_at: 10,
+        }
+    }
+
+    #[test]
+    fn archived_closure_fallback_scope_blocks_on_empty_system_paths() {
+        // D2.5: a pre-`system_paths` legacy record degrades to empty and
+        // must fail closed here — mirrors `manifest_view`. This check runs
+        // before any filesystem access, so an unused placeholder root path
+        // is fine.
+        let record = test_archive_record(
+            None,
+            &"b".repeat(40),
+            "openspec/changes/archive/x",
+            &"1".repeat(64),
+            vec![],
+        );
+        let error = archived_closure_fallback_scope(std::path::Path::new("/nonexistent"), &record)
+            .unwrap_err();
+        assert!(error.contains("no concrete recorded scope"), "{error}");
+    }
+
+    #[test]
+    fn archived_closure_fallback_scope_authorizes_legacy_record_from_system_paths_alone() {
+        // D2.6 / Condition 9(d): `candidate_id: None` (a legacy, pre-
+        // Candidate archive) keeps the concrete-footprint scope alone — no
+        // plan is ever consulted, so no filesystem access happens here
+        // either.
+        let record = test_archive_record(
+            None,
+            &"b".repeat(40),
+            "openspec/changes/archive/x",
+            &"1".repeat(64),
+            vec!["b.txt".to_string(), "a.txt".to_string()],
+        );
+        let scope =
+            archived_closure_fallback_scope(std::path::Path::new("/nonexistent"), &record).unwrap();
+        assert_eq!(scope, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn archived_closure_fallback_scope_blocks_when_candidate_bound_plan_is_missing() {
+        let root = closure_test_root("fallback-missing-plan");
+        let record = test_archive_record(
+            Some(&"c".repeat(64)),
+            &"b".repeat(40),
+            "openspec/changes/archive/x",
+            &"1".repeat(64),
+            vec!["a.txt".to_string()],
+        );
+        let error = archived_closure_fallback_scope(&root, &record).unwrap_err();
+        assert!(error.contains("missing or invalid"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn archived_closure_fallback_scope_blocks_when_plan_binding_differs_from_record() {
+        // Security-plan Condition 5/14 and the Q1/Q4 bypass framing: a
+        // resolved change whose OWN manifest deletion is staged and whose
+        // ledger DOES carry a candidate-bound archive record must still be
+        // blocked outright — never narrowed to `system_paths` alone — the
+        // moment its retained plan disagrees with the record on any bound
+        // field.
+        let root = closure_test_root("fallback-rebound-plan");
+        let candidate_id = "c".repeat(64);
+        let archive_path = "openspec/changes/archive/2026-01-01-thing";
+        let txid = "1".repeat(64);
+        let plan = test_candidate_plan(&candidate_id, &"b".repeat(40), archive_path, &txid, vec![]);
+        crate::closure::save_candidate_closure_plan(&root, &plan).unwrap();
+
+        // The record disagrees with the saved plan on `base_commit` — a
+        // rebound/tampered shape.
+        let record = test_archive_record(
+            Some(&candidate_id),
+            &"d".repeat(40),
+            archive_path,
+            &txid,
+            vec!["system-only.txt".to_string()],
+        );
+        let error = archived_closure_fallback_scope(&root, &record).unwrap_err();
+        assert!(error.contains("binding differs"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn archived_closure_fallback_scope_authorizes_union_of_system_paths_and_plan_entries() {
+        let root = closure_test_root("fallback-authorized");
+        let candidate_id = "c".repeat(64);
+        let base_commit = "b".repeat(40);
+        let archive_path = "openspec/changes/archive/2026-01-01-thing";
+        let txid = "1".repeat(64);
+        let plan = test_candidate_plan(
+            &candidate_id,
+            &base_commit,
+            archive_path,
+            &txid,
+            vec![crate::closure::ClosureTreeEntry {
+                path: "plan-only.txt".into(),
+                mode: 0o100644,
+                byte_len: 1,
+                sha256: "a".repeat(64),
+            }],
+        );
+        crate::closure::save_candidate_closure_plan(&root, &plan).unwrap();
+
+        let record = test_archive_record(
+            Some(&candidate_id),
+            &base_commit,
+            archive_path,
+            &txid,
+            vec!["system-only.txt".to_string()],
+        );
+        let scope = archived_closure_fallback_scope(&root, &record).unwrap();
+        assert_eq!(
+            scope,
+            vec!["plan-only.txt".to_string(), "system-only.txt".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn doctor_test_dir(label: &str) -> std::path::PathBuf {

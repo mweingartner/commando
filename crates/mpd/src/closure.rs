@@ -1320,7 +1320,13 @@ fn inventory_closure_directory(
     Ok(())
 }
 
-fn closure_tree_digest(entries: &[ClosureTreeEntry]) -> Result<String, String> {
+/// `pub(crate)` (rather than private) solely so `cli.rs`'s pre-commit
+/// fallback tests can build a genuinely valid `CandidateClosurePlan` — one
+/// whose `expected_tree_digest` actually matches its `entries`, the same
+/// invariant `validate_candidate_closure_plan` enforces — without
+/// duplicating this hashing logic. No production caller outside `closure.rs`
+/// exists; this is a visibility widening only.
+pub(crate) fn closure_tree_digest(entries: &[ClosureTreeEntry]) -> Result<String, String> {
     let mut canonical = Vec::with_capacity(entries.len());
     for entry in entries {
         canonical.push(

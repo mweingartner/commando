@@ -140,6 +140,34 @@ fn run(cmd: &str, args: &[&str], dir: &Path) -> Output {
         .unwrap_or_else(|e| panic!("run {cmd}: {e}"))
 }
 
+/// A real `git commit` that goes through the ACTUAL installed `.githooks/
+/// pre-commit` script — which shells out to plain `mpd` on `$PATH`
+/// (`githooks.rs`: "shells out only to the typed `mpd hook pre-commit`
+/// coordinator"), not the freshly built test binary. An ambient globally
+/// installed `mpd` on the developer's own `$PATH` can be stale (predating a
+/// subcommand this binary just added), which would make the hook itself
+/// error with "unrecognized subcommand" — a test-environment artifact, not
+/// a real hook failure. Prepending `CARGO_BIN_EXE_mpd`'s own directory makes
+/// the installed hook resolve to the exact binary this test suite just
+/// built, the same way a real clone's `$PATH` would after `cargo install`.
+fn git_commit_through_installed_hook(dir: &Path, message: &str) -> Output {
+    let mpd_dir = Path::new(env!("CARGO_BIN_EXE_mpd"))
+        .parent()
+        .expect("CARGO_BIN_EXE_mpd has a parent directory")
+        .to_path_buf();
+    let mut path = std::ffi::OsString::from(mpd_dir);
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(existing);
+    }
+    Command::new("git")
+        .args(["commit", "-q", "-m", message])
+        .current_dir(dir)
+        .env("PATH", path)
+        .output()
+        .unwrap_or_else(|e| panic!("run git commit: {e}"))
+}
+
 fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -3638,6 +3666,810 @@ fn pre_commit_accepts_exact_pending_closure_scope_and_blocks_unrelated_paths() {
     let blocked = sb.mpd(&["hook", "pre-commit"]);
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("outside pending closure scope"));
+    assert_hook_read_only(&sb, &before);
+}
+
+/// Drive a fresh chore change all the way through every gate to
+/// `AwaitingCommit` (the state `archive --yes` leaves behind) — the shared
+/// setup every archived-closure fallback test below starts from
+/// (fix-closure-commit-coherence).
+fn drive_change_to_awaiting_commit(sb: &Sandbox, change: &str) {
+    assert!(sb.mpd(&["begin", change, "--chore"]).status.success());
+    fill_artifacts(sb, change);
+    write_thing_spec(sb, change);
+    // Commit the change's own WIP state to HEAD before archiving — the
+    // realistic shape (a real change accrues commits during Build/Test),
+    // and load-bearing here: `archive --yes` moves the active manifest by
+    // renaming the change directory. Git's `-M -C` rename detection can only
+    // pair that move into a `D`/`R` entry against a path `HEAD` already
+    // tracks; an uncommitted manifest simply vanishes from the diff instead
+    // (a plain `A` at the new location, no `D`/`R` at the old one), which
+    // would make the archived-closure fallback's trigger unforgeable for
+    // the wrong reason — it would just never fire.
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &[
+            "commit",
+            "--no-verify",
+            "-q",
+            "-m",
+            &format!("begin {change}"),
+        ],
+        &sb.dir,
+    );
+    for phase in [
+        "architecture",
+        "security-plan",
+        "build",
+        "security-code",
+        "test",
+        "documentation",
+        "doc-validation",
+        "deploy",
+    ] {
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let archived = sb.mpd(&["archive", "--yes"]);
+    assert!(
+        archived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&archived.stderr)
+    );
+    assert!(sb.dir.join(".mpd/pending-closure").is_file());
+}
+
+/// design.md Goal 1 / Condition 1 regression: the canonical order (commit
+/// BEFORE abandon) must still work through a REAL `git commit` — not just a
+/// direct `mpd hook pre-commit` check — proving the untouched AwaitingCommit
+/// branch coexists correctly with the new archived-closure fallback arm
+/// this change adds to the ELSE branch (fix-closure-commit-coherence).
+#[test]
+fn correct_flow_closure_commit_succeeds_via_real_git_commit_before_abandon() {
+    let sb = Sandbox::new("correct-flow-real-commit");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "correct-flow-thing");
+
+    run("git", &["add", "-A"], &sb.dir);
+    let committed = git_commit_through_installed_hook(&sb.dir, "close correct-flow-thing");
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+
+    let abandoned = sb.mpd(&["closure", "abandon", "--yes"]);
+    assert!(
+        abandoned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&abandoned.stderr)
+    );
+    assert!(!sb.dir.join(".mpd/pending-closure").exists());
+}
+
+/// design.md Goal 1 (the exact footgun this change fixes): a closure commit
+/// made AFTER `mpd archive --abandon --yes` must succeed via `mpd use
+/// <change>` + a real `git commit` — authorized from the archive record's
+/// frozen `system_paths` and its retained Candidate closure plan, with no
+/// active manifest anywhere in the index or worktree. Before this change,
+/// the ELSE branch hard-errored "active manifest is absent or unreadable in
+/// the index" here.
+#[test]
+fn post_abandon_closure_commit_succeeds_via_use_and_real_git_commit() {
+    let sb = Sandbox::new("post-abandon-real-commit");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "post-abandon-thing");
+
+    // The footgun: abandon runs BEFORE the closure commit.
+    let abandoned = sb.mpd(&["closure", "abandon", "--yes"]);
+    assert!(
+        abandoned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&abandoned.stderr)
+    );
+    assert!(!sb.dir.join(".mpd/pending-closure").exists());
+    assert!(!sb.dir.join(".mpd/current").exists());
+    assert!(!sb.dir.join("openspec/changes/post-abandon-thing").exists());
+
+    // Recovery per D5: `mpd use` restores the coordinator pointer. No
+    // active manifest is ever re-created.
+    let used = sb.mpd(&["use", "post-abandon-thing"]);
+    assert!(
+        used.status.success(),
+        "{}",
+        String::from_utf8_lossy(&used.stderr)
+    );
+
+    run("git", &["add", "-A"], &sb.dir);
+    assert!(!sb
+        .dir
+        .join("openspec/changes/post-abandon-thing/manifest.json")
+        .exists());
+
+    let hook = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        hook.status.success(),
+        "fallback must authorize the post-abandon closure commit: {}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+
+    let committed = git_commit_through_installed_hook(&sb.dir, "close post-abandon-thing");
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+}
+
+/// Condition 6: even under the fallback arm, every staged path — including
+/// one entirely unrelated to the archived closure — must still pass the
+/// coverage check. The fallback supplies an authorized scope; it never
+/// skips the check.
+#[test]
+fn post_abandon_fallback_blocks_staged_path_outside_archived_scope() {
+    let sb = Sandbox::new("post-abandon-outside-scope");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "outside-scope-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb.mpd(&["use", "outside-scope-thing"]).status.success());
+
+    run("git", &["add", "-A"], &sb.dir);
+    sb.write(
+        "unrelated-post-abandon.txt",
+        "outside the frozen archive scope\n",
+    );
+    run("git", &["add", "unrelated-post-abandon.txt"], &sb.dir);
+
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("outside archived closure scope"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("unrelated-post-abandon.txt"),
+        "stderr={stderr}"
+    );
+    assert_hook_read_only(&sb, &before);
+
+    // Unstaging the unrelated file lets the real archived diff alone
+    // through.
+    run(
+        "git",
+        &["restore", "--staged", "unrelated-post-abandon.txt"],
+        &sb.dir,
+    );
+    let clean = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+}
+
+/// Security-plan Condition 10: when the staged diff removes the resolved
+/// change's own active manifest but its ledger carries NO archive record
+/// (the ordinary in-progress case — nothing has ever been archived), the
+/// ordinary path must run byte-identical and block via its existing
+/// protected-artifact check — the exact same message as before this change,
+/// never a fallback-specific reason, and never a silent fall-through.
+#[test]
+fn in_progress_change_deleting_own_manifest_without_archive_record_blocks_as_today() {
+    let sb = Sandbox::new("in-progress-no-record");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    assert!(sb
+        .mpd(&["begin", "in-progress-thing", "--chore"])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "in-progress baseline"],
+        &sb.dir,
+    );
+
+    run(
+        "git",
+        &[
+            "rm",
+            "-q",
+            "openspec/changes/in-progress-thing/manifest.json",
+        ],
+        &sb.dir,
+    );
+
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("deletion of required governance artifact"),
+        "stderr={}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_hook_read_only(&sb, &before);
+}
+
+/// Security-plan Condition 4/14, and the Q1/Q4 bypass framing: a resolved
+/// change whose OWN manifest deletion is staged and whose ledger claims a
+/// Candidate-bound archive record must still be blocked outright — never
+/// narrowed to `system_paths` alone — the moment its retained plan cannot
+/// be trusted (missing, here — the exact "tampered/rebound plan" fail-
+/// closed shape; `archived_closure_fallback_scope_blocks_when_plan_binding_
+/// differs_from_record` in `cli.rs` covers the loads-but-mismatches variant
+/// directly, which needs a byte-valid on-disk plan this black-box e2e test
+/// cannot cheaply fabricate). Also proves Condition 12: a hostile
+/// `candidate_id` (the worktree ledger is owner-writable, hence attacker-
+/// controlled text under this arm's own threat model) never reaches raw
+/// hook output, and long record text is length-bounded.
+#[test]
+fn post_abandon_fallback_blocks_when_candidate_bound_plan_is_missing_and_sanitizes_hostile_text() {
+    let sb = Sandbox::new("post-abandon-missing-plan");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "missing-plan-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb.mpd(&["use", "missing-plan-thing"]).status.success());
+
+    let ledger_path = sb.dir.join(".mpd/state/missing-plan-thing.json");
+    let mut ledger_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+    // The default `--chore` (manual-tier) flow produces a legacy record —
+    // `candidate_id` absent. Claim a Candidate binding whose plan was never
+    // saved (true for every transaction this legacy flow ever produces),
+    // with hostile control bytes + a long tail standing in for the
+    // candidate ID — worktree-ledger text this arm's own threat model
+    // treats as attacker-controlled.
+    assert!(
+        ledger_json["archive_closure"]["candidate_id"].is_null(),
+        "fixture must start legacy (no Candidate) to meaningfully claim one: {ledger_json}"
+    );
+    let hostile_candidate_id = format!("EVIL\u{7}\u{1b}[31mMARKER{}", "x".repeat(300));
+    ledger_json["archive_closure"]["candidate_id"] = Value::String(hostile_candidate_id);
+    let mut rewritten = serde_json::to_vec_pretty(&ledger_json).unwrap();
+    rewritten.push(b'\n');
+    std::fs::write(&ledger_path, rewritten).unwrap();
+
+    run("git", &["add", "-A"], &sb.dir);
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(stderr.contains("pre-commit blocked"), "stderr={stderr}");
+    assert!(stderr.contains("missing or invalid"), "stderr={stderr}");
+    assert!(
+        !stderr.contains('\u{7}'),
+        "raw control byte must never reach hook output: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "raw ESC byte must never reach hook output: {stderr}"
+    );
+    assert!(
+        stderr.contains("EVIL"),
+        "sanitized hint text should still be present: {stderr}"
+    );
+    assert!(
+        stderr.contains('…'),
+        "long record text must be bounded: {stderr}"
+    );
+    assert_hook_read_only(&sb, &before);
+}
+
+/// D2.5: a legacy record whose `system_paths` degrades to empty (recorded
+/// before that field existed) must fail closed rather than authorize
+/// anything.
+#[test]
+fn post_abandon_fallback_blocks_on_legacy_record_with_empty_system_paths() {
+    let sb = Sandbox::new("post-abandon-empty-system-paths");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "empty-system-paths-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb
+        .mpd(&["use", "empty-system-paths-thing"])
+        .status
+        .success());
+
+    let ledger_path = sb.dir.join(".mpd/state/empty-system-paths-thing.json");
+    let mut ledger_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+    ledger_json["archive_closure"]["system_paths"] = Value::Array(Vec::new());
+    let mut rewritten = serde_json::to_vec_pretty(&ledger_json).unwrap();
+    rewritten.push(b'\n');
+    std::fs::write(&ledger_path, rewritten).unwrap();
+
+    run("git", &["add", "-A"], &sb.dir);
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("no concrete recorded scope"),
+        "stderr={}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_hook_read_only(&sb, &before);
+}
+
+/// D2.6: a legacy (pre-Candidate) archive record — `candidate_id` absent —
+/// must authorize the identical real archived diff from its frozen
+/// `system_paths` snapshot alone; no plan is ever consulted. The manual
+/// (non-`--strict`) tier this test drives never retains a Build Candidate,
+/// so its archive record is legacy-shaped by construction — asserted
+/// explicitly here rather than assumed.
+#[test]
+fn post_abandon_fallback_authorizes_from_legacy_record_with_candidate_id_none() {
+    let sb = Sandbox::new("post-abandon-legacy-candidate-none");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "legacy-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb.mpd(&["use", "legacy-thing"]).status.success());
+
+    let ledger_path = sb.dir.join(".mpd/state/legacy-thing.json");
+    let ledger_json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+    assert!(
+        ledger_json["archive_closure"]["candidate_id"].is_null(),
+        "manual-tier archive must be legacy-shaped (no Candidate binding): {ledger_json}"
+    );
+    assert!(
+        !ledger_json["archive_closure"]["system_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the frozen concrete footprint must be non-empty: {ledger_json}"
+    );
+
+    run("git", &["add", "-A"], &sb.dir);
+    let hook = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        hook.status.success(),
+        "legacy candidate_id:None record must authorize from system_paths alone: {}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+}
+
+/// Condition 1/7 regression: an ordinary in-progress commit — including
+/// deleting a DIFFERENT change's stray manifest that this change's own
+/// manifest declares verbatim in scope (the real
+/// candidate-lifecycle-defects/proportionate-governance shape this fix
+/// targets) — must be byte-identical to today. The archived-closure
+/// fallback never engages here: the staged manifest deletion belongs to a
+/// foreign change, not the resolved coordinator's own `manifest_path`.
+#[test]
+fn ordinary_in_progress_commit_regression_with_foreign_stray_deletion_in_scope() {
+    let sb = Sandbox::new("ordinary-foreign-stray");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    sb.write(
+        "openspec/changes/stray-change/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline with stray"],
+        &sb.dir,
+    );
+
+    assert!(sb
+        .mpd(&["begin", "cleanup-thing", "--chore"])
+        .status
+        .success());
+    // Declare the stray path verbatim in THIS change's own scope, mirroring
+    // the real fix-closure-commit-coherence manifest.
+    sb.write(
+        "openspec/changes/cleanup-thing/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"openspec/changes/cleanup-thing/**\", \"openspec/changes/stray-change/manifest.json\"],\n  \"shared_paths\": []\n}\n",
+    );
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "cleanup-thing begin"],
+        &sb.dir,
+    );
+
+    run(
+        "git",
+        &["rm", "-q", "openspec/changes/stray-change/manifest.json"],
+        &sb.dir,
+    );
+    let before = staged_snapshot(&sb);
+    let clean = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        clean.status.success(),
+        "deleting a foreign stray within this change's declared scope must still pass: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+    assert_hook_read_only(&sb, &before);
+
+    // The SAME resolved change's own manifest deletion, with no archive
+    // record, still blocks exactly as today (Condition 1's byte-identical
+    // guarantee) — the two behaviors must never interfere with each other.
+    run(
+        "git",
+        &["rm", "-q", "openspec/changes/cleanup-thing/manifest.json"],
+        &sb.dir,
+    );
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("deletion of required governance artifact"),
+        "stderr={}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+}
+
+/// D5 / task 4.6: when there is no resolvable coordinator at all (post-
+/// abandon, before `mpd use`) and the staged diff is closure-shaped (it
+/// removes some change's own active manifest), the pre-commit message must
+/// name that change and point at the exact recovery command — never the
+/// bare generic "no active change coordinator" alone, and never `mpd
+/// archive --recover` (which requires the pointer `abandon` already
+/// deleted).
+#[test]
+fn pre_commit_guidance_names_change_when_no_coordinator_for_closure_shaped_diff() {
+    let sb = Sandbox::new("no-coordinator-guidance");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "no-coordinator-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(!sb.dir.join(".mpd/current").exists());
+
+    // Stage the real archived diff WITHOUT ever running `mpd use` — there
+    // is no resolvable coordinator at all.
+    run("git", &["add", "-A"], &sb.dir);
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("no active change coordinator"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("mpd use no-coordinator-thing"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("archive --abandon --yes"),
+        "stderr={stderr}"
+    );
+    assert!(!stderr.contains("archive --recover"), "stderr={stderr}");
+    assert_hook_read_only(&sb, &before);
+}
+
+/// Security-code independent review, pinned as a regression: the fallback
+/// trigger is structurally unforgeable AFTER the closure commit lands. The
+/// archive record and the `mpd use` coordinator pointer both survive the
+/// landing, so if the trigger were replayable the record would authorize
+/// smuggling arbitrary content into its frozen footprint forever. It is
+/// not: `git diff --cached` reports a `D` only for a path HEAD tracks, the
+/// landed commit removed the active manifest from HEAD, and `git rm` cannot
+/// even stage the deletion — so a post-landing commit always falls to the
+/// ordinary path and blocks on the absent manifest.
+#[test]
+fn post_landing_fallback_trigger_cannot_be_reforged_for_archived_scope_smuggling() {
+    let sb = Sandbox::new("post-landing-replay");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "post-landing-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb.mpd(&["use", "post-landing-thing"]).status.success());
+
+    // Land the closure commit through the real installed hook (the fallback
+    // authorizes exactly once, from the record+plan pair).
+    run("git", &["add", "-A"], &sb.dir);
+    let committed = git_commit_through_installed_hook(&sb.dir, "close post-landing-thing");
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+
+    // The replay preconditions deliberately survive: the coordinator still
+    // names the archived change and its ledger still carries the archive
+    // record. Only the trigger is gone.
+    assert_eq!(
+        std::fs::read_to_string(sb.dir.join(".mpd/current"))
+            .unwrap()
+            .trim(),
+        "post-landing-thing"
+    );
+    let ledger_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/post-landing-thing.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger_json["archive_closure"].is_object(),
+        "the archive record must still exist for the replay attempt to be meaningful: {ledger_json}"
+    );
+
+    // Forging the trigger signature is impossible: the manifest is absent
+    // from HEAD, so no `D` of it can be staged at all.
+    let forge = run(
+        "git",
+        &[
+            "rm",
+            "-q",
+            "openspec/changes/post-landing-thing/manifest.json",
+        ],
+        &sb.dir,
+    );
+    assert!(
+        !forge.status.success(),
+        "a D of a non-HEAD path must be unstageable: {}",
+        String::from_utf8_lossy(&forge.stderr)
+    );
+
+    // Stage smuggled content INSIDE the frozen footprint (the dated archive
+    // directory is a prefix entry in `system_paths`, so a replayed fallback
+    // WOULD cover it). The hook must fall to the ordinary path and block on
+    // the absent manifest — never re-authorize from the record.
+    let archive_dir = std::fs::read_dir(sb.dir.join("openspec/changes/archive"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().into_string().unwrap())
+        .find(|name| name.ends_with("-post-landing-thing"))
+        .expect("landed archive directory exists");
+    sb.write(
+        &format!("openspec/changes/archive/{archive_dir}/smuggled-after-landing.txt"),
+        "content the frozen footprint would cover under a replayed fallback\n",
+    );
+    run(
+        "git",
+        &[
+            "add",
+            &format!("openspec/changes/archive/{archive_dir}/smuggled-after-landing.txt"),
+        ],
+        &sb.dir,
+    );
+
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        !blocked.status.success(),
+        "post-landing staged content must never be authorized from the archive record"
+    );
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("active manifest is absent or unreadable in the index"),
+        "stderr={}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert_hook_read_only(&sb, &before);
+}
+
+/// The §1 footprint-replay containment, gate-side: even under a fully valid
+/// fallback trigger (the resolved change's OWN manifest deletion is staged,
+/// record+plan bind), the frozen scope never extends to a DIFFERENT
+/// change's stray manifest that entered HEAD after the snapshot froze. The
+/// fallback supplies a scope; it never grants blanket authority over
+/// `openspec/changes/`.
+#[test]
+fn post_abandon_fallback_blocks_foreign_stray_manifest_deletion_outside_frozen_scope() {
+    let sb = Sandbox::new("post-abandon-foreign-stray");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    // `archive --yes` (inside the driver) freezes the concrete scope
+    // snapshot HERE — before the foreign stray exists.
+    drive_change_to_awaiting_commit(&sb, "replay-source-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb.mpd(&["use", "replay-source-thing"]).status.success());
+
+    // A foreign change's stray manifest lands in HEAD AFTER the freeze, so
+    // it is outside `system_paths` and outside the plan's post-archive
+    // entries. Distinct content on purpose: `-M -C` rename detection must
+    // pair the archive move with the change's own manifest, leaving this
+    // one a plain `D`.
+    sb.write(
+        "openspec/changes/foreign-stray/manifest.json",
+        "{\n  \"version\": 1,\n  \"paths\": [\"foreign/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    run(
+        "git",
+        &["add", "openspec/changes/foreign-stray/manifest.json"],
+        &sb.dir,
+    );
+    run(
+        "git",
+        &[
+            "commit",
+            "--no-verify",
+            "-q",
+            "-m",
+            "foreign stray lands after freeze",
+        ],
+        &sb.dir,
+    );
+
+    // Stage the genuine archived diff (valid trigger) PLUS the foreign
+    // stray's deletion — the footprint-replay shape aimed at another
+    // change's governance artifact.
+    run("git", &["add", "-A"], &sb.dir);
+    run(
+        "git",
+        &["rm", "-q", "openspec/changes/foreign-stray/manifest.json"],
+        &sb.dir,
+    );
+
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("outside archived closure scope"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("openspec/changes/foreign-stray/manifest.json"),
+        "stderr={stderr}"
+    );
+    assert_hook_read_only(&sb, &before);
+
+    // Unstaging the foreign deletion leaves the genuine archived diff, which
+    // the record+plan pair still authorizes — the block was containment, not
+    // a broken trigger.
+    run(
+        "git",
+        &[
+            "restore",
+            "--staged",
+            "openspec/changes/foreign-stray/manifest.json",
+        ],
+        &sb.dir,
+    );
+    let clean = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        clean.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+}
+
+/// Security-plan Condition 10, second arm: when the staged diff removes the
+/// resolved change's own active manifest but the worktree ledger cannot even
+/// be read, the hook must block with its own specific reason — never fall
+/// through to the ordinary index-based manifest read, which could disagree
+/// with what was just observed in the worktree.
+#[test]
+fn post_abandon_fallback_blocks_when_worktree_ledger_is_unreadable() {
+    let sb = Sandbox::new("post-abandon-unreadable-ledger");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &["commit", "--no-verify", "-q", "-m", "baseline"],
+        &sb.dir,
+    );
+
+    drive_change_to_awaiting_commit(&sb, "unreadable-ledger-thing");
+    assert!(sb.mpd(&["closure", "abandon", "--yes"]).status.success());
+    assert!(sb.mpd(&["use", "unreadable-ledger-thing"]).status.success());
+
+    // Corrupt the worktree ledger AFTER `mpd use` (which only needs the
+    // pointer file) so the fallback's `ledger::load` is the first reader to
+    // trip over it.
+    std::fs::write(
+        sb.dir.join(".mpd/state/unreadable-ledger-thing.json"),
+        "not-json{{{\n",
+    )
+    .unwrap();
+
+    run("git", &["add", "-A"], &sb.dir);
+    let before = staged_snapshot(&sb);
+    let blocked = sb.mpd(&["hook", "pre-commit"]);
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("unreadable archive record"),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("active manifest is absent"),
+        "an unreadable ledger must never fall through to the ordinary index read: {stderr}"
+    );
     assert_hook_read_only(&sb, &before);
 }
 
