@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "paths": [
+    ".mpd/state/fix-closure-commit-coherence.json",
+    "crates/mpd/**",
+    "docs/fix-closure-commit-coherence.md",
+    "openspec/changes/candidate-lifecycle-defects/manifest.json",
+    "openspec/changes/closure-defects-and-measurement/manifest.json",
+    "openspec/changes/fix-closure-commit-coherence/**",
+    "openspec/changes/proportionate-governance/manifest.json",
+    "openspec/specs/**"
+  ],
+  "shared_paths": []
+}
