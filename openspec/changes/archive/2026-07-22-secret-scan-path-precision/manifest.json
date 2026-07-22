@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "paths": [
+    "crates/mpd/src/checks/secrets.rs",
+    "openspec/specs/local-validation/spec.md",
+    ".mpd/state/secret-scan-path-precision.json",
+    "openspec/changes/secret-scan-path-precision/**",
+    "docs/secret-scan-path-precision.md"
+  ],
+  "shared_paths": []
+}

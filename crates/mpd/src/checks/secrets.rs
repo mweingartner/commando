@@ -52,6 +52,41 @@ const PLACEHOLDERS: &[&str] = &[
     "...",
 ];
 
+/// Minimum length of a contiguous run over the token alphabet (see
+/// `is_token_char`, alphabet `[A-Za-z0-9+]`) required for
+/// `generic_secret_assignment` to flag a keyworded value (design.md decision
+/// D3).
+///
+/// **Threshold rationale.** 16 matches the smallest credential core the
+/// scanner already trusts: `has_aws_access_key` requires exactly 16
+/// characters after `AKIA`, and the Stripe prefixes (`sk_live_`/`sk_test_`/
+/// `rk_live_`) require a 16-char tail (OpenAI's `sk-` requires 32, the
+/// largest of the curated tails). Sixteen sits above dictionary words,
+/// hyphenated/dated path segments, and abbreviated git-hash directory names
+/// (typically 7-12 chars) and below real secret cores (hex digests >= 32,
+/// GitHub token tails 36+, this repo's own credential-shaped fixtures 20-27
+/// chars).
+///
+/// **Accepted misses** (documented, not implicit — do not "fix" these without
+/// first reading design.md's Risks table). The deterministic classes are pinned
+/// by dedicated tests; the probabilistic special-character-fragmentation classes
+/// are documented in the Risks table (their miss rate is < 100%, so a
+/// deterministic pin is not meaningful):
+/// - UUID-shaped values (`8-4-4-4-12`, hyphen-separated): longest run is 12.
+///   Pinned (`generic_rule_ignores_hyphenated_dictionary_values`).
+/// - 4-char-grouped keys (`XXXX-XXXX-XXXX-XXXX`): every run is 4. Pinned
+///   (`generic_rule_ignores_grouped_keys`).
+/// - Slash-bearing base64 secrets (AWS secret access keys, short
+///   standard-base64 blobs): a `/` in the body can split an otherwise-long
+///   token below the threshold. Mechanism pinned
+///   (`generic_rule_alphabet_pins_plus_and_slash`).
+/// - Env/TOML/YAML-style Azure AD client secrets, whose ~37-char tail uses
+///   `~ . - _` as DATA characters rather than separators, which can
+///   fragment the tail into runs under 16.
+/// - GitLab `glpat-` tails (20 chars, `-`/`_` possible mid-tail): the same
+///   special-character fragmentation as the Azure case above.
+const MIN_TOKEN_RUN: usize = 16;
+
 /// Maximum bytes of a line actually scanned. Real secret tokens are short;
 /// bounding the prefix keeps the repeated pattern scans linear against an
 /// adversarial multi-megabyte single line (scanner DoS defense).
@@ -215,7 +250,17 @@ fn contains_prefixed_token(line: &str, prefix: &str, min_tail: usize) -> bool {
 }
 
 /// A `key = "value"` / `key: "value"` assignment where the key names a secret
-/// and the value looks like real entropy (not a placeholder).
+/// and the value looks like real entropy (not a placeholder). The value must
+/// additionally carry contiguous credential material — a filesystem path or
+/// hyphenated/dotted dictionary text (dated archive names, UUIDs, snake_case
+/// identifiers) is prose/path shape, not credential shape, and is never
+/// flagged (design.md decision D1). This final gate strictly subsumes the
+/// prior whole-value `has_alpha && has_digit` test: any run that qualifies
+/// under `has_contiguous_token_run` has itself donated a letter and a digit
+/// to the whole value, so `has_contiguous_token_run(value) =>
+/// (value has_alpha && value has_digit)` for every value — a monotone
+/// tightening. No value that was clean before this change becomes flagged;
+/// some values that were false positives before now correctly fall through.
 fn generic_secret_assignment(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     let keyed = [
@@ -243,9 +288,65 @@ fn generic_secret_assignment(line: &str) -> bool {
     if PLACEHOLDERS.iter().any(|p| lv.contains(p)) {
         return false;
     }
-    let has_alpha = value.chars().any(|c| c.is_ascii_alphabetic());
-    let has_digit = value.chars().any(|c| c.is_ascii_digit());
-    has_alpha && has_digit
+    has_contiguous_token_run(value)
+}
+
+/// A character in the token alphabet `[A-Za-z0-9+]` — the alphabet a
+/// contiguous credential run (`has_contiguous_token_run`, `MIN_TOKEN_RUN`) is
+/// measured over.
+///
+/// Deliberately excludes `/` (the path separator — including it resurrects
+/// the exact false-positive class this heuristic exists to close), `-`/`_`
+/// (separators of hyphenated names, dates, snake_case identifiers, and also
+/// base64url data characters), `.` and whitespace (versions, prose, and the
+/// JWT dot-separator — JWTs have their own dedicated rule), and `=` (the
+/// assignment separator; base64 padding is a 1-2 char suffix that does not
+/// affect run length either way).
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '+'
+}
+
+/// True iff `value` contains a maximal run of `is_token_char` characters of
+/// length at least `MIN_TOKEN_RUN` that itself contains at least one ASCII
+/// letter and at least one ASCII digit.
+///
+/// Single `O(len)` pass over `value`, no allocation: track the current run's
+/// length plus whether a letter and a digit have been seen within that run;
+/// on a non-token character (or at the end of input) evaluate the just-ended
+/// run against the threshold, then reset the run state.
+///
+/// This SUBSUMES the old whole-value `has_alpha(value) && has_digit(value)`
+/// test: any run that satisfies this predicate has, by construction,
+/// contributed at least one letter and one digit to the whole value, so
+/// `has_contiguous_token_run(v) => (v.chars().any(is_ascii_alphabetic) &&
+/// v.chars().any(is_ascii_digit))` holds for every `v` — a monotone
+/// tightening, never a new false positive (design.md D1; Security-plan
+/// Condition 2). Pinned mechanically by `new_gate_implies_old_gate` below.
+fn has_contiguous_token_run(value: &str) -> bool {
+    /// Whether a just-ended run of `run_len` token characters, having seen a
+    /// letter and/or a digit as recorded, clears the bar.
+    fn run_qualifies(run_len: usize, letter_seen: bool, digit_seen: bool) -> bool {
+        run_len >= MIN_TOKEN_RUN && letter_seen && digit_seen
+    }
+
+    let mut run_len = 0usize;
+    let mut letter_seen = false;
+    let mut digit_seen = false;
+    for c in value.chars() {
+        if is_token_char(c) {
+            run_len += 1;
+            letter_seen |= c.is_ascii_alphabetic();
+            digit_seen |= c.is_ascii_digit();
+        } else {
+            if run_qualifies(run_len, letter_seen, digit_seen) {
+                return true;
+            }
+            run_len = 0;
+            letter_seen = false;
+            digit_seen = false;
+        }
+    }
+    run_qualifies(run_len, letter_seen, digit_seen)
 }
 
 /// Extract the first single- or double-quoted substring.
@@ -383,6 +484,113 @@ mod tests {
     }
 
     #[test]
+    fn generic_rule_ignores_filesystem_paths() {
+        // Motivating false positives (design.md Context): dated archive
+        // paths whose change name happens to contain a keyword. The longest
+        // contiguous token run across these three fixtures is 9
+        // ("precision", in the path segment), well under MIN_TOKEN_RUN
+        // (16), so the new gate correctly stays quiet — and no curated rule
+        // can fire on any of these lines either.
+        let ledger_array_element =
+            "      \"openspec/changes/archive/2026-07-21-secret-fixture-hygiene\",";
+        assert_eq!(scan_line(ledger_array_element), None);
+
+        let quoted_path_assignment =
+            "archive_path: \"openspec/changes/archive/2026-07-21-secret-fixture-hygiene\"";
+        assert_eq!(scan_line(quoted_path_assignment), None);
+
+        let unquoted_env_path = "SECRET_STATE=.mpd/state/secret-scan-path-precision.json";
+        assert_eq!(scan_line(unquoted_env_path), None);
+    }
+
+    #[test]
+    fn generic_rule_ignores_hyphenated_dictionary_values() {
+        // Accepted misses, pinned per design.md's Risks table — do not
+        // "fix" without re-reading the analysis there. A dated hyphenated
+        // name (longest run 8) and a UUID (longest run 12) both fall below
+        // MIN_TOKEN_RUN even though both are keyworded, non-placeholder,
+        // and >= 20 chars, i.e. they would have flagged under the old gate.
+        let dated_name = "api_key: \"2026-07-21-secret-fixture-hygiene-followup\"";
+        assert_eq!(scan_line(dated_name), None);
+
+        let uuid_value = "api_key = \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"";
+        assert_eq!(scan_line(uuid_value), None);
+    }
+
+    #[test]
+    fn generic_rule_ignores_grouped_keys() {
+        // Accepted miss (design.md Risks table, same rationale as the UUID
+        // case above): a 4-char-grouped license/product key. Every run is
+        // exactly 4, well under MIN_TOKEN_RUN, yet it is keyworded,
+        // non-placeholder, and >= 20 chars — so the OLD whole-value gate
+        // flagged it. Do not "fix" without re-reading the analysis.
+        let grouped = "api_key: \"AAAA-1111-BBBB-2222-CCCC-3333\"";
+        assert_eq!(scan_line(grouped), None);
+    }
+
+    #[test]
+    fn generic_rule_still_flags_contiguous_digests() {
+        // A 64-char hex-shaped digest is real credential material with no
+        // dedicated rule (design.md Risks table: "Hex keys/digests").
+        // Assembled from fragments each under 16 token-alphabet chars so
+        // this source line stays scanner-clean (see the doctrine comment
+        // atop this module) even though the runtime value is one 64-char
+        // contiguous run.
+        let digest = format!(
+            "{}{}{}{}{}",
+            "0123456789abc", "def0123456789", "abcdef0123456", "789abcdef0123", "456789abcdef",
+        );
+        let line = format!("token = \"{}\"", digest);
+        assert_eq!(scan_line(&line), Some("generic-secret-assignment"));
+    }
+
+    #[test]
+    fn generic_rule_run_threshold_boundary() {
+        // Boundary pin for MIN_TOKEN_RUN (design.md D3). Each run is
+        // assembled from two fragments under 16 chars each so this source
+        // line stays scanner-clean; the runs are isolated inside separator
+        // padding so their length is exactly what the fragments sum to.
+        let run_of_16 = format!("{}{}", "aaaa1111", "bbbb2222");
+        let at_threshold = format!("token = \"path-{}-node\"", run_of_16);
+        assert_eq!(
+            scan_line(&at_threshold),
+            Some("generic-secret-assignment"),
+            "an exactly-16 letter+digit run must flag"
+        );
+
+        let run_of_15 = format!("{}{}", "aaaa111", "bbbb2222");
+        let below_threshold = format!("token = \"path-{}-node\"", run_of_15);
+        assert_eq!(
+            scan_line(&below_threshold),
+            None,
+            "an exactly-15 letter+digit run must not flag (would have under the old gate)"
+        );
+    }
+
+    #[test]
+    fn generic_rule_alphabet_pins_plus_and_slash() {
+        // D2: `+` is in-alphabet (a `+`-joined value is one contiguous run
+        // spanning the joins); `/` is excluded (the path separator — each
+        // `/`-joined segment is its own isolated run). Same three 8-char
+        // segments, only the joiner differs.
+        let plus_joined = format!("{}+{}+{}", "aaaa1111", "bbbb2222", "cccc3333");
+        let plus_line = format!("token = \"{}\"", plus_joined);
+        assert_eq!(
+            scan_line(&plus_line),
+            Some("generic-secret-assignment"),
+            "`+` must not break the run"
+        );
+
+        let slash_joined = format!("{}/{}/{}", "aaaa1111", "bbbb2222", "cccc3333");
+        let slash_line = format!("token = \"{}\"", slash_joined);
+        assert_eq!(
+            scan_line(&slash_line),
+            None,
+            "`/` must break the run into 8-char segments, each below threshold"
+        );
+    }
+
+    #[test]
     fn ignores_ordinary_code() {
         assert_eq!(scan_line("let token = next_token();"), None);
         assert_eq!(scan_line("// remember to rotate the password"), None);
@@ -505,10 +713,12 @@ mod tests {
 
     /// The self-enforcing guard (design decision D2, Conditions 2/3/9/13/14):
     /// walk every regular file under `crates/`, scan it with the PRODUCTION
-    /// detector (`scan_paths` — never `checks::scan_secrets`, whose
-    /// `unwrap_or_default()` fail-open would silently turn a scan error into
-    /// a clean report), and assert zero findings survive the (empty, by
-    /// design) `SOURCE_HYGIENE_ALLOW`.
+    /// detector (`scan_paths` directly — it returns the raw findings this guard
+    /// asserts over, not the `SecretReport` wrapper that `checks::scan_secrets`
+    /// returns; `scan_secrets` is now fail-closed — it propagates scan errors
+    /// rather than the historical `unwrap_or_default()` — but the wrapper shape
+    /// is still the wrong surface for a raw-findings assertion), and assert zero
+    /// findings survive the (empty, by design) `SOURCE_HYGIENE_ALLOW`.
     #[test]
     fn first_party_source_is_scanner_clean() {
         // CARGO_MANIFEST_DIR is `<repo>/crates/mpd`; its grandparent is the
@@ -637,6 +847,16 @@ mod tests {
         assert_eq!(scan_line_windows(&line), Some("generic-secret-assignment"));
     }
 
+    /// The gate `generic_secret_assignment` used BEFORE this change (design.md
+    /// D1 baseline), reimplemented here — never in production code — purely
+    /// as the reference point for `new_gate_implies_old_gate` below: any
+    /// keyworded, non-placeholder, length->=20 value with at least one ASCII
+    /// letter and one ASCII digit ANYWHERE in the value, with no requirement
+    /// that they be contiguous.
+    fn old_whole_value_gate(value: &str) -> bool {
+        value.chars().any(|c| c.is_ascii_alphabetic()) && value.chars().any(|c| c.is_ascii_digit())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
 
@@ -673,6 +893,72 @@ mod tests {
             };
             let line = format!("{}{}", "x".repeat(pad), fixture);
             prop_assert_eq!(scan_line_windows(&line), Some(expected));
+        }
+
+        /// Security-plan Condition 4 / design.md Condition 12 (archive-blocker):
+        /// values decomposed into 3-8 segments over `[a-w0-9]{1,15}`, joined
+        /// by separators outside the token alphabet (`/ - _` and a space),
+        /// can never assemble a run >= MIN_TOKEN_RUN — every join breaks the
+        /// run and no single segment reaches the threshold on its own — so
+        /// the GENERIC rule must never fire on them. Asserted RULE-SPECIFIC
+        /// (`!= Some("generic-secret-assignment")`), NOT `== None`: the
+        /// `[a-w0-9]` segment alphabet plus `-`/`_` joins can occasionally
+        /// compose a tail that legitimately trips a CURATED rule (e.g. an
+        /// `sk-`-shaped prefix); that is a different rule's concern and must
+        /// not seed-persist a spurious failure here.
+        #[test]
+        fn separator_decomposed_values_are_never_generic_flagged(
+            segments in prop::collection::vec("[a-w0-9]{1,15}", 3..=8),
+            seps in prop::collection::vec(
+                prop_oneof![Just('/'), Just('-'), Just('_'), Just(' ')],
+                7,
+            ),
+        ) {
+            let mut value = String::new();
+            for (i, segment) in segments.iter().enumerate() {
+                if i > 0 {
+                    value.push(seps[i - 1]);
+                }
+                value.push_str(segment);
+            }
+            let line = format!("token = \"{}\"", value);
+            prop_assert_ne!(scan_line(&line), Some("generic-secret-assignment"));
+        }
+
+        /// The mirror image of the property above: a single undecomposed run
+        /// over `[a-w0-9]` of length 20-64 (guaranteed by construction to
+        /// carry both a letter and a digit) is exactly the shape the generic
+        /// rule exists to catch, and the constrained alphabet (no separators,
+        /// no uppercase) guarantees no curated rule can pre-empt the label.
+        #[test]
+        fn contiguous_alnum_tokens_are_flagged(
+            value in "[a-w0-9]{20,64}".prop_filter(
+                "letter + digit, and no PLACEHOLDERS substring (which the rule \
+                 suppresses — `todo`/`changeme`/`redacted`/`placeholder`/`dummy` \
+                 are all composable in `[a-w0-9]`, so an unfiltered generator \
+                 seed-persists a spurious failure)",
+                |v: &String| {
+                    v.chars().any(|c| c.is_ascii_alphabetic())
+                        && v.chars().any(|c| c.is_ascii_digit())
+                        && !PLACEHOLDERS.iter().any(|p| v.contains(p))
+                },
+            ),
+        ) {
+            let line = format!("token = \"{}\"", value);
+            prop_assert_eq!(scan_line(&line), Some("generic-secret-assignment"));
+        }
+
+        /// Direct monotonicity proof (Security-plan Condition 2 / design.md
+        /// Condition 11, archive-blocker): over ARBITRARY strings — not just
+        /// credential-shaped ones — the new gate implies the old one. This is
+        /// the mechanical, permanent version of the "no new false positive"
+        /// claim: it cannot regress silently, because any counterexample
+        /// shrinks and persists under `proptest-regressions/`.
+        #[test]
+        fn new_gate_implies_old_gate(value in any::<String>()) {
+            if has_contiguous_token_run(&value) {
+                prop_assert!(old_whole_value_gate(&value));
+            }
         }
     }
 }
