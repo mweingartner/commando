@@ -1988,6 +1988,193 @@ fn a_doc_only_change_widening_its_own_manifest_after_architecture_pass_stales_ev
     );
 }
 
+/// A real, minimal strict `local_validation` policy (the exact shape
+/// `validation_never_executes_unactivated_candidate_policy` already proves
+/// parses and validates cleanly) plus its inert marker tool and the real
+/// sandbox profile it names — committed to HEAD so a later strict change's
+/// own (possibly narrow) manifest never has to declare them.
+fn write_strict_local_validation_config(sb: &Sandbox) {
+    sb.write(
+        "marker-check.sh",
+        "#!/bin/sh\nprintf candidate-started > marker-executed\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            sb.dir.join("marker-check.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let profile = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../security/sandbox/validation.sb"),
+    )
+    .unwrap();
+    sb.write("security/sandbox/validation.sb", &profile);
+    sb.write(
+        ".mpd/config.json",
+        &format!(
+            "{{\n  \"test\": {PASSING_TEST_CMD:?},\n  \"local_validation\": {{\n\
+             \x20\x20\x20\x20\"schema\": 1,\n\
+             \x20\x20\x20\x20\"required-toolchain\": {{ \"rust-release\": \"1.91.0\", \"host\": \"aarch64-apple-darwin\", \"components\": [\"marker\"] }},\n\
+             \x20\x20\x20\x20\"tools\": {{ \"marker\": {{ \"program\": \"marker-check.sh\", \"version-args\": [\"--version\"], \"requirement\": \"required\", \"install-hint\": \"Fixture-only marker that must remain inert.\" }} }},\n\
+             \x20\x20\x20\x20\"checks\": {{\n\
+             \x20\x20\x20\x20\x20\x20\"format\": {{ \"kind\": \"format\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"lint\": {{ \"kind\": \"lint\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"test\": {{ \"kind\": \"test\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"release\": {{ \"kind\": \"release-build\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"self-check\": {{ \"kind\": \"self-check\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"dependency\": {{ \"kind\": \"dependency-audit\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"secret\": {{ \"kind\": \"secret-scan\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"sast\": {{ \"kind\": \"sast\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }},\n\
+             \x20\x20\x20\x20\x20\x20\"nonfunctional\": {{ \"kind\": \"nonfunctional\", \"program\": \"marker\", \"args\": [], \"timeout-secs\": 30, \"result-policy\": \"exit-zero\" }}\n\
+             \x20\x20\x20\x20}},\n\
+             \x20\x20\x20\x20\"profiles\": {{\n\
+             \x20\x20\x20\x20\x20\x20\"build\": {{ \"checks\": [\"format\", \"lint\", \"test\", \"release\"] }},\n\
+             \x20\x20\x20\x20\x20\x20\"security\": {{ \"checks\": [\"self-check\", \"dependency\", \"secret\", \"sast\"] }},\n\
+             \x20\x20\x20\x20\x20\x20\"test\": {{ \"checks\": [\"format\", \"lint\", \"test\", \"release\", \"self-check\", \"dependency\", \"secret\", \"sast\"] }},\n\
+             \x20\x20\x20\x20\x20\x20\"high-risk\": {{ \"checks\": [\"format\", \"lint\", \"test\", \"release\", \"self-check\", \"dependency\", \"secret\", \"sast\", \"nonfunctional\"] }}\n\
+             \x20\x20\x20\x20}},\n\
+             \x20\x20\x20\x20\"gates\": {{ \"build\": \"build\", \"security-code\": \"security\", \"test\": \"test\", \"pre-push\": \"test\", \"high-risk-test\": \"high-risk\" }},\n\
+             \x20\x20\x20\x20\"hooks\": {{ \"path\": \".githooks\", \"require-bundled\": true }},\n\
+             \x20\x20\x20\x20\"receipts\": {{ \"log-count-cap\": 16, \"log-byte-cap\": 4096 }},\n\
+             \x20\x20\x20\x20\"offline\": {{\n\
+             \x20\x20\x20\x20\x20\x20\"cargo-lock\": \"Cargo.lock\",\n\
+             \x20\x20\x20\x20\x20\x20\"cargo-target\": \"aarch64-apple-darwin\",\n\
+             \x20\x20\x20\x20\x20\x20\"advisory-db-path\": \"mpd/advisory-db\",\n\
+             \x20\x20\x20\x20\x20\x20\"advisory-revision\": \"b5fc89b8be99e96f79194d8a6f11e9b4143b99f0\",\n\
+             \x20\x20\x20\x20\x20\x20\"advisory-tree\": \"c943a47fee3f2b9767f664fd26c2cb6f0447b23d\",\n\
+             \x20\x20\x20\x20\x20\x20\"advisory-max-age-days\": 30\n\
+             \x20\x20\x20\x20}},\n\
+             \x20\x20\x20\x20\"sandbox\": {{\n\
+             \x20\x20\x20\x20\x20\x20\"contract-version\": 1,\n\
+             \x20\x20\x20\x20\x20\x20\"network-adapter\": \"platform-mandatory\",\n\
+             \x20\x20\x20\x20\x20\x20\"environment-allowlist\": [\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\"CARGO_HOME\", \"CARGO_NET_OFFLINE\", \"CARGO_TARGET_DIR\", \"CARGO_TERM_COLOR\",\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\"GIT_CONFIG_GLOBAL\", \"GIT_CONFIG_NOSYSTEM\", \"GIT_CONFIG_SYSTEM\",\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\"GIT_OPTIONAL_LOCKS\", \"GIT_PAGER\", \"GIT_TERMINAL_PROMPT\", \"HOME\", \"LANG\",\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\"LC_ALL\", \"PAGER\", \"PATH\", \"RUSTC\", \"SEMGREP_SEND_METRICS\", \"TERM\",\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\"TMPDIR\", \"TZ\"\n\
+             \x20\x20\x20\x20\x20\x20]\n\
+             \x20\x20\x20\x20}},\n\
+             \x20\x20\x20\x20\"limits\": {{\n\
+             \x20\x20\x20\x20\x20\x20\"checks-per-profile\": 16,\n\
+             \x20\x20\x20\x20\x20\x20\"aggregate-secs\": 300,\n\
+             \x20\x20\x20\x20\x20\x20\"output-bytes\": 4096,\n\
+             \x20\x20\x20\x20\x20\x20\"log-bytes\": 4096,\n\
+             \x20\x20\x20\x20\x20\x20\"worktree-bytes\": 1048576,\n\
+             \x20\x20\x20\x20\x20\x20\"child-processes\": 32,\n\
+             \x20\x20\x20\x20\x20\x20\"child-open-files\": 64,\n\
+             \x20\x20\x20\x20\x20\x20\"child-file-bytes\": 1048576\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20}}\n}}\n"
+        ),
+    );
+    run("git", &["add", "."], &sb.dir);
+    run(
+        "git",
+        &[
+            "commit",
+            "--no-verify",
+            "-q",
+            "-m",
+            "configure strict local validation",
+        ],
+        &sb.dir,
+    );
+}
+
+/// design.md "Fail-early manifest process-scope validation": a strict change
+/// whose manifest never declares its own process-scope entries must be
+/// refused at the Build gate — before a Candidate is even captured — naming
+/// exactly the entries to add, and the refusal must clear once the manifest
+/// declares them (self-healing, never requiring anything beyond those two
+/// entries).
+#[test]
+fn strict_build_gate_refuses_and_then_accepts_missing_process_scope_entries() {
+    let sb = Sandbox::new("scope-autoseed");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    write_strict_local_validation_config(&sb);
+
+    let change = "narrowscope";
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix"])
+        .status
+        .success());
+    // A narrow manifest that omits both required process-scope entries.
+    sb.write(
+        &format!("openspec/changes/{change}/manifest.json"),
+        "{\n  \"version\": 1,\n  \"paths\": [\"crates/**\"],\n  \"shared_paths\": []\n}\n",
+    );
+    write_thing_spec(&sb, change);
+    fill_artifacts(&sb, change);
+    author_judgment(&sb, change, "architecture");
+    assert_gate_ok(&sb, "architecture");
+    author_judgment(&sb, change, "security-plan");
+    assert_gate_ok(&sb, "security-plan");
+
+    let blocked = sb.mpd(&["gate", "build", "--pass"]);
+    assert!(
+        !blocked.status.success(),
+        "a narrow manifest omitting its own process scope must refuse Build"
+    );
+    let err = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        err.contains(&format!("openspec/changes/{change}/**")),
+        "must name the missing change-dir entry: {err}"
+    );
+    assert!(
+        err.contains(&format!("docs/{change}.md")),
+        "must name the missing durable-doc entry: {err}"
+    );
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "build",
+        "a refused Build gate must not advance the phase"
+    );
+
+    // Fix the manifest: declare both required entries (add-only — the
+    // pre-existing "crates/**" entry is left in place).
+    sb.write(
+        &format!("openspec/changes/{change}/manifest.json"),
+        &format!(
+            "{{\n  \"version\": 1,\n  \"paths\": [\"crates/**\", \"openspec/changes/{change}/**\", \"docs/{change}.md\"],\n  \"shared_paths\": []\n}}\n"
+        ),
+    );
+    // Widening the declared scope after Architecture PASS stales evidence and
+    // rewinds to Architecture (a pre-existing, unrelated invariant — see
+    // `a_doc_only_change_widening_its_own_manifest_after_architecture_pass_
+    // stales_evidence_and_rewinds`). The very next gate call only performs
+    // that rewind and refuses ("re-run `mpd next`"); walk the judgment gates
+    // again afterward with the now-complete manifest.
+    sb.mpd(&["gate", "architecture", "--pass"]);
+    author_judgment(&sb, change, "architecture");
+    assert_gate_ok(&sb, "architecture");
+    author_judgment(&sb, change, "security-plan");
+    assert_gate_ok(&sb, "security-plan");
+
+    let retried = sb.mpd(&["gate", "build", "--pass"]);
+    let retried_err = String::from_utf8_lossy(&retried.stderr);
+    assert!(
+        !retried_err.contains("missing required process-scope"),
+        "the completed manifest must clear the process-scope refusal: {retried_err}"
+    );
+    // Reaching a genuine structured Build PASS additionally requires a real,
+    // digest-confirmed trusted-policy activation (a deliberate, out-of-band
+    // owner trust decision this fixture does not perform — see
+    // `validation_never_executes_unactivated_candidate_policy`); the only
+    // remaining blocker must be that unrelated, pre-existing boundary, never
+    // our new check.
+    assert!(
+        retried_err.contains("trusted-policy-missing"),
+        "the only remaining blocker must be the unrelated trusted-policy boundary: {retried_err}"
+    );
+}
+
 #[test]
 fn fail_class_and_security_exploitability_are_strict_and_persisted() {
     let sb = Sandbox::new("classified-fail");

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "paths": [
+    "crates/mpd/src/closure.rs",
+    "crates/mpd/src/cli.rs",
+    "crates/mpd/tests/e2e.rs",
+    "openspec/changes/manifest-scope-autoseed/**",
+    "docs/manifest-scope-autoseed.md"
+  ],
+  "shared_paths": []
+}

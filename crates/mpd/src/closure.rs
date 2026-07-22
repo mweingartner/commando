@@ -536,8 +536,23 @@ pub fn build_candidate_closure_plan(
     let change = &candidate.capture.subject.change;
     let active_prefix = format!("openspec/changes/{change}");
     validate_archive_path(change, &active_prefix, &closure.archive_path)?;
-    let manifest = load_manifest(candidate_root, change)
-        .map_err(|error| format!("candidate closure cannot read its retained manifest: {error}"))?;
+    let manifest = load_manifest(candidate_root, change).map_err(|error| {
+        // Backstop for a pre-fix in-flight candidate whose scope digest is
+        // already frozen without its own process-scope entry declared (the
+        // primary defense is the Build-gate `missing_process_scope` check,
+        // which refuses before this candidate is even captured) — name the
+        // exact fix only for the "never captured" case; the other variants
+        // (invalid name / unsafe path / malformed JSON) are not fixed by
+        // adding a `paths` entry.
+        let hint = if error == ManifestLoadError::NotFound {
+            format!(
+                "; the Build candidate retains only declared paths — add \"openspec/changes/{change}/**\" to the change's manifest.json \"paths\""
+            )
+        } else {
+            String::new()
+        };
+        format!("candidate closure cannot read its retained manifest: {error}{hint}")
+    })?;
     if !manifest.is_ready() {
         return Err("candidate closure manifest is not ready".into());
     }
@@ -1073,7 +1088,8 @@ fn validate_documentation_postimage(
             .any(|pattern| glob_match(pattern, &document.path))
     {
         return Err(format!(
-            "reviewed documentation postimage {:?} is not a regular declared durable-doc path",
+            "reviewed documentation postimage {:?} is not a regular declared durable-doc path; \
+             add it to the change's manifest.json \"paths\"",
             document.path
         ));
     }
@@ -1665,6 +1681,68 @@ pub fn save_manifest(root: &Path, change: &str, manifest: &ChangeManifest) -> io
     json.push('\n');
     openspec_core::atomic_write_contained(&changes_dir, &path, json.as_bytes())
         .map_err(io::Error::other)
+}
+
+/// Whether concrete repository-relative `path` falls within `manifest`'s
+/// declared scope — the same glob-over-(`paths` ∪ `shared_paths`) semantics
+/// `crate::candidate`'s private `declared()` helper and
+/// [`validate_documentation_postimage`] use, so a superset pattern (`"**"`)
+/// is always treated as already covering `path`. Deliberately excludes
+/// [`SystemScope`] — unlike [`ChangeManifest::covers`], this is used to
+/// check what the manifest itself declares, not what a commit-time check
+/// folds in regardless of declaration.
+fn manifest_declares(manifest: &ChangeManifest, path: &str) -> bool {
+    manifest
+        .paths
+        .iter()
+        .chain(manifest.shared_paths.iter())
+        .any(|pattern| glob_match(pattern, path))
+}
+
+/// The `paths`/`shared_paths` scope entries `change`'s manifest must declare
+/// but doesn't yet — the entries a strict-tier Build candidate needs so that
+/// `mpd archive` can later retain this change's own `manifest.json` and its
+/// durable documentation, rather than failing late at closure (design.md
+/// "Fail-early manifest process-scope validation"). Returns the *entries to
+/// add*, sorted the same way every time an incomplete manifest reports them,
+/// not the raw probe paths themselves — empty means the manifest already
+/// covers everything this check requires.
+///
+/// Two probes:
+/// - `openspec/changes/<change>/manifest.json` AND
+///   `openspec/changes/<change>/specs/probe/spec.md` — a nested path,
+///   because a single `*` never crosses a `/` ([`crate::pathmatch`]), so a
+///   manifest declaring only `openspec/changes/<change>/*` would otherwise
+///   look complete while still missing everything nested (e.g. a spec
+///   subdirectory). Either probe unmatched reports the one recursive entry
+///   `openspec/changes/<change>/**`.
+/// - `<docs_dir>/<change>.md` — reported verbatim when unmatched.
+///
+/// Deliberately never probes or requires `.mpd/state/<change>.json`: the
+/// ledger is folded into scope via [`SystemScope`] at every commit-time check
+/// regardless of what the manifest declares (candidate.rs), and declaring it
+/// would needlessly trip the `.mpd/` sensitive-path risk signal.
+pub fn missing_process_scope(
+    manifest: &ChangeManifest,
+    change: &str,
+    docs_dir: &str,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+
+    let change_dir_manifest = format!("openspec/changes/{change}/manifest.json");
+    let change_dir_nested_probe = format!("openspec/changes/{change}/specs/probe/spec.md");
+    if !manifest_declares(manifest, &change_dir_manifest)
+        || !manifest_declares(manifest, &change_dir_nested_probe)
+    {
+        missing.push(format!("openspec/changes/{change}/**"));
+    }
+
+    let doc_target = format!("{docs_dir}/{change}.md");
+    if !manifest_declares(manifest, &doc_target) {
+        missing.push(doc_target);
+    }
+
+    missing
 }
 
 // =====================================================================
@@ -4214,6 +4292,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Like [`candidate_closure_fixture`], but the change directory and its
+    /// `manifest.json` are never part of the base commit — they are created
+    /// as untracked worktree files only after "base" lands, matching the
+    /// real shape design.md's Context describes: `mpd manifest` writes
+    /// `manifest.json` into the live worktree, and "the mpd flow commits
+    /// once at closure", so at Build-candidate-capture time it is still
+    /// dirty/uncommitted. When `manifest_paths` does not declare the
+    /// change's own `openspec/changes/<change>/**`, the strict overlay
+    /// excludes this undeclared dirty path (candidate.rs `overlay_plan`) and
+    /// the private clone never retains its own manifest.json at all.
+    fn candidate_closure_fixture_with_undeclared_change_dir(
+        tag: &str,
+        change: &str,
+        manifest_paths: &[&str],
+    ) -> (PathBuf, crate::candidate::CandidateProjection) {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-closure-plan-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".mpd")).unwrap();
+        std::fs::write(root.join(".mpd/.gitignore"), b"build-output/\nstate/\n").unwrap();
+        std::fs::write(root.join("README.md"), b"base\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "closure-fixture@example.invalid"]);
+        git(&["config", "user.name", "Closure Fixture"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        let paths_json = manifest_paths
+            .iter()
+            .map(|p| format!("{p:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/manifest.json")),
+            format!("{{\"version\":1,\"paths\":[{paths_json}],\"shared_paths\":[]}}"),
+        )
+        .unwrap();
+
+        let captured = crate::candidate::capture_candidate(&root, change, &"a".repeat(64))
+            .expect("capture candidate with an undeclared, uncommitted manifest.json");
+        (root, captured.projection)
+    }
+
+    #[test]
+    fn build_candidate_closure_plan_hints_the_missing_scope_entry_for_a_never_retained_manifest() {
+        // D1/D2: the primary repro from design.md's Context — a manifest
+        // that never declares its own `openspec/changes/<change>/**` never
+        // retains its own `manifest.json` in the strict candidate, so `mpd
+        // archive` fails late with `ManifestLoadError::NotFound`. That
+        // archive error must now carry a copy-pasteable remediation hint
+        // naming the exact entry to add (the (c) backstop; the (b) primary
+        // defense — the Build-gate `missing_process_scope` check — refuses
+        // before a candidate like this is ever captured).
+        let change = "narrowscope";
+        let (root, candidate) = candidate_closure_fixture_with_undeclared_change_dir(
+            "undeclared-manifest",
+            change,
+            &["crates/**"],
+        );
+        let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
+        assert!(
+            !candidate_root
+                .join(format!("openspec/changes/{change}/manifest.json"))
+                .exists(),
+            "the undeclared manifest.json must never have been retained by the candidate"
+        );
+
+        let archive_closure = ArchiveClosure {
+            base_commit: candidate.capture.subject.base_commit.clone(),
+            archive_path: format!("openspec/changes/archive/2026-01-01-{change}"),
+            transaction_id: Digest::of_bytes(b"txn"),
+            candidate_id: Some(candidate.capture.subject.id.clone()),
+            allowed_paths: vec!["crates/**".to_string()],
+            system_paths: vec![format!("openspec/changes/archive/2026-01-01-{change}")],
+            post_archive_digest: Digest::of_bytes(b"post"),
+            archived_at: 1_752_000_000,
+        };
+        let documentation = ReviewedDocumentationPostimages {
+            doc_validation_receipt_id: "d".repeat(64),
+            files: Vec::new(),
+        };
+        let archive = DeterministicArchivePostimages {
+            spec_writes: Vec::new(),
+            ledger: ClosureFilePostimage::regular(
+                format!(".mpd/state/{change}.json"),
+                b"{}".to_vec(),
+            ),
+        };
+        let result = build_candidate_closure_plan(
+            &candidate_root,
+            &candidate,
+            &archive_closure,
+            &[],
+            &documentation,
+            &archive,
+        );
+        let error =
+            result.expect_err("a never-retained manifest must be a clean Err, never a panic");
+        assert!(
+            error.contains("retained manifest"),
+            "must keep the pinned substring: {error}"
+        );
+        assert!(
+            error.contains(&format!("openspec/changes/{change}/**")),
+            "must name the exact entry to add: {error}"
+        );
+        assert!(
+            error.contains("manifest.json"),
+            "must point at the change's manifest.json \"paths\": {error}"
+        );
+
+        make_tree_removable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A pre-`system_paths` archive-closure record (schema drift within this
     /// unreleased feature, or a hand-crafted legacy fixture) must still parse
     /// — `system_paths` degrades to empty rather than failing to load.
@@ -4523,6 +4734,147 @@ mod manifest_tests {
             "must not string-prefix-match a sibling directory"
         );
         assert!(!manifest.covers("random/unrelated.rs", &system));
+    }
+}
+
+// =====================================================================
+// missing_process_scope
+// =====================================================================
+
+#[cfg(test)]
+mod missing_process_scope_tests {
+    use super::scope_is_documentation_only_tests::{arb_allow_pattern, arb_deny_pattern};
+    use super::*;
+    use proptest::prelude::*;
+
+    const CHANGE: &str = "my-change";
+
+    fn manifest_of(paths: Vec<String>, shared_paths: Vec<String>) -> ChangeManifest {
+        ChangeManifest {
+            version: MANIFEST_SCHEMA,
+            paths,
+            shared_paths,
+            publish: None,
+        }
+    }
+
+    fn owned(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    #[test]
+    fn the_conventional_trio_is_complete() {
+        let manifest = manifest_of(
+            owned(&["openspec/changes/my-change/**", "docs/my-change.md"]),
+            Vec::new(),
+        );
+        assert!(missing_process_scope(&manifest, CHANGE, "docs").is_empty());
+    }
+
+    #[test]
+    fn a_recursive_double_star_over_everything_is_always_complete() {
+        let manifest = manifest_of(owned(&["**"]), Vec::new());
+        assert!(missing_process_scope(&manifest, CHANGE, "docs").is_empty());
+    }
+
+    #[test]
+    fn a_narrow_unrelated_scope_reports_both_entries_by_exact_string() {
+        let manifest = manifest_of(owned(&["crates/**"]), Vec::new());
+        assert_eq!(
+            missing_process_scope(&manifest, CHANGE, "docs"),
+            vec![
+                "openspec/changes/my-change/**".to_string(),
+                "docs/my-change.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn declaring_only_the_change_dir_still_reports_the_doc_target() {
+        let manifest = manifest_of(owned(&["openspec/changes/my-change/**"]), Vec::new());
+        assert_eq!(
+            missing_process_scope(&manifest, CHANGE, "docs"),
+            vec!["docs/my-change.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn declaring_only_the_doc_target_still_reports_the_change_dir() {
+        let manifest = manifest_of(owned(&["docs/my-change.md"]), Vec::new());
+        assert_eq!(
+            missing_process_scope(&manifest, CHANGE, "docs"),
+            vec!["openspec/changes/my-change/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_shared_paths_entry_counts_as_declared() {
+        let manifest = manifest_of(
+            Vec::new(),
+            owned(&["openspec/changes/my-change/**", "docs/my-change.md"]),
+        );
+        assert!(missing_process_scope(&manifest, CHANGE, "docs").is_empty());
+    }
+
+    #[test]
+    fn a_custom_docs_dir_is_honored_not_hardcoded() {
+        let manifest = manifest_of(
+            owned(&[
+                "openspec/changes/my-change/**",
+                "documentation/my-change.md",
+            ]),
+            Vec::new(),
+        );
+        assert!(missing_process_scope(&manifest, CHANGE, "documentation").is_empty());
+        // The default "docs" tree is NOT what this manifest declared, so
+        // probing under the custom `docs_dir` must still report the custom
+        // target rather than silently falling back to "docs/<change>.md".
+        let manifest = manifest_of(owned(&["openspec/changes/my-change/**"]), Vec::new());
+        assert_eq!(
+            missing_process_scope(&manifest, CHANGE, "documentation"),
+            vec!["documentation/my-change.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_single_star_change_dir_pattern_still_reports_incomplete() {
+        // `*` never crosses `/` (pathmatch.rs) — a manifest declaring only
+        // `openspec/changes/<c>/*` matches `manifest.json` but not the
+        // nested spec probe, so it must still be reported as needing the
+        // recursive `**` form.
+        let manifest = manifest_of(
+            owned(&["openspec/changes/my-change/*", "docs/my-change.md"]),
+            Vec::new(),
+        );
+        assert_eq!(
+            missing_process_scope(&manifest, CHANGE, "docs"),
+            vec!["openspec/changes/my-change/**".to_string()]
+        );
+    }
+
+    fn arb_pattern() -> impl Strategy<Value = String> {
+        prop_oneof![arb_allow_pattern(), arb_deny_pattern()]
+    }
+
+    proptest! {
+        /// Self-healing (and, by completing without panicking on an
+        /// arbitrary safe scope, a proof the function never panics):
+        /// whatever `missing_process_scope` reports, adding exactly those
+        /// entries to `paths` always makes the very next call report
+        /// nothing — the check can never demand an entry it would then
+        /// fail to recognize once declared.
+        #[test]
+        fn adding_the_reported_entries_always_heals_the_manifest(
+            paths in prop::collection::vec(arb_pattern(), 0..5),
+            shared_paths in prop::collection::vec(arb_pattern(), 0..3),
+        ) {
+            let change = "proptest-change";
+            let manifest = manifest_of(paths, shared_paths);
+            let missing = missing_process_scope(&manifest, change, "docs");
+            let mut healed = manifest.clone();
+            healed.paths.extend(missing);
+            prop_assert!(missing_process_scope(&healed, change, "docs").is_empty());
+        }
     }
 }
 

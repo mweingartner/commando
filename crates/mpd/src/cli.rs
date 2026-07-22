@@ -3309,6 +3309,22 @@ fn cmd_gate(
                 )?;
                 let profile = profile.as_str();
                 let report = if phase == Phase::Build {
+                    // Fail-early manifest process-scope validation (design.md
+                    // "Fail-early manifest process-scope validation"): a
+                    // strict candidate retains only its DECLARED dirty
+                    // paths, so an undeclared `openspec/changes/<change>/**`
+                    // or durable-doc target is silently dropped from the
+                    // candidate and only surfaces as a cryptic late `mpd
+                    // archive` failure. Refuse here, before the candidate is
+                    // even captured, with the exact entries to add.
+                    let scope_gaps =
+                        closure::missing_process_scope(&live_manifest, &change, cfg.docs_dir());
+                    if !scope_gaps.is_empty() {
+                        return Ok(gate_blocked(&format!(
+                            "Build gate refused: manifest.json is missing required process-scope path(s): {}. Add them to openspec/changes/{change}/manifest.json \"paths\" and re-run the Build gate.",
+                            scope_gaps.join(", ")
+                        )));
+                    }
                     let (pending, report) =
                         execute_strict_candidate_build(&root, &change, local, profile)?;
                     gate_candidate = Some(pending.capture().clone());
@@ -5927,8 +5943,11 @@ fn cmd_manifest(change: Option<String>) -> CmdResult {
     }
     closure::save_manifest(&root, &change, &closure::ChangeManifest::seed())
         .map_err(|e| e.to_string())?;
+    let docs_dir = Config::load(&root).docs_dir().to_string();
     println!(
-        "Seeded {}. Declare paths before Architecture PASS.",
+        "Seeded {}. Declare paths before Architecture PASS — every strict change needs at \
+         least \"openspec/changes/{change}/**\" and \"{docs_dir}/{change}.md\" declared, or the \
+         Build gate will refuse.",
         path.display()
     );
     Ok(0)
