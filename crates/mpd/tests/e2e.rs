@@ -1213,11 +1213,13 @@ fn check_staged_blocks_on_secret() {
 /// SECURITY(plan) Condition 2 (scan-secrets-fail-closed): the wrapper-level
 /// unit tests prove `scan_secrets` returns `Err` on a tracked symlink; only a
 /// black-box run proves the CALLER blocks instead of swallowing it. A temp
-/// repo with a tracked symlink (target existing — else `git_files`' `exists()`
-/// filter drops it and this proves nothing) must make non-staged `mpd check`
-/// exit non-zero with the fail-closed diagnostic and never print the
-/// clean-scan line. The failing scan resolves before external scanners or the
-/// test runner, so this stays hermetic.
+/// repo with a tracked symlink (target existing — a dangling target is also
+/// retained by `git_tracked_files`' lstat-presence filter, but a healthy
+/// symlink already exercises the `scan_secrets` non-regular refusal this test
+/// targets) must make non-staged `mpd check` exit non-zero with the
+/// fail-closed diagnostic and never print the clean-scan line. The failing
+/// scan resolves before external scanners or the test runner, so this stays
+/// hermetic.
 #[cfg(unix)]
 #[test]
 fn check_fails_closed_on_tracked_symlink() {
@@ -1245,7 +1247,9 @@ fn check_fails_closed_on_tracked_symlink() {
     );
     assert!(
         sb.dir.join("safe.txt").is_file(),
-        "the symlink target must exist to survive the exists() filter"
+        "this fixture keeps the symlink healthy (target present); \
+         a dangling symlink is now retained by enumeration too and blocks \
+         the same way — see git_tracked_files_retains_dangling_symlink_*"
     );
 
     let out = sb.mpd(&["check"]);
@@ -1278,6 +1282,112 @@ fn check_fails_closed_on_tracked_symlink() {
         stdout(&out)
     );
 }
+
+/// Design D6/D7: a git enumeration failure (not just a non-regular tracked
+/// file) must also block non-staged `mpd check` rather than silently
+/// reporting clean. A `.git` FILE pointing at a nonexistent gitdir makes
+/// `git ls-files` exit non-zero deterministically and is reversible via
+/// rename-back.
+#[test]
+fn check_blocks_when_enumeration_fails() {
+    let sb = Sandbox::new("enumeration-fails");
+    sb.mpd(&["init"]);
+
+    let git_dir = sb.dir.join(".git");
+    let saved_git_dir = sb.dir.join(".git-saved");
+    std::fs::rename(&git_dir, &saved_git_dir).unwrap();
+    std::fs::write(&git_dir, "gitdir: /nonexistent/does-not-exist\n").unwrap();
+
+    let out = sb.mpd(&["check"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a broken enumeration boundary must exit 2, never report clean: stdout={} stderr={}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot enumerate tracked files"),
+        "stderr must carry the enumeration-boundary diagnostic: {err}"
+    );
+    assert!(
+        !stdout(&out).contains("Checks passed"),
+        "a blocked check must not print the clean-scan line: {}",
+        stdout(&out)
+    );
+
+    // Restore the real `.git` directory so the sandbox tears down cleanly.
+    std::fs::remove_file(&git_dir).unwrap();
+    std::fs::rename(&saved_git_dir, &git_dir).unwrap();
+}
+
+/// D2: `git ls-files -z` emits pathnames verbatim, so a `core.quotepath`-quoted
+/// (non-ASCII) tracked name must still reach the built-in scanner and be
+/// flagged like any other tracked file — never silently excluded.
+#[test]
+fn check_scans_quotepath_quoted_tracked_file() {
+    let sb = Sandbox::new("quotepath-scan");
+    sb.mpd(&["init"]);
+    run("git", &["config", "core.quotepath", "true"], &sb.dir);
+    // Assemble the fake key from split literals so this test source itself
+    // carries no contiguous credential pattern.
+    sb.write(
+        "sécrets.txt",
+        &format!("aws_key = AKIA{}\n", "IOSFODNN7EXAMPLE"),
+    );
+    run("git", &["add", "sécrets.txt"], &sb.dir);
+
+    // Vacuity guard: line-mode `git ls-files` really does octal-quote this
+    // non-ASCII name, else this fixture doesn't exercise quoting.
+    let ls = run("git", &["ls-files"], &sb.dir);
+    assert!(
+        stdout(&ls).contains("\\303\\251"),
+        "git line-mode output must quote the non-ASCII name: {}",
+        stdout(&ls)
+    );
+
+    let out = sb.mpd(&["check"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a secret in a quotepath-quoted tracked file must block check: stdout={} stderr={}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Assert the ASCII suffix, not the é bytes, to dodge macOS NFC/NFD
+    // filename-normalization differences.
+    assert!(
+        err.contains("crets.txt"),
+        "stderr must name the quotepath-quoted tracked file: {err}"
+    );
+    assert!(
+        err.contains("aws-access-key-id"),
+        "stderr must name the finding rule: {err}"
+    );
+    assert!(
+        !stdout(&out).contains("Checks passed"),
+        "a blocked check must not print the clean-scan line: {}",
+        stdout(&out)
+    );
+}
+
+// A `security_code_gate_blocks_when_enumeration_fails` black-box test was
+// deliberately NOT added here. Walking a candidate-backed change to the
+// Security (code) gate first exercises `candidate::validate_worktree_surface`
+// (candidate.rs), which makes its OWN direct, differently-formatted
+// `git::ls_files` call to independently cross-check the overlay surface —
+// entirely out of this change's scope (design.md Condition 10). With `.git`
+// broken, THAT call fails first (bare "git ls-files failed", exit 2), so the
+// gate never reaches `checks::git_tracked_files` and a gate-walk test would
+// assert on an out-of-scope failure rather than this fix — brittle, not
+// informative. This is a deliberate deviation from tasks.md task 4.3, recorded
+// here on those technical merits (not on any design.md/security-plan.md
+// allowance — there is none). Coverage that DOES bite: `cmd_gate`'s
+// enumeration-`Err` arm (cli.rs) shares the exact `checks::git_tracked_files`
+// path that `check_blocks_when_enumeration_fails` (above) pins black-box and the
+// `checks::mod` unit tests pin directly.
 
 #[test]
 fn archive_refuses_with_unmet_gates() {

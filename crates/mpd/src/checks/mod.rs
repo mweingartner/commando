@@ -138,25 +138,23 @@ fn write_ephemeral_gitleaks_config() -> Option<PathBuf> {
     Some(path)
 }
 
-/// All git-tracked files, as absolute paths.
-pub fn git_tracked_files(root: &Path) -> Vec<PathBuf> {
-    git_files(root, &["ls-files"])
-}
-
-fn git_files(root: &Path, args: &[&str]) -> Vec<PathBuf> {
-    let output = Command::new("git").args(args).current_dir(root).output();
-    let Ok(out) = output else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| root.join(l))
-        .filter(|p| p.exists())
-        .collect()
+/// All git-tracked files, as absolute paths. Fails closed: any enumeration
+/// failure (git spawn failure, non-zero exit, oversized or non-UTF-8 listing)
+/// is an `Err` — never an empty, falsely-scannable set. Paths come NUL-delimited
+/// (`git ls-files -z` via `crate::git::ls_files`) so unusual name bytes are never
+/// quoted or dropped. The single intentional omission is a tracked path with no
+/// worktree entry at all (an unstaged deletion or sparse checkout) — no worktree
+/// bytes to scan; everything with an lstat entry, including a dangling symlink,
+/// is retained for `secrets::scan_paths`'s own fail-closed handling. A repo with
+/// zero tracked files legitimately returns `Ok(vec![])` (clean), never an error.
+pub fn git_tracked_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let rels =
+        crate::git::ls_files(root).map_err(|e| format!("cannot enumerate tracked files: {e}"))?;
+    Ok(rels
+        .into_iter()
+        .map(|rel| root.join(rel))
+        .filter(|p| p.symlink_metadata().is_ok()) // lstat-presence, NEVER exists()
+        .collect())
 }
 
 /// Result of a secret scan.
@@ -415,10 +413,10 @@ mod tests {
             .unwrap()
             .success());
 
-        let files = git_tracked_files(&root);
+        let files = git_tracked_files(&root).expect("enumeration must succeed in a real repo");
         assert!(
             files.iter().any(|p| p == &root.join("link.txt")),
-            "the tracked symlink (target exists) must survive the exists() filter, \
+            "the tracked symlink (target exists) must survive enumeration, \
              else this test proves nothing: {files:?}"
         );
 
@@ -431,6 +429,201 @@ mod tests {
             !err.contains("safe bytes"),
             "error must not leak scanned file content: {err}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Shared temp-git-repo fixture for the `git_tracked_files` regression
+    /// pins below: an initialized repo with a committer identity configured,
+    /// ready for the caller to write/add/commit fixture content.
+    fn init_repo_fixture(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        root
+    }
+
+    /// A `.git` FILE (not a directory) pointing at a nonexistent gitdir makes
+    /// `git ls-files` exit non-zero deterministically (design D7), without
+    /// depending on any outer repo. The enumeration boundary must refuse
+    /// rather than fall back to an empty, falsely-clean set.
+    #[test]
+    fn git_tracked_files_fails_closed_when_git_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-broken-git-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /nonexistent/does-not-exist\n").unwrap();
+
+        let err = git_tracked_files(&root)
+            .expect_err("a broken .git must fail closed, never enumerate an empty set");
+        assert!(
+            err.starts_with("cannot enumerate tracked files"),
+            "error must carry the enumeration-boundary prefix: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `git ls-files -z` emits pathnames verbatim; `core.quotepath` governs
+    /// only line-mode output (D2). Must FAIL against the pre-fix line-mode
+    /// enumeration, which drops any name git's line-mode output quotes.
+    #[test]
+    fn git_tracked_files_retains_quotepath_quoted_names() {
+        let root = init_repo_fixture("quotepath");
+        assert!(Command::new("git")
+            .args(["config", "core.quotepath", "true"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let name = "sécrets.txt";
+        std::fs::write(root.join(name), "benign fixture bytes\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", name])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        // Vacuity guard: line-mode `git ls-files` really does octal-quote this
+        // name — else this fixture doesn't exercise quoting and proves nothing.
+        let ls = Command::new("git")
+            .args(["ls-files"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let ls_stdout = String::from_utf8_lossy(&ls.stdout);
+        assert!(
+            ls_stdout.contains("\\303\\251"),
+            "git line-mode output must quote the non-ASCII name: {ls_stdout}"
+        );
+
+        let files = git_tracked_files(&root).expect("enumeration must succeed in a real repo");
+        assert!(
+            files.iter().any(|p| p == &root.join(name)),
+            "the quotepath-quoted name must survive -z enumeration verbatim: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A dangling tracked symlink (D4) must be RETAINED by lstat-presence
+    /// filtering and fail the scan closed — never dropped by an `exists()`-style
+    /// filter, which would let breaking the link silently un-block the gate.
+    /// Must FAIL against the pre-fix `exists()` filter.
+    #[cfg(unix)]
+    #[test]
+    fn git_tracked_files_retains_dangling_symlink_and_scan_fails_closed() {
+        let root = init_repo_fixture("dangling-symlink");
+        std::os::unix::fs::symlink("no-such-target", root.join("gone.txt")).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "gone.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let files = git_tracked_files(&root).expect("enumeration must succeed in a real repo");
+        assert!(
+            files.iter().any(|p| p == &root.join("gone.txt")),
+            "a dangling tracked symlink must be retained (lstat-presence, never exists()): {files:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("gone.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "gone.txt must still be a symlink on disk"
+        );
+
+        let err = scan_secrets(&files).unwrap_err();
+        assert!(
+            err.contains("non-regular"),
+            "error must name the non-regular cause: {err}"
+        );
+        assert!(
+            !err.contains("no-such-target"),
+            "error must not leak the dangling symlink's target: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A tracked path with no worktree entry at all (an unstaged deletion) is
+    /// the single intentional enumeration-time omission (D5): no worktree
+    /// bytes to scan, and the name is still covered by the staged and egress
+    /// scans. It must be excluded without disturbing sibling tracked paths.
+    #[test]
+    fn git_tracked_files_skips_worktree_absent_tracked_path() {
+        let root = init_repo_fixture("worktree-absent");
+        std::fs::write(root.join("a.txt"), "safe bytes a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "safe bytes b\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "a.txt", "b.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "add a.txt and b.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        // Unstaged deletion: still tracked (in HEAD and the index), but the
+        // worktree entry is gone.
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+
+        let files = git_tracked_files(&root).expect("enumeration must succeed in a real repo");
+        assert!(
+            !files.iter().any(|p| p == &root.join("a.txt")),
+            "a worktree-absent tracked path must be omitted: {files:?}"
+        );
+        assert!(
+            files.iter().any(|p| p == &root.join("b.txt")),
+            "the sibling tracked path must remain: {files:?}"
+        );
+
+        let report = scan_secrets(&files).expect("the remaining regular file set must scan clean");
+        assert!(report.findings.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Advisory A2 (security-plan.md): a repo with zero tracked files must
+    /// enumerate `Ok(vec![])`, never `Err` — pins that "empty" and "failed" stay
+    /// structurally distinct so a future stricter check can't break fresh repos.
+    #[test]
+    fn git_tracked_files_ok_empty_for_zero_tracked_files() {
+        let root = init_repo_fixture("empty-repo");
+        let files = git_tracked_files(&root)
+            .expect("a clean fresh repo with zero tracked files must enumerate Ok, never Err");
+        assert!(
+            files.is_empty(),
+            "a repo with zero tracked files must enumerate empty: {files:?}"
+        );
+        let report = scan_secrets(&files).expect("an empty scan set must report clean");
+        assert!(report.findings.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

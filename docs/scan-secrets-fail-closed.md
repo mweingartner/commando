@@ -25,12 +25,16 @@ overflow, or an unreadable path now block at both call sites (the Security (code
 phase gate and non-staged `mpd check`).
 
 **Does not cover (explicit residuals, by design):**
-- The *enumeration* boundary that builds the scan set (`git_files`) is unchanged
-  and can still silently shrink the set — a `git ls-files` failure, a
-  `core.quotepath`-quoted (non-ASCII) filename, or a dangling symlink. These are
-  compensated at egress by the path-independent pre-push blob scan and are
-  tracked as a separate follow-up; they are called out honestly in the spec's
-  boundary note rather than claimed fixed.
+- The *enumeration* boundary that builds the scan set (`git_tracked_files`) is
+  now fail-closed and quoting-immune: a `git ls-files` failure, an oversized
+  listing, or a non-UTF-8 listing blocks rather than silently enumerating an
+  empty set; a `core.quotepath`-quoted (non-ASCII) tracked name is enumerated
+  verbatim and scanned like any other tracked file; a dangling tracked symlink
+  is retained and fails the scan closed, same as a healthy one. The single
+  remaining intentional omission is a tracked path with no worktree entry at
+  all (an unstaged deletion or a sparse checkout) — there are no worktree bytes
+  to scan, and the name is still covered by the staged scan (at commit) and the
+  path-independent egress scan (at push).
 - The error diagnostic **never includes file contents** — the trust-boundary
   invariant verified by Security and the tests. It always names the cause; it
   names the offending path for the non-regular and oversize classes, while the
