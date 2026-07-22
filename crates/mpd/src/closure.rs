@@ -220,6 +220,7 @@ pub enum NoExternalState {
 /// Absent or incomplete ⇒ those phases stay `always_execute` (the safe
 /// default) — see design.md "Dependency and invalidation rules".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HermeticReusePolicy {
     /// Schema version (see [`HERMETIC_POLICY_SCHEMA`]).
     pub schema: u32,
@@ -4079,6 +4080,18 @@ mod tests {
         let policy: HermeticReusePolicy = serde_json::from_str(minimal).unwrap();
         assert!(policy.environment.is_empty());
         assert!(policy.input_paths.is_empty());
+    }
+
+    /// Security-code L2: an unknown OPTIONAL field inside the
+    /// `closure.hermetic_reuse` block must fail parse rather than being
+    /// silently ignored — the pre-existing gap the advisory flagged (the
+    /// required `schema`/`external_state` fields already failed closed; a
+    /// misspelled or extraneous optional field previously did not).
+    #[test]
+    fn hermetic_policy_rejects_an_unknown_field() {
+        let with_typo =
+            r#"{"schema":1,"external_state":"none","environment":[],"input_paths":[],"typo":true}"#;
+        assert!(serde_json::from_str::<HermeticReusePolicy>(with_typo).is_err());
     }
 
     #[test]

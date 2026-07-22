@@ -3009,6 +3009,211 @@ fn validate_candidate_report_binding(
     Ok(())
 }
 
+/// design.md A2 / Security-plan C2: mirror `validate_candidate_report_binding`'s
+/// subject and typed Build-output checks against a RECORDED validation
+/// receipt from ledger history (not a live `ValidationReport`), applied to the
+/// ORIGIN of a strict Build/Test `--reuse` request. A receipt whose subject
+/// or typed Build output names a candidate OTHER than the one it is nominally
+/// attached to must never be reused, even though `evaluate_reuse`'s
+/// dependency-snapshot validity already passed — the two fields are never
+/// trusted to merely cooperate.
+fn validate_origin_receipt_candidate_binding(
+    receipt: &crate::local_validation::ValidationReceiptV1,
+    capture: &crate::candidate::CandidateCapture,
+) -> Result<(), String> {
+    let expected_request = format!("candidate:{}", capture.subject.id);
+    let subject = &receipt.subject;
+    if subject.requested != expected_request
+        || subject.pushed_kind != "candidate"
+        || subject.commit != capture.subject.base_commit
+        || subject.tree != capture.subject.base_tree
+        || subject.pushed_oid != capture.subject.base_commit
+        || !subject.tag_chain.is_empty()
+    {
+        return Err(
+            "origin validation receipt subject differs from its own retained Candidate".into(),
+        );
+    }
+    if let Some(output) = receipt.build_output.as_ref() {
+        if output.candidate_id.as_deref() != Some(capture.subject.id.as_str()) {
+            return Err(
+                "origin validation receipt's Build output candidate ID differs from its own \
+                 retained Candidate"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// design.md A2 item 5: revalidate a previously RECORDED `BuildOutputV1`
+/// against disk now, composed only from the public [`crate::local_validation::
+/// capture_build_output`] primitive (the private `capture_recorded_build_output`
+/// this mirrors is not reachable from this module). A fresh read is taken at
+/// `output.path` and every recorded identity/contract field — including the
+/// opened file's device/inode, not merely its content digest — must still
+/// match exactly; any drift (rebuild, replacement, missing file) refuses.
+fn revalidate_recorded_build_output(
+    root: &Path,
+    output: &crate::ledger::BuildOutputV1,
+) -> Result<(), String> {
+    let mut observed = crate::local_validation::capture_build_output(root, &output.path)
+        .map_err(|e| format!("Build output revalidation failed: {e}"))?;
+    if observed.size > output.max_bytes || observed.mode != output.required_mode {
+        return Err("Build output no longer satisfies its recorded size/mode contract".into());
+    }
+    observed.name = output.name.clone();
+    observed.max_bytes = output.max_bytes;
+    observed.required_mode = output.required_mode;
+    observed.candidate_id = output.candidate_id.clone();
+    if observed != *output {
+        return Err(
+            "Build output has changed since the origin receipt; fresh execution is required".into(),
+        );
+    }
+    Ok(())
+}
+
+/// The verified bindings a strict Build/Test `--reuse` request carries
+/// forward into its `GateRecord` (design.md A2 item 6) — never `None`, so
+/// downstream `retained_candidate_for_objective_gate`/archive equivalence
+/// keep working exactly as they would after a fresh PASS.
+#[derive(Debug)]
+struct StrictObjectiveReuse {
+    candidate: crate::candidate::CandidateCapture,
+    build_output: Option<crate::ledger::BuildOutputV1>,
+    validation_receipt: crate::local_validation::ValidationReceiptV1,
+    checks: CheckSummary,
+}
+
+/// design.md A2: whether a strict Build/Test `--reuse` request may append a
+/// reused `GateRecord` carrying a Candidate/validation receipt/(Build output)
+/// — instead of the plain judgment-style reused record every other phase
+/// gets. The caller has already confirmed `origin`'s dependency-snapshot
+/// validity (`evidence_validity` + `evaluate_reuse`); this adds the strictly
+/// more restrictive candidate/profile/policy/build-output equality set A2
+/// requires. Every miss returns a plain `Err` — the caller never falls back
+/// to a silent PASS; the phase must then be executed fresh.
+fn evaluate_strict_objective_reuse(
+    root: &Path,
+    change: &str,
+    phase: Phase,
+    effective_risk: RiskLevel,
+    ledger: &ledger::Ledger,
+    origin: &ledger::GateEvent,
+    receipt_hex: &str,
+) -> Result<StrictObjectiveReuse, String> {
+    // Item 1: the origin record must itself carry a retained Candidate and a
+    // typed validation receipt (+ Build output for Build), and the receipt
+    // must be bound to THAT candidate (Security-plan C2) for BOTH phases.
+    let origin_candidate = origin.record.candidate.as_ref().ok_or_else(|| {
+        format!(
+            "{} origin receipt has no retained Candidate binding",
+            phase.label()
+        )
+    })?;
+    let origin_receipt = origin.record.validation_receipt.as_ref().ok_or_else(|| {
+        format!(
+            "{} origin receipt has no typed validation receipt",
+            phase.label()
+        )
+    })?;
+    let origin_build_output = origin.record.build_output.as_ref();
+    if phase == Phase::Build && origin_build_output.is_none() {
+        return Err("Build origin receipt has no typed BuildOutputV1".into());
+    }
+    validate_origin_receipt_candidate_binding(origin_receipt, origin_candidate)?;
+
+    // The current, live typed policy — loaded once so the profile-selection
+    // and policy-digest checks below observe the exact same config read.
+    let (local, policy_digest) = crate::local_validation::load_candidate_policy(root)?;
+
+    // Item 4: policy equality — explicit and cheap, ahead of any candidate
+    // (re)capture below, plus the origin record's own internal receipt/
+    // Candidate consistency.
+    if policy_digest != origin_candidate.subject.policy_digest {
+        return Err(format!(
+            "{} candidate policy has changed since the origin receipt; fresh execution is required",
+            phase.label()
+        ));
+    }
+    if origin_receipt.candidate_policy_digest != origin_candidate.subject.policy_digest {
+        return Err(format!(
+            "{} origin receipt's candidate_policy_digest is inconsistent with its own retained \
+             Candidate",
+            phase.label()
+        ));
+    }
+
+    // Item 3: profile equality (load-bearing) — computed from the CURRENT
+    // effective risk (already re-loaded by the caller after freshness
+    // enforcement), never from the candidate ID, which does not bind the
+    // selected profile.
+    let live_manifest = closure::load_manifest(root, change).map_err(|e| e.to_string())?;
+    let profile =
+        closure::select_gate_profile(&local, phase, &live_manifest, change, effective_risk)?;
+    if profile != origin_receipt.profile {
+        return Err(format!(
+            "{} profile {profile:?} differs from the origin receipt's {:?}; fresh execution is \
+             required",
+            phase.label(),
+            origin_receipt.profile
+        ));
+    }
+
+    // Item 2: candidate identity NOW. Build recaptures (idempotent over the
+    // retained root — a content match reopens the same root; any drift
+    // publishes/uses a different id); Test reuses the candidate the current
+    // Build PASS + Security(code) PASS already retained and bound together.
+    let fresh_candidate = match phase {
+        Phase::Build => {
+            let captured = crate::candidate::capture_candidate(root, change, &policy_digest)?;
+            captured.rehash(root)?;
+            captured.projection.capture.clone()
+        }
+        Phase::Test => {
+            let capture = retained_candidate_for_objective_gate(ledger, change, Phase::Test)?;
+            crate::candidate::reopen_candidate(root, &capture)?;
+            capture
+        }
+        other => {
+            return Err(format!(
+                "{} is not a strict objective reuse phase",
+                other.label()
+            ))
+        }
+    };
+    if fresh_candidate.subject.id != origin_candidate.subject.id {
+        return Err(format!(
+            "{} candidate identity has changed since the origin receipt; fresh execution is \
+             required",
+            phase.label()
+        ));
+    }
+
+    // Item 5: Build output revalidation against disk (Build only) — Deploy
+    // depends on this artifact still being exactly what it was.
+    let build_output = if phase == Phase::Build {
+        let recorded = origin_build_output.expect("checked above");
+        revalidate_recorded_build_output(root, recorded)?;
+        Some(recorded.clone())
+    } else {
+        None
+    };
+
+    // Item 6: a non-`None` CheckSummary carrying the origin's own summary
+    // plus an explicit reuse note.
+    let mut checks = origin.record.checks.clone().unwrap_or_default();
+    checks.command = Some(format!("reused from receipt {receipt_hex}"));
+
+    Ok(StrictObjectiveReuse {
+        candidate: fresh_candidate,
+        build_output,
+        validation_receipt: origin_receipt.clone(),
+        checks,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_gate(
     phase_slug: String,
@@ -3087,13 +3292,16 @@ fn cmd_gate(
             return Ok(gate_blocked(&issue));
         }
     }
-    // Candidate-backed objective gates are always fresh executions. Refuse a
-    // reuse request before freshness/risk maintenance can write the ledger, so
-    // an inapplicable receipt cannot advance or otherwise mutate strict state.
-    if reuse.is_some()
-        && ledger.strict
-        && matches!(phase, Phase::Build | Phase::SecurityCode | Phase::Test)
-    {
+    // Security(code) evidence is never carried forward: A1 (design.md) — every
+    // rewind still runs one fresh full deterministic-scan pass on the
+    // candidate, which is the premise that makes reusing Test's embedded scans
+    // safe. Refuse a reuse request before freshness/risk maintenance can write
+    // the ledger, so an inapplicable receipt cannot advance or otherwise
+    // mutate strict state. Build/Test are narrower: they may reuse a prior
+    // objective receipt on a byte-identical candidate (see the strict
+    // `Build`/`Test` branch of the `--reuse` block below, gated by strictly
+    // more conditions than this early refusal enforces for Security(code)).
+    if reuse.is_some() && ledger.strict && phase == Phase::SecurityCode {
         return Err(format!(
             "strict {} is candidate-backed and cannot reuse a prior receipt",
             phase.label()
@@ -3218,6 +3426,25 @@ fn cmd_gate(
         let validity = closure::evidence_validity(Some(origin_receipt), &current);
         closure::evaluate_reuse(phase, origin.record.verdict, origin_receipt, &validity)
             .map_err(|e| format!("cannot reuse {receipt_hex}: {e}"))?;
+        // design.md A2: strict Build/Test reuse additionally requires the
+        // candidate/profile/policy/build-output equality set — every miss
+        // falls through to a plain `Err` below, forcing fresh execution. This
+        // never applies to SecurityCode (categorically refused above) or to
+        // the judgment phases (which carry no candidate at all and keep the
+        // plain reused record they always have).
+        let strict_objective = if ledger.strict && matches!(phase, Phase::Build | Phase::Test) {
+            Some(evaluate_strict_objective_reuse(
+                &root,
+                &change,
+                phase,
+                effective_risk,
+                &ledger,
+                origin,
+                &receipt_hex,
+            )?)
+        } else {
+            None
+        };
         let receipt = closure::EvidenceReceipt::reused_from(origin_receipt);
         let completed = ledger::now_epoch_secs();
         ledger.record(
@@ -3226,7 +3453,7 @@ fn cmd_gate(
                 verdict: Verdict::Pass,
                 by: actor.clone(),
                 evidence: Some(format!("reused from {receipt_hex}")),
-                checks: None,
+                checks: strict_objective.as_ref().map(|s| s.checks.clone()),
                 at: date::today_utc(),
                 failure_class: None,
                 exploitability: None,
@@ -3235,13 +3462,31 @@ fn cmd_gate(
                 completed_at_epoch_secs: completed,
                 receipt: Some(receipt),
                 persona_tuning: persona_stamp.clone(),
-                candidate: None,
-                build_output: None,
+                candidate: strict_objective.as_ref().map(|s| s.candidate.clone()),
+                build_output: strict_objective
+                    .as_ref()
+                    .and_then(|s| s.build_output.clone()),
                 deploy_result: None,
-                validation_receipt: None,
+                validation_receipt: strict_objective
+                    .as_ref()
+                    .map(|s| s.validation_receipt.clone()),
             },
         )?;
-        ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+        // L1 (Security-code): the same exact compare-and-swap the execute
+        // path uses (cli.rs ~3973), against the SAME `observed` image taken
+        // after freshness maintenance re-loaded the ledger above (~3324) —
+        // never a plain `save` that could silently lose a concurrent update.
+        // `pending_candidate_build` is always `None` on this branch (it is
+        // only ever armed inside the execute path below), so this mirrors
+        // `resolve_candidate_save_outcome`'s call shape exactly with no
+        // candidate output to revalidate.
+        if let Some(warning) = resolve_candidate_save_outcome(
+            &root,
+            pending_candidate_build.as_mut(),
+            ledger::save_exact_observed(&root, &ledger, &observed),
+        )? {
+            eprintln!("{warning}");
+        }
         println!(
             "Recorded reused PASS for {} from {receipt_hex}.",
             phase.label()
@@ -8255,15 +8500,18 @@ mod tests {
         archived_closure_fallback_scope, bounded_record_hint, canonical_artifact_actor,
         canonical_artifact_verdict, check_documentation, check_sections, closure_recovery_hint,
         current_validation_status, dated_archive_matches, doctor_expected_pending_remote,
-        doctor_installed_deploy_health, extract_section, has_unfilled_placeholder,
-        is_valid_date_prefix, parse_exploit, receipt_failure_fact, removed_manifest_change_name,
-        require_closure_plan, resolve_runtime_head, resolve_runtime_ledger,
-        retained_candidate_for_objective_gate, runtime_doctor_findings_with_receipt,
-        sandbox_blocker, stages_removal_of, strict_actor_separation_issue, strict_gate_command,
-        union_closure_scope, upstream_artifact_pointers, validate_candidate_report_binding,
-        validate_evidence, validate_introduced_by, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
+        doctor_installed_deploy_health, evaluate_strict_objective_reuse, extract_section,
+        has_unfilled_placeholder, is_valid_date_prefix, parse_exploit, receipt_failure_fact,
+        removed_manifest_change_name, require_closure_plan, resolve_runtime_head,
+        resolve_runtime_ledger, retained_candidate_for_objective_gate,
+        revalidate_recorded_build_output, runtime_doctor_findings_with_receipt, sandbox_blocker,
+        stages_removal_of, strict_actor_separation_issue, strict_gate_command, union_closure_scope,
+        upstream_artifact_pointers, validate_candidate_report_binding, validate_evidence,
+        validate_introduced_by, validate_origin_receipt_candidate_binding, WorkflowOutcome,
+        REQUIRED_DOC_SECTIONS,
     };
-    use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, Verdict};
+    use crate::closure;
+    use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, RiskLevel, Verdict};
     use crate::phase::{Applicability, Phase};
     use clap::Parser as _;
     use proptest::prelude::*;
@@ -8984,6 +9232,921 @@ mod tests {
         let mut no_output_report = report.clone();
         no_output_report.receipt.as_mut().unwrap().build_output = None;
         validate_candidate_report_binding(&no_output_report, &capture).unwrap();
+    }
+
+    // =====================================================================
+    // design.md A2 / Security-plan C1, C2 — strict Build/Test receipt reuse.
+    //
+    // A genuine strict Build/Test PASS cannot be produced through the CLI in
+    // this test harness without the full trusted-policy bootstrap (see
+    // `validation_never_executes_unactivated_candidate_policy` and
+    // `strict_build_gate_refuses_and_then_accepts_missing_process_scope_
+    // entries` in tests/e2e.rs, both of which stop at "trusted-policy-
+    // missing"). Per the plan, the reuse-decision logic is instead
+    // reproduced here at the unit level: a REAL git repository and REAL
+    // `candidate::capture_candidate`/`reopen_candidate` calls establish
+    // genuine Candidate identity, and the (never-executed) check/profile
+    // machinery is represented by hand-constructed, but internally
+    // consistent, `ValidationReceiptV1`/`BuildOutputV1`/`EvidenceReceipt`
+    // fixtures — never a brittle bootstrap of the real sandbox/tool chain.
+    // =====================================================================
+
+    /// A minimal but *structurally* valid strict `LocalValidationConfig` —
+    /// every required lane (design.md Security-plan C1) is present, and every
+    // field satisfies `LocalValidationConfig::validate()`'s bounds. No
+    /// program named here is ever actually invoked by these tests (the
+    /// reuse-decision path never runs a check), so fixture "tools" need not
+    /// exist on disk.
+    fn strict_reuse_local_validation() -> crate::config::LocalValidationConfig {
+        use crate::config::*;
+        use std::collections::BTreeMap;
+
+        let mut tools = BTreeMap::new();
+        tools.insert(
+            "marker".to_string(),
+            ToolConfig {
+                program: "marker".to_string(),
+                version_args: Vec::new(),
+                requirement: ToolRequirement::Required,
+                install_hint: "fixture-only; never executed by these tests".to_string(),
+            },
+        );
+
+        let mut checks = BTreeMap::new();
+        for (name, kind) in [
+            ("format", CheckKind::Format),
+            ("lint", CheckKind::Lint),
+            ("test", CheckKind::Test),
+            ("release", CheckKind::ReleaseBuild),
+            ("self-check", CheckKind::SelfCheck),
+            ("dependency", CheckKind::DependencyAudit),
+            ("secret", CheckKind::SecretScan),
+            ("sast", CheckKind::Sast),
+            ("nonfunctional", CheckKind::Nonfunctional),
+        ] {
+            checks.insert(
+                name.to_string(),
+                CheckConfig {
+                    kind,
+                    program: "marker".to_string(),
+                    args: Vec::new(),
+                    timeout_secs: 30,
+                    result_policy: ResultPolicy::ExitZero,
+                    output: None,
+                },
+            );
+        }
+
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "build".to_string(),
+            ProfileConfig {
+                includes: Vec::new(),
+                checks: vec![
+                    "format".into(),
+                    "lint".into(),
+                    "test".into(),
+                    "release".into(),
+                ],
+            },
+        );
+        profiles.insert(
+            "security-code".to_string(),
+            ProfileConfig {
+                includes: Vec::new(),
+                checks: vec![
+                    "self-check".into(),
+                    "dependency".into(),
+                    "secret".into(),
+                    "sast".into(),
+                ],
+            },
+        );
+        profiles.insert(
+            "test".to_string(),
+            ProfileConfig {
+                includes: Vec::new(),
+                checks: vec![
+                    "format".into(),
+                    "lint".into(),
+                    "test".into(),
+                    "release".into(),
+                    "self-check".into(),
+                    "dependency".into(),
+                    "secret".into(),
+                    "sast".into(),
+                ],
+            },
+        );
+        profiles.insert(
+            "high-risk-test".to_string(),
+            ProfileConfig {
+                includes: vec!["test".into()],
+                checks: vec!["nonfunctional".into()],
+            },
+        );
+
+        LocalValidationConfig {
+            schema: 1,
+            required_toolchain: RequiredToolchainConfig {
+                rust_release: "1.91.0".into(),
+                host: Some("aarch64-apple-darwin".into()),
+                components: vec!["marker".into()],
+            },
+            tools,
+            checks,
+            profiles,
+            gates: GateProfiles {
+                build: "build".into(),
+                security_code: "security-code".into(),
+                test: "test".into(),
+                pre_push: "test".into(),
+                high_risk_test: "high-risk-test".into(),
+                docs_build: None,
+                docs_security_code: None,
+                docs_test: None,
+            },
+            hooks: HookPolicyConfig {
+                path: ".githooks".into(),
+                require_bundled: true,
+            },
+            receipts: ReceiptLimits {
+                log_count_cap: 16,
+                log_byte_cap: 4096,
+            },
+            offline: OfflinePolicyConfig {
+                cargo_lock: "Cargo.lock".into(),
+                cargo_target: "aarch64-apple-darwin".into(),
+                advisory_db_path: "mpd/advisory-db".into(),
+                advisory_revision: "b5fc89b8be99e96f79194d8a6f11e9b4143b99f0".into(),
+                advisory_tree: "c943a47fee3f2b9767f664fd26c2cb6f0447b23d".into(),
+                advisory_max_age_days: 30,
+            },
+            sandbox: SandboxPolicyConfig {
+                contract_version: 1,
+                network_adapter: NetworkAdapter::PlatformMandatory,
+                environment_allowlist: EnvironmentAllowlist(vec!["PATH".into()]),
+            },
+            limits: ResourceLimitsConfig {
+                checks_per_profile: 16,
+                aggregate_secs: 300,
+                output_bytes: 4096,
+                log_bytes: 4096,
+                worktree_bytes: 1_048_576,
+                child_processes: 32,
+                child_open_files: 64,
+                child_file_bytes: 1_048_576,
+            },
+            build_output: None,
+            deploy_output: None,
+        }
+    }
+
+    fn strict_reuse_run_git(root: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed in {}",
+            root.display()
+        );
+    }
+
+    fn strict_reuse_commit(root: &std::path::Path, message: &str) {
+        strict_reuse_run_git(root, &["add", "."]);
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Reuse Test",
+                    "-c",
+                    "user.email=reuse@invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    message,
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success(),
+            "git commit failed in {}",
+            root.display()
+        );
+    }
+
+    /// The strict `Config` a fixture repo commits to `.mpd/config.json` —
+    /// optionally opted into the A0 `closure.hermetic_reuse` policy.
+    fn strict_reuse_config(hermetic: bool) -> crate::config::Config {
+        crate::config::Config {
+            local_validation: Some(strict_reuse_local_validation()),
+            closure: hermetic.then(|| crate::config::ClosureConfig {
+                hermetic_reuse: Some(crate::closure::HermeticReusePolicy {
+                    schema: 1,
+                    external_state: crate::closure::NoExternalState::None,
+                    environment: Vec::new(),
+                    input_paths: vec!["security/tool-lock.json".to_string()],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A real git repository with a committed change manifest, a source
+    /// tree, `security/tool-lock.json` (the A0 hermetic input), and a
+    /// structurally valid strict `.mpd/config.json` — optionally opted into
+    /// the A0 `closure.hermetic_reuse` policy. Returns the repo root and the
+    /// exact `Config` value committed to disk.
+    fn strict_reuse_repo(
+        label: &str,
+        change: &str,
+        hermetic: bool,
+    ) -> (std::path::PathBuf, crate::config::Config) {
+        let root = doctor_test_dir(label);
+        strict_reuse_run_git(&root, &["init", "-q"]);
+        std::fs::write(root.join("src.rs"), b"fn main() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("security")).unwrap();
+        std::fs::write(root.join("security/tool-lock.json"), b"{\"tools\":[]}\n").unwrap();
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/manifest.json")),
+            "{\n  \"version\": 1,\n  \"paths\": [\"**\"],\n  \"shared_paths\": []\n}\n",
+        )
+        .unwrap();
+        let config = strict_reuse_config(hermetic);
+        std::fs::create_dir_all(root.join(".mpd")).unwrap();
+        std::fs::write(
+            root.join(".mpd/config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        strict_reuse_commit(&root, "strict reuse fixture");
+        (root, config)
+    }
+
+    /// Edit and recommit the tracked source file — the minimal Source-key
+    /// content change the headline reuse-refusal test needs.
+    fn strict_reuse_edit_source(root: &std::path::Path) {
+        std::fs::write(root.join("src.rs"), b"fn main() { println!(\"x\"); }\n").unwrap();
+        strict_reuse_commit(root, "edit source");
+    }
+
+    /// Capture (or idempotently reopen) a real Candidate over `root`'s
+    /// current HEAD, returning the capture and the live policy digest.
+    fn strict_reuse_candidate(
+        root: &std::path::Path,
+        change: &str,
+    ) -> (crate::candidate::CandidateCapture, String) {
+        let (_, policy_digest) = crate::local_validation::load_candidate_policy(root).unwrap();
+        let captured = crate::candidate::capture_candidate(root, change, &policy_digest).unwrap();
+        captured.rehash(root).unwrap();
+        (captured.projection.capture.clone(), policy_digest)
+    }
+
+    /// Write a real Build output artifact and capture its typed descriptor,
+    /// bound to `candidate_id`.
+    fn strict_reuse_build_output(
+        root: &std::path::Path,
+        candidate_id: &str,
+    ) -> crate::ledger::BuildOutputV1 {
+        let relative = ".mpd/build-output/mpd";
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"reviewed release bytes\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut output = crate::local_validation::capture_build_output(root, relative).unwrap();
+        output.name = "mpd-release".into();
+        output.max_bytes = 1_048_576;
+        output.required_mode = 0o755;
+        output.candidate_id = Some(candidate_id.to_string());
+        output
+    }
+
+    /// A fully-populated `ValidationReceiptV1` fixture bound to `capture`,
+    /// mirroring `validate_candidate_report_binding_pins_build_output_
+    /// candidate_id_too`'s shape.
+    fn strict_reuse_validation_receipt(
+        capture: &crate::candidate::CandidateCapture,
+        profile: &str,
+        build_output: Option<crate::ledger::BuildOutputV1>,
+    ) -> crate::local_validation::ValidationReceiptV1 {
+        let subject = crate::local_validation::Subject {
+            requested: format!("candidate:{}", capture.subject.id),
+            pushed_oid: capture.subject.base_commit.clone(),
+            pushed_kind: "candidate".into(),
+            tag_chain: Vec::new(),
+            commit: capture.subject.base_commit.clone(),
+            tree: capture.subject.base_tree.clone(),
+        };
+        crate::local_validation::ValidationReceiptV1 {
+            schema: 1,
+            id: "1".repeat(64),
+            subject,
+            profile: profile.to_string(),
+            config_digest: "2".repeat(64),
+            checks_digest: "3".repeat(64),
+            trusted_policy_oid: "4".repeat(40),
+            trusted_before_policy_digest: "5".repeat(64),
+            candidate_policy_digest: capture.subject.policy_digest.clone(),
+            effective_policy_digest: "7".repeat(64),
+            sandbox: crate::local_validation::SandboxReceiptBindingV1 {
+                contract_version: 1,
+                adapter_digest: "8".repeat(64),
+                profile_digest: "9".repeat(64),
+                environment_keys: Vec::new(),
+                certified_host: "fixture-host".into(),
+                adapter_abi_digest: "a".repeat(64),
+                canary_contract_digest: "b".repeat(64),
+                residual_limitations: Vec::new(),
+                run_request_digests: Vec::new(),
+                run_authority_digests: Vec::new(),
+                run_root_inventory_digests: Vec::new(),
+                run_canary_digests: Vec::new(),
+            },
+            validation_contract_version: 1,
+            validator_version: "fixture".into(),
+            validator_digest: "c".repeat(64),
+            platform: crate::local_validation::PlatformReceiptBindingV1 {
+                operating_system: "linux".into(),
+                architecture: "x86_64".into(),
+                cargo_target: "x86_64-unknown-linux-gnu".into(),
+            },
+            toolchain: crate::local_validation::ToolchainReceiptBindingV1 {
+                rust_release: "1.91.0".into(),
+                host: None,
+                components: Vec::new(),
+            },
+            cargo_lock_digest: "d".repeat(64),
+            advisory: crate::local_validation::AdvisoryReceiptBindingV1 {
+                revision: "e".repeat(40),
+                tree: "f".repeat(40),
+                lock_digest: "1".repeat(64),
+                max_age_days: 30,
+            },
+            tool_policy_digest: "2".repeat(64),
+            tool_digests: std::collections::BTreeMap::new(),
+            results: Vec::new(),
+            started_epoch_secs: 1,
+            completed_epoch_secs: 2,
+            outcome: "passed".into(),
+            build_output,
+        }
+    }
+
+    /// The dependency snapshot / flattened `EvidenceReceipt` a genuinely
+    /// executed gate would have recorded for `phase`, captured for real from
+    /// the current repo/ledger/config state.
+    fn strict_reuse_evidence_receipt(
+        root: &std::path::Path,
+        change: &str,
+        phase: Phase,
+        ledger: &ledger::Ledger,
+        config: &crate::config::Config,
+    ) -> closure::EvidenceReceipt {
+        let values = closure::capture_dependency_values(root, change, ledger, config, phase)
+            .expect("dependency values capture for a fixture ledger");
+        let snapshot =
+            closure::DependencySnapshot::for_phase(phase, &values).expect("hermetic keys optional");
+        closure::EvidenceReceipt::executed(phase, snapshot)
+    }
+
+    /// Reproduces `cmd_gate`'s `--reuse` decision sequence exactly: the
+    /// shared `evidence_validity`/`evaluate_reuse` gate (byte-unchanged,
+    /// design.md Condition 8), then — for strict Build/Test — the new A2
+    /// `evaluate_strict_objective_reuse` equality set. Returns the
+    /// `GateRecord` `cmd_gate` would append.
+    #[allow(clippy::too_many_arguments)]
+    fn attempt_strict_reuse(
+        root: &std::path::Path,
+        change: &str,
+        phase: Phase,
+        effective_risk: RiskLevel,
+        ledger: &ledger::Ledger,
+        config: &crate::config::Config,
+        receipt_hex: &str,
+    ) -> Result<GateRecord, String> {
+        let requested = crate::digest::Digest::from_hex(receipt_hex)?;
+        let origin = ledger
+            .history
+            .iter()
+            .find(|event| {
+                event.phase == phase
+                    && event
+                        .record
+                        .receipt
+                        .as_ref()
+                        .is_some_and(|r| r.id == requested)
+            })
+            .ok_or_else(|| format!("no receipt {receipt_hex} exists for {}", phase.label()))?;
+        let origin_receipt = origin.record.receipt.as_ref().expect("matched receipt");
+        let current = closure::capture_dependency_values(root, change, ledger, config, phase)?;
+        let validity = closure::evidence_validity(Some(origin_receipt), &current);
+        closure::evaluate_reuse(phase, origin.record.verdict, origin_receipt, &validity)
+            .map_err(|e| format!("cannot reuse {receipt_hex}: {e}"))?;
+        let strict = evaluate_strict_objective_reuse(
+            root,
+            change,
+            phase,
+            effective_risk,
+            ledger,
+            origin,
+            receipt_hex,
+        )?;
+        Ok(GateRecord {
+            verdict: Verdict::Pass,
+            by: "tester".into(),
+            evidence: Some(format!("reused from {receipt_hex}")),
+            checks: Some(strict.checks),
+            at: "2026-01-01".into(),
+            failure_class: None,
+            exploitability: None,
+            attempt: 1,
+            started_at_epoch_secs: 1,
+            completed_at_epoch_secs: 2,
+            receipt: Some(closure::EvidenceReceipt::reused_from(origin_receipt)),
+            persona_tuning: None,
+            candidate: Some(strict.candidate),
+            build_output: strict.build_output,
+            deploy_result: None,
+            validation_receipt: Some(strict.validation_receipt),
+        })
+    }
+
+    /// A ledger with Architecture/SecurityPlan already PASSed (fixture
+    /// records — content is irrelevant to the reuse decision), ready for the
+    /// caller to record Build/SecurityCode/Test.
+    fn strict_reuse_ledger(change: &str) -> ledger::Ledger {
+        let mut ledger = ledger::Ledger::new(change, "mpd", false, ledger::ChangeKind::Fix);
+        ledger.strict = true;
+        ledger
+            .record(Phase::Architecture, doctor_gate_record())
+            .unwrap();
+        ledger
+            .record(Phase::SecurityPlan, doctor_gate_record())
+            .unwrap();
+        ledger
+    }
+
+    /// Fixture state for a strict change with Build/SecurityCode/Test already
+    /// PASSed on a single retained Candidate — `gates` (current) and
+    /// `history` (append-only) both carry the full receipt/candidate/build-
+    /// output bindings a genuine structured PASS would.
+    struct StrictReuseFixture {
+        root: std::path::PathBuf,
+        change: String,
+        ledger: ledger::Ledger,
+        config: crate::config::Config,
+        candidate: crate::candidate::CandidateCapture,
+        build_receipt_hex: String,
+        test_receipt_hex: String,
+    }
+
+    impl Drop for StrictReuseFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Build a complete, self-consistent strict fixture: a real repo/
+    /// Candidate, a Build PASS (candidate + validation receipt + build
+    /// output) and a Test PASS (same candidate + validation receipt), both
+    /// bound to the current (hermetic-complete, when `hermetic`) dependency
+    /// snapshot.
+    fn strict_reuse_fixture(label: &str, hermetic: bool) -> StrictReuseFixture {
+        let change = format!("reuse-{label}");
+        let (root, config) = strict_reuse_repo(label, &change, hermetic);
+        let mut ledger = strict_reuse_ledger(&change);
+        let (candidate, _policy_digest) = strict_reuse_candidate(&root, &change);
+
+        let build_evidence =
+            strict_reuse_evidence_receipt(&root, &change, Phase::Build, &ledger, &config);
+        let build_output = strict_reuse_build_output(&root, &candidate.subject.id);
+        let build_validation =
+            strict_reuse_validation_receipt(&candidate, "build", Some(build_output.clone()));
+        let mut build_record = doctor_gate_record();
+        build_record.candidate = Some(candidate.clone());
+        build_record.build_output = Some(build_output);
+        build_record.validation_receipt = Some(build_validation);
+        build_record.receipt = Some(build_evidence);
+        let build_receipt_hex = build_record.receipt.as_ref().unwrap().id.to_hex();
+        ledger.record(Phase::Build, build_record).unwrap();
+
+        let mut security_record = doctor_gate_record();
+        security_record.candidate = Some(candidate.clone());
+        ledger.record(Phase::SecurityCode, security_record).unwrap();
+
+        let test_evidence =
+            strict_reuse_evidence_receipt(&root, &change, Phase::Test, &ledger, &config);
+        let test_validation = strict_reuse_validation_receipt(&candidate, "test", None);
+        let mut test_record = doctor_gate_record();
+        test_record.candidate = Some(candidate.clone());
+        test_record.validation_receipt = Some(test_validation);
+        test_record.receipt = Some(test_evidence);
+        let test_receipt_hex = test_record.receipt.as_ref().unwrap().id.to_hex();
+        ledger.record(Phase::Test, test_record).unwrap();
+
+        StrictReuseFixture {
+            root,
+            change,
+            ledger,
+            config,
+            candidate,
+            build_receipt_hex,
+            test_receipt_hex,
+        }
+    }
+
+    #[test]
+    fn strict_build_and_test_reuse_succeed_on_a_byte_identical_candidate() {
+        // Condition 2 (corrected firing set): simulates a rewind that leaves
+        // the Candidate BYTE-IDENTICAL — an off-Candidate cause (persona/
+        // governance/risk re-derivation, repair-state, or a reverted edit),
+        // NOT a prose edit (the change's prose is in the Candidate via process
+        // scope, so editing it changes the id and correctly refuses reuse).
+        // `invalidate_for_freshness` (untouched) clears every gate record at
+        // phase >= Architecture while `history` — and every still-valid Build/
+        // Test receipt — survives; fresh judgment gates re-run, and Build/Test
+        // reuse the individually still-valid, byte-identical-candidate evidence.
+        let fixture = strict_reuse_fixture("happy-path", true);
+        let mut ledger = fixture.ledger.clone();
+        for phase in [
+            Phase::Architecture,
+            Phase::SecurityPlan,
+            Phase::Build,
+            Phase::SecurityCode,
+            Phase::Test,
+        ] {
+            ledger.gates.remove(&phase);
+        }
+        ledger.phase = Phase::Architecture;
+        ledger
+            .record(Phase::Architecture, doctor_gate_record())
+            .unwrap();
+        ledger
+            .record(Phase::SecurityPlan, doctor_gate_record())
+            .unwrap();
+
+        let build_record = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Build,
+            RiskLevel::Medium,
+            &ledger,
+            &fixture.config,
+            &fixture.build_receipt_hex,
+        )
+        .expect("byte-identical Build reuse must succeed");
+        assert_eq!(
+            build_record.candidate.as_ref().unwrap().subject.id,
+            fixture.candidate.subject.id
+        );
+        assert!(build_record.build_output.is_some());
+        assert!(build_record.validation_receipt.is_some());
+        assert!(build_record
+            .checks
+            .as_ref()
+            .unwrap()
+            .command
+            .as_deref()
+            .unwrap()
+            .contains("reused from receipt"));
+        // The candidate carried forward is the FRESH recapture (item 6), not
+        // a copy of the stale origin binding — later phases (SecurityCode,
+        // Test) must key off exactly this value, matching what a real
+        // separate `mpd gate build --reuse` process would have persisted.
+        let fresh_build_candidate = build_record.candidate.clone().unwrap();
+        ledger.record(Phase::Build, build_record).unwrap();
+
+        // A1: Security(code) is never reused — model the mandatory fresh
+        // pass it always runs, bound to the SAME candidate Build's reuse
+        // just re-verified.
+        let mut security_record = doctor_gate_record();
+        security_record.candidate = Some(fresh_build_candidate);
+        ledger.record(Phase::SecurityCode, security_record).unwrap();
+
+        let test_record = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Test,
+            RiskLevel::Medium,
+            &ledger,
+            &fixture.config,
+            &fixture.test_receipt_hex,
+        )
+        .expect("byte-identical Test reuse must succeed");
+        assert_eq!(
+            test_record.candidate.as_ref().unwrap().subject.id,
+            fixture.candidate.subject.id
+        );
+        assert!(test_record.build_output.is_none());
+        assert!(test_record.validation_receipt.is_some());
+    }
+
+    #[test]
+    fn strict_build_reuse_refuses_on_source_drift_after_rewind() {
+        // Condition 1 (headline): editing an in-scope source file changes
+        // the Source dependency key, so the pre-existing, byte-unchanged
+        // `evidence_validity`/`evaluate_reuse` gate refuses BEFORE the new
+        // A2 candidate/profile/policy checks ever run — the exact same
+        // refusal a stale receipt hits today.
+        let fixture = strict_reuse_fixture("source-drift", true);
+        strict_reuse_edit_source(&fixture.root);
+        let error = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Build,
+            RiskLevel::Medium,
+            &fixture.ledger,
+            &fixture.config,
+            &fixture.build_receipt_hex,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot reuse"), "{error}");
+    }
+
+    #[test]
+    fn strict_test_reuse_refuses_on_profile_mismatch() {
+        // Condition 4: the origin Test receipt names the plain "test"
+        // profile, but a risk escalation to High means the CURRENT
+        // `select_gate_profile` resolves "high-risk-test" — a risk
+        // escalation must never reuse a lighter profile's receipt.
+        let fixture = strict_reuse_fixture("profile-mismatch", true);
+        let error = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Test,
+            RiskLevel::High,
+            &fixture.ledger,
+            &fixture.config,
+            &fixture.test_receipt_hex,
+        )
+        .unwrap_err();
+        assert!(error.contains("profile"), "{error}");
+        assert!(error.contains("high-risk-test"), "{error}");
+    }
+
+    #[test]
+    fn strict_reuse_refuses_without_a_complete_hermetic_policy() {
+        // Condition 5a: a pre-opt-in receipt (no `closure.hermetic_reuse`
+        // configured) never binds the Hermetic* keys, so
+        // `evaluate_reuse`/`hermetic_complete` refuses with `AlwaysExecutes`
+        // — unchanged, byte-identical logic.
+        let fixture = strict_reuse_fixture("no-hermetic-opt-in", false);
+        let error = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Build,
+            RiskLevel::Medium,
+            &fixture.ledger,
+            &fixture.config,
+            &fixture.build_receipt_hex,
+        )
+        .unwrap_err();
+        assert!(error.contains("always-execute"), "{error}");
+    }
+
+    #[test]
+    fn strict_reuse_refuses_on_a_differing_hermetic_executable_digest() {
+        // Condition 5b: a hand-corrupted HermeticExecutable digest in the
+        // origin's dependency snapshot makes `evidence_validity` observe a
+        // stale dependency (a coordinator-binary swap) — refused as
+        // `NotValid`, never silently ignored.
+        let fixture = strict_reuse_fixture("hermetic-drift", true);
+        let mut ledger = fixture.ledger.clone();
+        let build = ledger.gates.get_mut(&Phase::Build).unwrap();
+        let receipt = build.receipt.as_mut().unwrap();
+        receipt.dependencies.values.insert(
+            closure::DependencyKey::HermeticExecutable,
+            crate::digest::Digest::of_bytes(b"tampered-coordinator-binary"),
+        );
+        // Re-flatten the id so the corrupted snapshot is what `--reuse`
+        // actually looks up by hex (mirrors a real corrupted receipt).
+        let corrupted =
+            closure::EvidenceReceipt::executed(Phase::Build, receipt.dependencies.clone());
+        let corrupted_hex = corrupted.id.to_hex();
+        *receipt = corrupted;
+        ledger
+            .history
+            .iter_mut()
+            .rev()
+            .find(|event| event.phase == Phase::Build)
+            .unwrap()
+            .record
+            .receipt = ledger.gates[&Phase::Build].receipt.clone();
+
+        let error = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Build,
+            RiskLevel::Medium,
+            &ledger,
+            &fixture.config,
+            &corrupted_hex,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot reuse"), "{error}");
+    }
+
+    #[test]
+    fn strict_test_reuse_refuses_without_a_current_build_and_security_code_pass() {
+        // Condition 6: Test reuse requires the CURRENT ledger to already
+        // bind a Build PASS + Security(code) PASS to the same retained
+        // Candidate (`retained_candidate_for_objective_gate`, unchanged) —
+        // not merely that the origin receipt once had one.
+        let fixture = strict_reuse_fixture("test-ordering", true);
+        let mut ledger = fixture.ledger.clone();
+        ledger.gates.remove(&Phase::Build);
+        let error = evaluate_strict_objective_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Test,
+            RiskLevel::Medium,
+            &ledger,
+            ledger
+                .history
+                .iter()
+                .find(|event| {
+                    event.phase == Phase::Test
+                        && event
+                            .record
+                            .receipt
+                            .as_ref()
+                            .map(|r| r.id.to_hex())
+                            .as_deref()
+                            == Some(fixture.test_receipt_hex.as_str())
+                })
+                .unwrap(),
+            &fixture.test_receipt_hex,
+        )
+        .unwrap_err();
+        assert!(error.contains("current Build PASS"), "{error}");
+    }
+
+    #[test]
+    fn strict_build_reuse_refuses_on_missing_or_drifted_build_output() {
+        // Condition 7: the recorded Build output artifact no longer matches
+        // what's on disk (here: deleted) — Deploy depends on this artifact,
+        // so a drifted/missing one must refuse reuse rather than silently
+        // carry forward a stale binding.
+        let fixture = strict_reuse_fixture("build-output-drift", true);
+        std::fs::remove_file(fixture.root.join(".mpd/build-output/mpd")).unwrap();
+        let error = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Build,
+            RiskLevel::Medium,
+            &fixture.ledger,
+            &fixture.config,
+            &fixture.build_receipt_hex,
+        )
+        .unwrap_err();
+        assert!(error.contains("Build output"), "{error}");
+    }
+
+    #[test]
+    fn strict_reuse_refuses_when_origin_receipt_names_a_different_candidate() {
+        // Security-plan C2 (negative test): an origin whose typed
+        // `validation_receipt` subject names a DIFFERENT candidate than the
+        // one it is nominally attached to must refuse for BOTH Build and
+        // Test — the receipt and its Candidate are never trusted to merely
+        // cooperate.
+        for phase in [Phase::Build, Phase::Test] {
+            let fixture = strict_reuse_fixture(
+                if phase == Phase::Build {
+                    "c2-build"
+                } else {
+                    "c2-test"
+                },
+                true,
+            );
+            let mut ledger = fixture.ledger.clone();
+            let foreign = candidate_capture('9');
+            let record = ledger.gates.get_mut(&phase).unwrap();
+            record
+                .validation_receipt
+                .as_mut()
+                .unwrap()
+                .subject
+                .requested = format!("candidate:{}", foreign.subject.id);
+            let receipt_hex = record.receipt.as_ref().unwrap().id.to_hex();
+            for event in ledger.history.iter_mut() {
+                if event.phase == phase {
+                    event.record.validation_receipt =
+                        ledger.gates[&phase].validation_receipt.clone();
+                }
+            }
+            let error = attempt_strict_reuse(
+                &fixture.root,
+                &fixture.change,
+                phase,
+                RiskLevel::Medium,
+                &ledger,
+                &fixture.config,
+                &receipt_hex,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("differs from its own retained Candidate"),
+                "phase={phase:?} error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_origin_receipt_candidate_binding_pins_build_output_candidate_id_too() {
+        // Security-plan C2, focused unit: mirrors
+        // `validate_candidate_report_binding_pins_build_output_candidate_id_
+        // too`'s coverage for the ORIGIN-receipt variant used by strict
+        // Build/Test reuse.
+        let capture = candidate_capture('c');
+        let receipt = strict_reuse_validation_receipt(
+            &capture,
+            "build",
+            Some(candidate_output(&capture.subject.id)),
+        );
+        validate_origin_receipt_candidate_binding(&receipt, &capture).unwrap();
+
+        let mut wrong_subject = receipt.clone();
+        wrong_subject.subject.requested = format!("candidate:{}", "9".repeat(64));
+        let error =
+            validate_origin_receipt_candidate_binding(&wrong_subject, &capture).unwrap_err();
+        assert!(
+            error.contains("differs from its own retained Candidate"),
+            "{error}"
+        );
+
+        let mut wrong_output = receipt;
+        wrong_output.build_output = Some(candidate_output(&"9".repeat(64)));
+        let error = validate_origin_receipt_candidate_binding(&wrong_output, &capture).unwrap_err();
+        assert!(
+            error.contains("Build output candidate ID differs from its own retained Candidate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn revalidate_recorded_build_output_detects_missing_and_drifted_artifacts() {
+        let root = doctor_test_dir("build-output-revalidate");
+        let relative = "artifact.bin";
+        std::fs::write(root.join(relative), b"original bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join(relative), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let mut output = crate::local_validation::capture_build_output(&root, relative).unwrap();
+        output.name = "artifact".into();
+        output.max_bytes = 1024;
+        output.required_mode = 0o755;
+        revalidate_recorded_build_output(&root, &output).unwrap();
+
+        std::fs::write(root.join(relative), b"replaced bytes!!").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join(relative), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let error = revalidate_recorded_build_output(&root, &output).unwrap_err();
+        assert!(
+            error.contains("changed since the origin receipt"),
+            "{error}"
+        );
+
+        std::fs::remove_file(root.join(relative)).unwrap();
+        assert!(revalidate_recorded_build_output(&root, &output).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn security_code_profile_missing_a_scan_kind_fails_local_validation() {
+        // Security-plan C1: the security-code gate's profile must always
+        // resolve to the full deterministic scan set — the existing,
+        // unedited `LocalValidationConfig::validate_required_lane_coverage`
+        // already enforces this (called from `load_candidate_policy` before
+        // every strict Build/SecurityCode/Test candidate execution), so this
+        // pins the floor rather than re-implementing it. Removing
+        // "dependency" (a `dependency-audit` check) from the security-code
+        // profile must make the whole typed config fail closed.
+        let mut config = strict_reuse_local_validation();
+        config
+            .profiles
+            .get_mut("security-code")
+            .unwrap()
+            .checks
+            .retain(|c| c != "dependency");
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("omits required lane"), "{error}");
+        assert!(error.contains("DependencyAudit"), "{error}");
     }
 
     #[test]

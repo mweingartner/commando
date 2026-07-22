@@ -31,8 +31,47 @@ that output as authoritative over any prose table, including this one. Note
 that `mpd conduct` takes no `--harness` flag — harness is a rendering choice
 made per `mpd next` call, not a property of the change.
 
-Repeat `next -> work -> gate` until Done, then archive, commit, push normally through
-the activated local hooks, and run `mpd publish --verify`. Keep these facts separate in
+**Effort/tier follows effective risk.** At effective High risk, Security and Tester
+also resolve to the deep model with a raised effort floor, and Test selects the
+heavier `high-risk-test` profile. High is a *depth* escalation, not an
+attempt-limit tightening — High in fact loosens the attempt limit (High 3 >
+Medium 2 > Low 1). A documentation-only change derives Low; every other change in
+this repo derives High (its source and `.mpd/`/config files are verification
+policy). Match the *requested* risk to blast radius (`mpd conduct --risk`); the
+classifier can only raise it, never lower it.
+
+## Lean operating protocol
+
+Keep the adversarial review; cut the mechanical re-work:
+
+- **Freeze prose artifacts before gating** — this is the real mitigation for the
+  rewind tax. Editing `design.md`/`proposal.md`/`tasks.md` *after* its gate rewinds to
+  Architecture AND changes the Candidate (the change's prose is folded into the
+  Candidate via mandatory process scope so the secret scanner covers it), so Build and
+  Test must re-execute. Author the plan fully, then gate once. Receipt **reuse** (`mpd
+  gate <phase> --pass --reuse <receipt>`, offered by `mpd next`) does NOT rescue a
+  prose-edit rewind — it fires only when a rewind leaves the Candidate byte-identical
+  (an off-Candidate cause: a persona/governance/risk re-derivation touching no in-scope
+  file, a `repair-state` rewind, or a reverted edit). SecurityCode always re-executes.
+  See README "Exact candidate and freshness".
+- **Tier-match the review to blast radius.** Spawn deep-tier persona subagents for
+  real threat surface or novel logic; for a genuinely low-surface change (a config
+  narrow, a back-compatible rename, a docs edit) author the Security/Doc artifacts
+  inline rather than spending a deep-tier pass.
+- **Batch small same-scope changes** into one traversal instead of one change per fix.
+- **Record non-blocking / comment-only findings as notes in the artifact**, not as
+  a FAIL or an artifact edit that triggers a re-drive.
+- **Declare the manifest completely up front** — source/spec paths plus
+  `openspec/changes/<change>/**` and `docs/<change>.md`; NOT the ledger
+  `.mpd/state/<change>.json` (folded via SystemScope; declaring it trips the
+  `.mpd/` sensitive-path risk signal). The strict Build gate now names any missing
+  entry.
+
+## Landing
+
+Repeat `next -> work -> gate` until Done, then archive, commit, release the closure
+with `mpd archive --close --yes` (formerly `--abandon`, still accepted as an alias),
+push normally through the activated local hooks, and run `mpd publish --verify`. Keep these facts separate in
 every report: local worktree, exact Candidate, gates/freshness, local validation,
 archive, commit coherence, push authorization, observed transfer, remote parity, and
 installation.

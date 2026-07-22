@@ -238,5 +238,13 @@
       "Tester": "terra",
       "Documenter": "luna"
     }
+  },
+  "closure": {
+    "hermetic_reuse": {
+      "schema": 1,
+      "external_state": "none",
+      "environment": [],
+      "input_paths": ["security/tool-lock.json"]
+    }
   }
 }

@@ -543,20 +543,65 @@ fn validation_never_executes_unactivated_candidate_policy() {
     assert_gate_ok(&sb, "security-plan");
     let before_reuse = snapshot();
     let ledger_before_reuse = std::fs::read(sb.dir.join(".mpd/state/sandbox-build.json")).unwrap();
-    for (phase, label) in [
-        ("build", "Build"),
-        ("security-code", "Security (code)"),
-        ("test", "Test"),
-    ] {
-        let refused_reuse = sb.mpd(&["gate", phase, "--pass", "--reuse", &"a".repeat(64)]);
-        assert!(!refused_reuse.status.success());
-        assert!(
-            String::from_utf8_lossy(&refused_reuse.stderr).contains(&format!(
-                "strict {label} is candidate-backed and cannot reuse"
-            )),
-            "phase={phase} stderr={}",
-            String::from_utf8_lossy(&refused_reuse.stderr)
-        );
+    // design.md A1: the strict `--reuse` categorical refusal narrows from
+    // {Build, SecurityCode, Test} to {SecurityCode} only — SecurityCode
+    // evidence is never carried forward, so it stays refused here, before
+    // any receipt lookup. Build/Test are no longer refused at this early
+    // gate; with no Build/Test history yet recorded for this change, they
+    // instead reach (and are refused by) the ordinary "no receipt exists"
+    // lookup further down `cmd_gate`'s `--reuse` path — never a silent PASS,
+    // and never a Git/ledger mutation either way.
+    let refused_reuse = sb.mpd(&[
+        "gate",
+        "security-code",
+        "--pass",
+        "--reuse",
+        &"a".repeat(64),
+    ]);
+    assert!(!refused_reuse.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused_reuse.stderr)
+            .contains("strict Security (code) is candidate-backed and cannot reuse"),
+        "stderr={}",
+        String::from_utf8_lossy(&refused_reuse.stderr)
+    );
+    assert_eq!(
+        snapshot(),
+        before_reuse,
+        "security-code reuse refusal must not mutate Git"
+    );
+    assert_eq!(
+        std::fs::read(sb.dir.join(".mpd/state/sandbox-build.json")).unwrap(),
+        ledger_before_reuse,
+        "security-code reuse refusal must not advance or rewrite the strict ledger"
+    );
+    // Build has no judgment artifact of its own (`Phase::judgment_artifact`),
+    // so with no Build history yet recorded for this change it reaches (and
+    // is refused by) the ordinary "no receipt exists" lookup.
+    let refused_build_reuse = sb.mpd(&["gate", "build", "--pass", "--reuse", &"a".repeat(64)]);
+    assert!(!refused_build_reuse.status.success());
+    let build_stderr = String::from_utf8_lossy(&refused_build_reuse.stderr);
+    assert!(
+        !build_stderr.contains("candidate-backed and cannot reuse"),
+        "Build must no longer hit the categorical strict refusal: {build_stderr}"
+    );
+    assert!(
+        build_stderr.contains(&format!("no receipt {} exists for Build", "a".repeat(64))),
+        "{build_stderr}"
+    );
+    // Test DOES carry its own judgment artifact (`test.md`) — Cond 13, pre-
+    // existing and unrelated to this change: the reuse path still enforces
+    // the phase's own artifact structurally before any receipt lookup, so an
+    // unauthored test.md refuses here rather than at "no receipt exists".
+    let refused_test_reuse = sb.mpd(&["gate", "test", "--pass", "--reuse", &"a".repeat(64)]);
+    assert!(!refused_test_reuse.status.success());
+    let test_stderr = String::from_utf8_lossy(&refused_test_reuse.stderr);
+    assert!(
+        !test_stderr.contains("candidate-backed and cannot reuse"),
+        "Test must no longer hit the categorical strict refusal: {test_stderr}"
+    );
+    assert!(test_stderr.contains("test.md incomplete"), "{test_stderr}");
+    for phase in ["build", "test"] {
         assert_eq!(
             snapshot(),
             before_reuse,
@@ -2172,6 +2217,156 @@ fn strict_build_gate_refuses_and_then_accepts_missing_process_scope_entries() {
     assert!(
         retried_err.contains("trusted-policy-missing"),
         "the only remaining blocker must be the unrelated trusted-policy boundary: {retried_err}"
+    );
+}
+
+/// Security-code condition CA / design.md Condition 2: drive strict Build's
+/// real `cmd_gate` `--reuse` dispatch (not the `attempt_strict_reuse` replica
+/// at cli.rs ~9607-9667) as deep as this black-box e2e binary can genuinely
+/// reach, with the design.md A0 `closure.hermetic_reuse` opt-in active, and
+/// separately pin the one half of the corrected "true firing set" contract
+/// that IS fully real-binary-testable without trust activation: a prose edit
+/// is never free.
+///
+/// **Documented residual gap** (not silently skipped — see security-code.md
+/// condition CA): a genuine strict Build/Test PASS, and therefore either a
+/// genuine byte-identical-candidate `--reuse` SUCCESS or an observed
+/// "candidate identity has changed" refusal from `evaluate_strict_objective_
+/// reuse` (cli.rs ~3097-3215) specifically, requires `execute_strict_
+/// candidate_build` to reach `validate_candidate_profile`, which calls
+/// `trusted_candidate_policy_bindings` (local_validation.rs) UNCONDITIONALLY
+/// — before any candidate-defined check runs, regardless of how the selected
+/// profile's check list is populated. Establishing that clone-local trust
+/// floor in production requires `mpd policy activate`, which itself requires:
+/// (a) `verify_certified_host()` pinned to an EXACT macOS product/build/arch
+/// (`sandbox_macos::CERTIFIED_PRODUCT_VERSION`/`CERTIFIED_BUILD_VERSION`/
+/// `CERTIFIED_ARCH`); (b) all eight `POLICY_ASSET_SPECS` tracked security
+/// assets (both git hooks, the advisory-db lock, the local-ci policy, the
+/// bwrap and macOS sandbox profiles, the semgrep config, and the tool-lock)
+/// present at one exact reviewed commit with exact modes; and (c) an exact
+/// `--confirm-policy-digest` equal to `sha256(serde_json::to_vec(&
+/// LocalValidationConfig))` — the RE-SERIALIZED typed struct in its Rust
+/// declaration field order, not the raw committed JSON bytes. The `mpd`
+/// crate ships no `lib` target (only `[[bin]] name = "mpd"`), so this
+/// black-box integration-test binary has no way to compute that digest
+/// independently or to call `capture_candidate`/`load_candidate_policy`
+/// directly. Only same-process `#[cfg(test)]` code compiled INSIDE the
+/// binary — cli.rs's own unit tests (e.g. `strict_reuse_candidate` at
+/// cli.rs ~9486-9494) — can call those functions directly to obtain a real
+/// candidate id/policy digest, which is exactly how the existing internal
+/// replica (`strict_build_and_test_reuse_succeed_on_a_byte_identical_
+/// candidate` and its siblings, cli.rs ~9704-9945) builds a genuinely
+/// self-consistent fixture and asserts the Reused record's shape end-to-end
+/// — the fallback evidence security-code.md's condition CA explicitly
+/// accepts ("assert the Reused record shape end-to-end"). No e2e fixture in
+/// this suite, before or after this change, completes trust activation: the
+/// two closest existing tests
+/// (`validation_never_executes_unactivated_candidate_policy`,
+/// `strict_build_gate_refuses_and_then_accepts_missing_process_scope_
+/// entries`) both stop at the identical "trusted-policy-missing" wall by
+/// construction. Fully closing this gap would need an Architecture-level
+/// decision (a portable, non-host-pinned trust-activation lane, or exposing
+/// a `lib` target) outside this Builder pass's scope.
+///
+/// What this test DOES drive for real, through the actual `mpd` binary:
+/// 1. The A0 opt-in does not relax or reroute the trust boundary: a strict
+///    Build gate, with `closure.hermetic_reuse` configured exactly as this
+///    project's own `.mpd/config.json` declares it, still reaches exactly
+///    "trusted-policy-missing" — never a silent PASS.
+/// 2. A1's narrowing holds with A0 active too: `--reuse` on Build with no
+///    Build history yet reaches the ordinary origin-receipt lookup (not the
+///    categorical refusal SecurityCode alone keeps), mirroring e2e.rs
+///    ~581-591's coverage of the same property on an unconfigured project.
+/// 3. The fully real-binary-testable half of the corrected "true firing set"
+///    contract (design.md "What still holds"): an in-scope PROSE edit —
+///    appending one byte to design.md, the change's own mandatory
+///    process-scope file, with manifest.json untouched — stales
+///    Architecture/SecurityPlan and forces a real rewind. A prose edit can
+///    therefore never reach a Build/Test reuse attempt against a chain that
+///    still looks byte-identical; it must re-earn judgment from Architecture
+///    first, exactly as the corrected contract states.
+#[test]
+fn strict_build_test_reuse_via_real_binary_reaches_the_trust_wall_and_prose_edits_are_never_free() {
+    let sb = Sandbox::new("reuse-real-binary");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    write_strict_local_validation_config(&sb);
+    // design.md A0: the byte-identical-candidate opt-in, matching this
+    // repository's own `.mpd/config.json` `closure.hermetic_reuse` shape.
+    edit_config(&sb, |v| {
+        v["closure"] = serde_json::json!({
+            "hermetic_reuse": {
+                "schema": 1,
+                "external_state": "none",
+                "environment": [],
+                "input_paths": []
+            }
+        });
+    });
+
+    let change = "reuse-thing";
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix"])
+        .status
+        .success());
+    write_thing_spec(&sb, change);
+    fill_artifacts(&sb, change);
+    author_judgment(&sb, change, "architecture");
+    assert_gate_ok(&sb, "architecture");
+    author_judgment(&sb, change, "security-plan");
+    assert_gate_ok(&sb, "security-plan");
+
+    // (1) Genuine strict Build execution reaches exactly the certified-host
+    // trust wall — the A0 opt-in opens no bypass around it.
+    let build_attempt = sb.mpd(&["gate", "build", "--pass"]);
+    assert!(!build_attempt.status.success());
+    let build_err = String::from_utf8_lossy(&build_attempt.stderr);
+    assert!(
+        build_err.contains("trusted-policy-missing"),
+        "hermetic-reuse config must not open a bypass around trust activation: {build_err}"
+    );
+
+    // (2) `--reuse` with no Build history yet still reaches the ordinary
+    // origin lookup, not any categorical refusal, even with A0 active.
+    let bogus_receipt = "a".repeat(64);
+    let build_reuse_attempt = sb.mpd(&["gate", "build", "--pass", "--reuse", &bogus_receipt]);
+    assert!(!build_reuse_attempt.status.success());
+    let build_reuse_err = String::from_utf8_lossy(&build_reuse_attempt.stderr);
+    assert!(
+        build_reuse_err.contains(&format!("no receipt {bogus_receipt} exists for Build")),
+        "{build_reuse_err}"
+    );
+
+    // (3) A prose-only edit is never free: append one byte to design.md
+    // (already the authored Architecture judgment artifact) without
+    // touching manifest.json, and confirm the very next read genuinely
+    // rewinds to Architecture rather than staying byte-identical.
+    let before_edit = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(before_edit["phase"], "build");
+    assert_eq!(before_edit["effective_phase"], "build");
+    let design_path = sb.dir.join(format!("openspec/changes/{change}/design.md"));
+    let mut design_contents = std::fs::read_to_string(&design_path).unwrap();
+    design_contents.push('x');
+    sb.write(
+        &format!("openspec/changes/{change}/design.md"),
+        &design_contents,
+    );
+    let after_edit = json(&sb.mpd(&["status", "--json"]));
+    assert_eq!(
+        after_edit["effective_phase"], "architecture",
+        "an in-scope prose edit must rewind to Architecture, never stay byte-identical: {after_edit}"
+    );
+    let reasons: Vec<&str> = after_edit["blocking_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        reasons.iter().any(|r| r.contains("stale evidence")),
+        "{reasons:?}"
     );
 }
 

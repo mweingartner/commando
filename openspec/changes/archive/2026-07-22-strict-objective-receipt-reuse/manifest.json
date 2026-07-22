@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "paths": [
+    "crates/mpd/src/cli.rs",
+    "crates/mpd/tests/e2e.rs",
+    ".mpd/config.json",
+    "README.md",
+    "AGENTS.md",
+    ".mpd/directives/protocol.md",
+    "crates/mpd/assets/directives/protocol.md",
+    "openspec/changes/strict-objective-receipt-reuse/**",
+    "docs/strict-objective-receipt-reuse.md"
+  ],
+  "shared_paths": []
+}

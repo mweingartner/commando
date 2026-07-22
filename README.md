@@ -81,6 +81,33 @@ affected rewind before the next brief or effect. `mpd repair-state --to <phase>
 creates a PASS or erases history. Effective risk is the maximum of requested and derived
 risk; configuration cannot lower it.
 
+When a rewind leaves the Candidate **byte-identical**, a strict Build/Test gate may
+**reuse** the prior validation receipt instead of re-executing the sandbox: `mpd gate
+<phase> --pass --reuse <receipt>`, offered by `mpd next`. The Candidate binds every
+manifest-scoped file — source, config, *and* the change's own prose artifacts
+(design/proposal/tasks are folded in via the mandatory `openspec/changes/<change>/**`
+process scope, so the secret scanner covers them) — so editing any in-scope file,
+prose included, changes the Candidate id and correctly forces fresh execution. Reuse
+therefore applies only to rewinds whose cause lies *outside* the Candidate: a
+persona-directive or governance/risk re-derivation that touches no in-scope file, a
+`repair-state` rewind, or an edit reverted to byte-identical. Reuse is fail-closed —
+it requires the same Candidate id, gate profile, policy digest, revalidated build
+output, and a hermetic-complete receipt bound to the coordinator's own executable
+digest; any drift re-executes, and Security(code) never reuses. It is enabled by
+`.mpd/config.json`'s `closure.hermetic_reuse`, whose
+`external_state: "none"` attests that no *unpinned* external mutable state feeds
+validation — the ambient reads that remain (cargo config under `$CARGO_HOME`, the SDK
+via `DEVELOPER_DIR`, the cargo/rustc binaries, OS beyond os-arch) are pinned by
+offline+locked builds, `Cargo.lock` checksums, and execution-time tool-digest
+verification against `security/tool-lock.json`.
+
+Effective risk drives *depth*, not attempt pressure: at High, Security and Tester
+resolve to the deep model with a raised effort floor and Test runs the heavier
+`high-risk-test` profile; High in fact *loosens* the attempt limit relative to
+Medium/Low. A documentation-only change derives Low; other changes derive High because
+their source and `.mpd/` policy files are verification authority. `mpd next --harness
+<h>` prints the resolved per-phase model — authoritative over any prose.
+
 ## Local validation and containment
 
 Authoritative checks use typed program/argv data, pinned tool identities, offline Cargo

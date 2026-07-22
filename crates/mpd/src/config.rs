@@ -876,6 +876,7 @@ fn validate_environment_allowlist(allowlist: &EnvironmentAllowlist) -> Result<()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClosureConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_remote: Option<String>,
@@ -1256,6 +1257,28 @@ mod tests {
         .unwrap();
         assert_eq!(invalid.remote_timeout_secs(), 15);
         assert_eq!(invalid.human_path_list_limit(), 50);
+    }
+
+    /// Security-code L2: `ClosureConfig` and the nested `HermeticReusePolicy`
+    /// both carry `#[serde(deny_unknown_fields)]`, so an unknown field
+    /// anywhere inside the real `closure.hermetic_reuse` block fails parse
+    /// instead of being silently ignored (the pre-existing advisory gap).
+    #[test]
+    fn unknown_field_inside_closure_hermetic_reuse_block_fails_parse() {
+        let ok = r#"{"closure":{"hermetic_reuse":{"schema":1,"external_state":"none","environment":[],"input_paths":["security/tool-lock.json"]}}}"#;
+        assert!(serde_json::from_str::<Config>(ok).is_ok());
+
+        let typo_in_hermetic_reuse = r#"{"closure":{"hermetic_reuse":{"schema":1,"external_state":"none","environment":[],"input_paths":[],"external_input":"oops"}}}"#;
+        assert!(
+            serde_json::from_str::<Config>(typo_in_hermetic_reuse).is_err(),
+            "an unknown field inside closure.hermetic_reuse must fail closed"
+        );
+
+        let typo_in_closure = r#"{"closure":{"hermetic_reuse":{"schema":1,"external_state":"none"},"unknown_closure_field":true}}"#;
+        assert!(
+            serde_json::from_str::<Config>(typo_in_closure).is_err(),
+            "an unknown field on closure itself must also fail closed"
+        );
     }
 
     #[cfg(unix)]
