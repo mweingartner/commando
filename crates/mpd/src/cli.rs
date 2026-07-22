@@ -32,7 +32,7 @@ Command groups:
   Core loop      conduct · next · gate · status · archive · publish   (the everyday motion)
   Author/govern  brief · resolve · reconcile · persona · manifest · use
   Setup/recovery init · strict · check · validate · policy activate · doctor
-                 (archive --recover/--abandon recovers an interrupted archive)
+                 (archive --recover/--close recovers an interrupted archive)
 
 Drive a change: mpd conduct <name> → loop (mpd next → do the work → mpd gate <phase>)
 → mpd archive --yes → commit + push → mpd publish --verify.";
@@ -313,7 +313,7 @@ enum Command {
     #[command(name = "__mpd-static-policy-check", hide = true)]
     InternalStaticPolicyCheck,
     /// Fold a completed change's specs into the record and archive it. Also
-    /// recovers/abandons an interrupted archive closure (`--recover`/`--abandon`).
+    /// recovers/closes an interrupted archive closure (`--recover`/`--close`).
     Archive {
         /// Change (defaults to the current change).
         #[arg(long)]
@@ -327,10 +327,11 @@ enum Command {
         /// Recover an interrupted archive closure transaction (completion-only).
         #[arg(long)]
         recover: bool,
-        /// Abandon owned closure transaction metadata after AwaitingCommit.
-        #[arg(long)]
-        abandon: bool,
-        /// Emit machine-readable JSON (only with --recover/--abandon).
+        /// Close owned closure transaction metadata after AwaitingCommit
+        /// (`--abandon` is a back-compat alias for this flag).
+        #[arg(long = "close", alias = "abandon")]
+        close: bool,
+        /// Emit machine-readable JSON (only with --recover/--close).
         #[arg(long)]
         json: bool,
     },
@@ -361,14 +362,14 @@ enum Command {
         json: bool,
     },
     /// Inspect or recover an interrupted archive closure transaction (hidden alias
-    /// — prefer `archive --recover` / `archive --abandon`).
+    /// — prefer `archive --recover` / `archive --close`).
     #[command(hide = true)]
     Closure {
         #[command(subcommand)]
         command: ClosureCommand,
     },
     /// Point `.mpd/current` at an existing change — recovers a cleared pointer
-    /// (e.g. after `mpd archive --abandon` or an archive that reset it).
+    /// (e.g. after `mpd archive --close` or an archive that reset it).
     Use {
         /// Change name to make current (must have a seeded ledger).
         change: String,
@@ -623,7 +624,9 @@ enum ClosureCommand {
         #[arg(long)]
         json: bool,
     },
-    Abandon {
+    /// `--abandon` is a back-compat alias for this subcommand.
+    #[command(alias = "abandon")]
+    Close {
         #[arg(long)]
         yes: bool,
         #[arg(long)]
@@ -796,7 +799,7 @@ pub fn run() -> i32 {
             println!("static validation policy: PASS");
             Ok(0)
         })(),
-        // `--recover`/`--abandon` route to the closure logic HERE, ahead of
+        // `--recover`/`--close` route to the closure logic HERE, ahead of
         // `cmd_archive` — whose first check refuses on a pending closure, exactly the
         // state recovery exists for (Security-plan Finding 2). `--json`/`--change`
         // are scoped to the recovery branch.
@@ -805,21 +808,21 @@ pub fn run() -> i32 {
             skip_specs,
             yes,
             recover,
-            abandon,
+            close,
             json,
-        } => match (recover, abandon) {
-            (true, true) => Err("--recover and --abandon are mutually exclusive".into()),
+        } => match (recover, close) {
+            (true, true) => Err("--recover and --close are mutually exclusive".into()),
             (true, false) | (false, true) if skip_specs => {
-                Err("--recover/--abandon are mutually exclusive with --skip-specs".into())
+                Err("--recover/--close are mutually exclusive with --skip-specs".into())
             }
             (true, false) | (false, true) if change.is_some() => Err(
-                "--change is not valid with --recover/--abandon (they act on the single pending closure)"
+                "--change is not valid with --recover/--close (they act on the single pending closure)"
                     .into(),
             ),
             (true, false) => find_root().and_then(|root| cmd_closure_recover(&root, yes, json)),
             (false, true) => find_root().and_then(|root| cmd_closure_abandon(&root, yes, json)),
             (false, false) if json => {
-                Err("--json is valid only with --recover/--abandon".into())
+                Err("--json is valid only with --recover/--close".into())
             }
             (false, false) => cmd_archive(change, skip_specs, yes),
         },
@@ -987,7 +990,7 @@ fn cmd_begin(
     if let Some(view) = openspec_core::inspect(&root).map_err(|e| e.to_string())? {
         return Err(format!(
             "cannot begin a new change — a closure for {:?} is still pending (stage: {}); \
-             run `mpd archive --recover` or `mpd archive --abandon` first",
+             run `mpd archive --recover` or `mpd archive --close` first",
             view.change,
             stage_label(view.stage)
         ));
@@ -4754,7 +4757,7 @@ fn closure_recovery_hint(name: &str) -> String {
     let name = harness::terminal_safe(name);
     format!(
         " A closure-shaped staged change for {name:?} was detected without its pending \
-         transaction; the closure commit belongs before `mpd archive --abandon --yes`. To \
+         transaction; the closure commit belongs before `mpd archive --close --yes`. To \
          commit it now: run `mpd use {name}` and retry. Do not re-create \
          openspec/changes/{name}/manifest.json."
     )
@@ -6308,7 +6311,7 @@ fn stepclass_label(class: openspec_core::StepClass) -> &'static str {
 }
 
 /// Render a [`openspec_core::TransactionView`] in the shared human/JSON form
-/// `mpd archive --recover` and `mpd archive --abandon` both use for their
+/// `mpd archive --recover` and `mpd archive --close` both use for their
 /// preview.
 fn render_transaction_view(view: &openspec_core::TransactionView, json: bool) {
     if json {
@@ -6345,7 +6348,7 @@ fn cmd_closure(command: ClosureCommand) -> CmdResult {
     let root = find_root()?;
     match command {
         ClosureCommand::Recover { yes, json } => cmd_closure_recover(&root, yes, json),
-        ClosureCommand::Abandon { yes, json } => cmd_closure_abandon(&root, yes, json),
+        ClosureCommand::Close { yes, json } => cmd_closure_abandon(&root, yes, json),
     }
 }
 
@@ -6389,13 +6392,13 @@ fn cmd_closure_abandon(root: &Path, yes: bool, json: bool) -> CmdResult {
     match openspec_core::abandon_apply(root) {
         Ok(()) => {
             if json {
-                println!("{}", serde_json::json!({"abandoned": true}));
+                println!("{}", serde_json::json!({"closed": true}));
             } else {
                 println!(
-                    "Abandoned the pending closure (removed only its own ignored metadata; \
+                    "Closed the pending closure (removed only its own ignored metadata; \
                      repository targets are untouched)."
                 );
-                // D7: reiterate the intended order. Abandon is post-commit
+                // D7: reiterate the intended order. Close is post-commit
                 // housekeeping — if the closure commit has not been made
                 // yet, the archived change can still be committed via
                 // `mpd use <change>` followed by `git commit` (the
@@ -6409,7 +6412,7 @@ fn cmd_closure_abandon(root: &Path, yes: bool, json: bool) -> CmdResult {
             Ok(0)
         }
         Err(e) => {
-            eprintln!("Abandon refused: {e}");
+            eprintln!("Close refused: {e}");
             Ok(1)
         }
     }
@@ -6443,7 +6446,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
             view.change,
             stage_label(view.stage)
         );
-        eprintln!("Run `mpd archive --recover` or `mpd archive --abandon` first.");
+        eprintln!("Run `mpd archive --recover` or `mpd archive --close` first.");
         return Ok(1);
     }
 
@@ -6899,7 +6902,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
          atomic beyond what the filesystem actually provided."
     );
     println!(
-        "→ next: commit the archived result, then run `mpd archive --abandon --yes` \
+        "→ next: commit the archived result, then run `mpd archive --close --yes` \
          once the commit is in (or `mpd publish --verify` once available)."
     );
     Ok(0)
@@ -8262,6 +8265,7 @@ mod tests {
     };
     use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, Verdict};
     use crate::phase::{Applicability, Phase};
+    use clap::Parser as _;
     use proptest::prelude::*;
     use std::process::Command;
 
@@ -8497,11 +8501,53 @@ mod tests {
     fn closure_recovery_hint_names_the_change_suggests_use_never_recover_or_recreate() {
         let hint = closure_recovery_hint("some-thing");
         assert!(hint.contains("mpd use some-thing"), "{hint}");
-        assert!(hint.contains("archive --abandon --yes"), "{hint}");
+        assert!(hint.contains("archive --close --yes"), "{hint}");
         // D5/Condition 3.2: never suggest `archive --recover` for this state
         // — recover requires the pointer abandon already deleted.
         assert!(!hint.contains("archive --recover"), "{hint}");
         assert!(hint.contains("Do not re-create"), "{hint}");
+    }
+
+    // rename-abandon-to-close D1/Cond 1: `--close` is the primary spelling and
+    // `--abandon` is a back-compat clap alias for the exact same field — both
+    // must parse to an identical `Command::Archive { close: true, .. }`.
+    #[test]
+    fn archive_close_flag_and_its_abandon_alias_parse_to_the_same_field() {
+        let via_close = super::Cli::try_parse_from(["mpd", "archive", "--close", "--yes"])
+            .expect("--close must parse");
+        let via_abandon = super::Cli::try_parse_from(["mpd", "archive", "--abandon", "--yes"])
+            .expect("--abandon alias must still parse");
+        for parsed in [via_close, via_abandon] {
+            match parsed.command {
+                super::Command::Archive { close, yes, .. } => {
+                    assert!(close, "--close/--abandon must both set the `close` field");
+                    assert!(yes);
+                }
+                other => panic!("expected Command::Archive, got {other:?}"),
+            }
+        }
+    }
+
+    // rename-abandon-to-close D1/Cond 1: `mpd closure close` is the primary
+    // subcommand and `mpd closure abandon` is a back-compat clap alias for the
+    // exact same variant.
+    #[test]
+    fn closure_close_subcommand_and_its_abandon_alias_dispatch_to_the_same_variant() {
+        let via_close =
+            super::Cli::try_parse_from(["mpd", "closure", "close"]).expect("close must parse");
+        let via_abandon = super::Cli::try_parse_from(["mpd", "closure", "abandon"])
+            .expect("abandon alias must still parse");
+        for parsed in [via_close, via_abandon] {
+            match parsed.command {
+                super::Command::Closure { command } => {
+                    assert!(
+                        matches!(command, super::ClosureCommand::Close { .. }),
+                        "expected ClosureCommand::Close, got {command:?}"
+                    );
+                }
+                other => panic!("expected Command::Closure, got {other:?}"),
+            }
+        }
     }
 
     #[test]

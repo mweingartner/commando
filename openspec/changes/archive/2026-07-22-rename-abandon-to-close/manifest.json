@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "paths": [
+    "crates/mpd/src/cli.rs",
+    "crates/mpd/tests/e2e.rs",
+    "crates/openspec-core/src/transaction.rs",
+    "docs/fix-closure-commit-coherence.md",
+    "openspec/changes/rename-abandon-to-close/**",
+    "docs/rename-abandon-to-close.md"
+  ],
+  "shared_paths": []
+}

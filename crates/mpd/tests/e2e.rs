@@ -4577,10 +4577,7 @@ fn pre_commit_guidance_names_change_when_no_coordinator_for_closure_shaped_diff(
         stderr.contains("mpd use no-coordinator-thing"),
         "stderr={stderr}"
     );
-    assert!(
-        stderr.contains("archive --abandon --yes"),
-        "stderr={stderr}"
-    );
+    assert!(stderr.contains("archive --close --yes"), "stderr={stderr}");
     assert!(!stderr.contains("archive --recover"), "stderr={stderr}");
     assert_hook_read_only(&sb, &before);
 }

@@ -7,8 +7,9 @@ active-manifest copy. The pre-commit hook's ELSE branch (`ordinary_else_governan
 `cli.rs:4819`, invoked from `staged_precommit_governance`, `cli.rs:4905`) demanded
 `openspec/changes/<change>/manifest.json` from the Git index whenever no closure was
 pending — but a properly-archived change has deleted exactly that file. Committing
-after `mpd archive --abandon` (or otherwise without the pending closure still open)
-fell straight into that branch and hard-errored "active manifest is absent or
+after `mpd archive --close` (`--abandon` is a back-compat alias for the same flag),
+or otherwise without the pending closure still open, fell straight into that branch
+and hard-errored "active manifest is absent or
 unreadable in the index," with no recovery command: `recover_apply` refuses without a
 pointer, and nothing recreates an abandoned transaction. The only escape was
 resurrecting a stray `openspec/changes/<change>/manifest.json` copy and committing it.
@@ -43,7 +44,7 @@ the three stray manifest deletions: `openspec/changes/candidate-lifecycle-defect
 `openspec/changes/proportionate-governance/manifest.json`. Out of scope: the
 AwaitingCommit branch, the archive transaction, `abandon_apply` semantics, and
 `verify_commit_coherence` itself — none are touched. No refusal of
-`mpd archive --abandon` before the closure commit is added; this is messaging and
+`mpd archive --close` before the closure commit is added; this is messaging and
 authorization only, no new flags or commands.
 
 ## Functional details
@@ -97,10 +98,10 @@ applies `harness::terminal_safe` and a length cap — the worktree ledger is
 owner-writable and therefore attacker text under the gate's own cooperative-owner
 threat model.
 
-**Correct operator flow.** Commit **before** `mpd archive --abandon`: while
+**Correct operator flow.** Commit **before** `mpd archive --close`: while
 `.mpd/pending-closure` still exists at `AwaitingCommit`, the existing AwaitingCommit
 branch authorizes the commit from the transaction's classified rows unioned with the
-closure plan's entries, and no active manifest is ever read. Post-abandon, the new
+closure plan's entries, and no active manifest is ever read. Post-close, the new
 fallback arm handles it via `mpd use <change>` plus an ordinary `git commit` — the
 archive record substitutes for the deleted manifest. Either way, an archived change's
 active manifest must never be resurrected: security review is explicit that a stray
@@ -116,11 +117,12 @@ Canonical closure-commit sequence (commit while the closure is still pending):
 ```sh
 mpd archive --yes
 git commit
-mpd archive --abandon --yes
+mpd archive --close --yes
 ```
 
-Post-abandon recovery, when the closure commit was not made before abandoning
-(the fallback arm authorizes it from the archive record):
+Post-close recovery, when the closure commit was not made before closing
+(`--abandon` remains a working alias for `--close`; the fallback arm authorizes
+it from the archive record):
 
 ```sh
 mpd use <change>

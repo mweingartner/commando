@@ -879,7 +879,7 @@ pub fn prepare(
     match fs::symlink_metadata(pointer_path(root)) {
         Ok(_) => {
             return Err(TransactionError::Refused(
-                "a closure is already pending; run `mpd closure recover` or `mpd closure abandon` first".into(),
+                "a closure is already pending; run `mpd closure recover` or `mpd closure close` first".into(),
             ));
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1440,7 +1440,7 @@ pub fn inspect(root: &Path) -> TxResult<Option<TransactionView>> {
 
     let write_eligible = all_complete && !matches!(pointer.stage, TransactionState::AwaitingCommit);
     let next = if matches!(pointer.stage, TransactionState::AwaitingCommit) {
-        "mpd closure abandon --yes (after committing the archived result), or commit the archived result directly".to_string()
+        "mpd closure close --yes (after committing the archived result), or commit the archived result directly".to_string()
     } else if write_eligible {
         "mpd closure recover --yes".to_string()
     } else {
