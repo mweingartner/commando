@@ -172,12 +172,18 @@ pub struct SecretReport {
 /// labeled `builtin` honestly — this is exactly the scanner that produced the
 /// findings. External scanners (gitleaks/Semgrep) run separately via
 /// [`run_external_scanners`] and are reported as themselves.
-pub fn scan_secrets(paths: &[PathBuf]) -> SecretReport {
-    let findings = secrets::scan_paths(paths).unwrap_or_default();
-    SecretReport {
+///
+/// Fails closed: any [`secrets::scan_paths`] error (a symlink or other
+/// non-regular tracked path, a file over its size cap, aggregate-size
+/// overflow, or an unreadable path) is propagated as `Err` — never collapsed
+/// into an empty, falsely-clean report. Callers must treat `Err` as blocking.
+pub fn scan_secrets(paths: &[PathBuf]) -> Result<SecretReport, String> {
+    let findings = secrets::scan_paths(paths)
+        .map_err(|e| format!("built-in secret scan failed closed: {e}"))?;
+    Ok(SecretReport {
         scanner: "builtin",
         findings,
-    }
+    })
 }
 
 /// Scan exactly the staged index postimages, never the possibly-different
@@ -370,6 +376,158 @@ mod tests {
             report.findings.is_empty(),
             "dirty worktree bytes must be excluded"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A tracked symlink must fail the built-in scan closed, end-to-end through
+    /// the real caller composition (`git_tracked_files` → `scan_secrets`), not
+    /// be silently dropped into an empty "clean" report.
+    #[cfg(unix)]
+    #[test]
+    fn scan_secrets_fails_closed_on_tracked_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-symlink-scan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(root.join("safe.txt"), "safe bytes\n").unwrap();
+        std::os::unix::fs::symlink("safe.txt", root.join("link.txt")).unwrap();
+        assert!(Command::new("git")
+            .args(["add", "safe.txt", "link.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let files = git_tracked_files(&root);
+        assert!(
+            files.iter().any(|p| p == &root.join("link.txt")),
+            "the tracked symlink (target exists) must survive the exists() filter, \
+             else this test proves nothing: {files:?}"
+        );
+
+        let err = scan_secrets(&files).unwrap_err();
+        assert!(
+            err.contains("non-regular"),
+            "error must name the non-regular cause: {err}"
+        );
+        assert!(
+            !err.contains("safe bytes"),
+            "error must not leak scanned file content: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Guards against inverting the fail-closed fix: a clean set of regular
+    /// files must still report `Ok` with no findings under the `builtin` label.
+    #[test]
+    fn scan_secrets_reports_clean_on_regular_files() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-clean-scan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("safe.txt");
+        std::fs::write(&file, "safe bytes\n").unwrap();
+
+        let report = scan_secrets(&[file]).unwrap();
+        assert!(report.findings.is_empty());
+        assert_eq!(report.scanner, "builtin");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Table test for the fail-closed invariant across the OTHER error
+    /// classes (`scan_paths` can also refuse a missing/unreadable path, a
+    /// non-regular directory, and an oversize file — not just a symlink),
+    /// and across positions: a bad entry anywhere in the set must yield
+    /// `Err`, never a partial "clean" report from the entries before it.
+    #[test]
+    fn scan_secrets_fails_closed_on_every_error_class_at_any_position() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-error-class-scan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let regulars: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|name| {
+                let path = root.join(name);
+                std::fs::write(&path, "safe bytes\n").unwrap();
+                path
+            })
+            .collect();
+
+        // Control first: the regular set alone is clean, so any `Err` below
+        // is attributable to the injected entry, not the fixtures.
+        let report = scan_secrets(&regulars).unwrap();
+        assert!(report.findings.is_empty());
+
+        // (1) Missing path (TOCTOU: a file can vanish between `git ls-files`
+        // enumeration and the scan) — fails closed at EVERY position. The
+        // cause is an OS message without the path, so only the wrapper's
+        // fixed prefix is asserted.
+        let missing = root.join("vanished.txt");
+        for position in 0..=regulars.len() {
+            let mut set = regulars.clone();
+            set.insert(position, missing.clone());
+            let err = scan_secrets(&set).unwrap_err();
+            assert!(
+                err.starts_with("built-in secret scan failed closed:"),
+                "missing path at position {position} must fail closed: {err}"
+            );
+        }
+
+        // (2) A directory is non-regular even where symlinks are unavailable.
+        let dir = root.join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+        let mut set = regulars.clone();
+        set.insert(1, dir);
+        let err = scan_secrets(&set).unwrap_err();
+        assert!(
+            err.starts_with("built-in secret scan failed closed:") && err.contains("non-regular"),
+            "a directory in the scan set must fail closed as non-regular: {err}"
+        );
+
+        // (3) Over the 16 MiB per-file content cap (secrets.rs
+        // MAX_FILE_BYTES). `set_len` makes the file sparse — the length check
+        // fires before any read, so no bytes are actually written or read.
+        let big = root.join("big.txt");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        let mut set = regulars.clone();
+        set.insert(1, big);
+        let err = scan_secrets(&set).unwrap_err();
+        assert!(
+            err.starts_with("built-in secret scan failed closed:") && err.contains("byte cap"),
+            "an oversize file must fail closed on the size cap: {err}"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

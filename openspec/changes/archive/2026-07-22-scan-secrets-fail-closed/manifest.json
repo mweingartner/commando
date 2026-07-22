@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "paths": [
+    "crates/mpd/src/checks/mod.rs",
+    "crates/mpd/src/cli.rs",
+    "crates/mpd/tests/e2e.rs",
+    "openspec/specs/local-validation/spec.md",
+    ".mpd/state/scan-secrets-fail-closed.json",
+    "openspec/changes/scan-secrets-fail-closed/**",
+    "docs/scan-secrets-fail-closed.md"
+  ],
+  "shared_paths": []
+}

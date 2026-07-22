@@ -1210,6 +1210,75 @@ fn check_staged_blocks_on_secret() {
     );
 }
 
+/// SECURITY(plan) Condition 2 (scan-secrets-fail-closed): the wrapper-level
+/// unit tests prove `scan_secrets` returns `Err` on a tracked symlink; only a
+/// black-box run proves the CALLER blocks instead of swallowing it. A temp
+/// repo with a tracked symlink (target existing — else `git_files`' `exists()`
+/// filter drops it and this proves nothing) must make non-staged `mpd check`
+/// exit non-zero with the fail-closed diagnostic and never print the
+/// clean-scan line. The failing scan resolves before external scanners or the
+/// test runner, so this stays hermetic.
+#[cfg(unix)]
+#[test]
+fn check_fails_closed_on_tracked_symlink() {
+    let sb = Sandbox::new("symlink-fail-closed");
+    sb.mpd(&["init"]);
+    sb.write("safe.txt", "safe bytes\n");
+    run("git", &["add", "safe.txt"], &sb.dir);
+    std::os::unix::fs::symlink("safe.txt", sb.dir.join("link.txt")).unwrap();
+    run("git", &["add", "link.txt"], &sb.dir);
+
+    // Vacuity guards: git actually tracks the symlink, it is still a symlink
+    // on disk, and its target exists (so enumeration retains it).
+    let ls = run("git", &["ls-files"], &sb.dir);
+    assert!(
+        stdout(&ls).lines().any(|l| l == "link.txt"),
+        "the symlink must be git-tracked or the scan never sees it: {}",
+        stdout(&ls)
+    );
+    assert!(
+        std::fs::symlink_metadata(sb.dir.join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "link.txt must still be a symlink on disk"
+    );
+    assert!(
+        sb.dir.join("safe.txt").is_file(),
+        "the symlink target must exist to survive the exists() filter"
+    );
+
+    let out = sb.mpd(&["check"]);
+    // Exit 2 pins the operational-error path (design D3); findings would be 1,
+    // and a clean pass 0 — either of those here means the caller swallowed
+    // the scan error.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "non-staged check must propagate the scan error as exit 2: stdout={} stderr={}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("built-in secret scan failed closed"),
+        "stderr must carry the fail-closed diagnostic: {err}"
+    );
+    assert!(
+        err.contains("non-regular") && err.contains("link.txt"),
+        "the diagnostic must name the cause and the offending path: {err}"
+    );
+    assert!(
+        !err.contains("safe bytes"),
+        "the diagnostic must never leak file contents: {err}"
+    );
+    assert!(
+        !stdout(&out).contains("Checks passed"),
+        "a blocked check must not print the clean-scan line: {}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn archive_refuses_with_unmet_gates() {
     let sb = Sandbox::new("unmet");

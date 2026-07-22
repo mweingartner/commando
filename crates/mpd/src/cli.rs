@@ -3418,7 +3418,15 @@ fn cmd_gate(
         }
         if phase.requires_secret_scan() && !structured_gate_ran {
             let files = checks::git_tracked_files(&root);
-            let report = checks::scan_secrets(&files);
+            let report = match checks::scan_secrets(&files) {
+                Ok(report) => report,
+                Err(e) => {
+                    return Ok(gate_blocked(&format!(
+                        "{} gate refused: {e}",
+                        phase.label()
+                    )))
+                }
+            };
             let scanner = report.scanner;
             let (findings, suppressed) =
                 crate::allowlist::Allowlist::load(&root).filter(report.findings, &root);
@@ -5201,7 +5209,7 @@ fn cmd_check(staged: bool, quiet: bool) -> CmdResult {
     let report = if staged {
         checks::scan_staged_postimages(&root)?
     } else {
-        checks::scan_secrets(&checks::git_tracked_files(&root))
+        checks::scan_secrets(&checks::git_tracked_files(&root))?
     };
     let scanner = report.scanner;
     let (findings, suppressed) =
