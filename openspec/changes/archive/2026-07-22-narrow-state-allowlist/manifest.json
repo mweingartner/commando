@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "paths": [
+    ".mpd/secret-allowlist.json",
+    "openspec/changes/narrow-state-allowlist/**",
+    "docs/narrow-state-allowlist.md"
+  ],
+  "shared_paths": []
+}
