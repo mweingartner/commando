@@ -17,6 +17,11 @@ append-only Ledger --freshness/risk--> ordered gates
           |                                |
           |                                v
           +--> immutable Candidate --> local validator --> receipts
+          |                  |                 |
+          |                  |                 +--> executed/reused check evidence
+          |                  +--> usage/provenance --> budgets + coverage
+          |
+          +--> blind routing evidence --> evaluation --> guarded preview/write
           |                                |
           v                                v
 archive closure --> coherent Commit --> pre-push authorization --> normal Git
@@ -91,6 +96,68 @@ Receipts bind subject, profile, effective policy, validator binary, host/toolcha
 Cargo/advisory/tool inputs, sandbox ABI/profile/root/canary attestations, results, times,
 and optional Build output. Logs are clone-private, capped, rotated, redacted, and bound by
 digest rather than copied into the ledger.
+
+### Governance economics and provenance
+
+`attestation.rs` parses a bounded versioned envelope that binds issuer, key, change,
+phase, attempt, actor, harness, model, session, artifact digest, subject digest, issue
+time, and integer usage counters. Authenticated envelopes use only
+`sshsig-ed25519-v1`, the fixed `mpd-attestation-v1` namespace, a reviewed issuer key,
+and the exact `/usr/bin/ssh-keygen` identity in `security/tool-lock.json`. Accepted
+digests are one-use ledger claims. Missing required evidence, verifier drift,
+cross-binding, invalid signatures, and replay are distinct fail-closed states.
+
+`economics.rs` is a pure coverage-aware projection. It aggregates tokens, active
+milliseconds, independently observed wall milliseconds, and per-currency micro-units
+without converting currency or treating absent evidence as zero. Risk-specific soft
+limits warn. Hard limits and the fixed two-blocker/30-minute anti-stall policy block
+only commissioning the next brief. They do not rewrite verdicts, delete history, or
+prevent read-only inspection. A continuation is explicit, bounded, and one-use.
+
+The repository currently configures cooperative attestation with no issuer, so the
+authenticated provenance path is `NOT DEPLOYED`; it is an implemented verification
+boundary, not a current production assurance claim.
+
+### Check reuse and documentation lane
+
+Each validation check has a canonical digest and an `executed` or `reused`
+disposition. Reuse searches only accepted current-change/current-subject receipts and
+requires equality across the entire validation identity. The stored reused result
+points directly to the executed origin; it does not form a trust chain. Security(code)
+and publication security checks are deliberately excluded from this optimization.
+
+Profile selection has a separate, explicit documentation-only lane. It is eligible
+only when the manifest is documentation-only and effective risk is exactly Low. Build
+requires the typed release build in addition to the secret scan and finite doctrine
+checker, preserving the existing Build-to-Deploy artifact invariant; Test requires the
+scan and doctrine checker, while Security(code) requires the fresh scan. Partial
+mappings, missing floor checks, or widened/risk-raised scope block or select the full
+profile rather than weakening validation.
+
+### Routing evidence and guarded configuration
+
+`routing.rs` evaluates strict, capped `routing-evidence-v1` data offline. Evidence binds
+the versioned suite and rubric, carries blinded unique seeded samples, has a maximum
+age and minimum sample count, and keeps currencies separate. The deterministic
+evaluator can recommend only an existing reviewed `(harness, persona)` target and
+does not claim global optimality when the current route is Pareto-eligible.
+
+`mpd routing evaluate` has no writer. `mpd routing apply` first emits an exact preview;
+`--yes` acquires a clone-private lock, rereads and rehashes both evidence and config,
+revalidates the allowlist and old values, then changes only the approved model fields
+and stores the evidence digest. The benchmark fixture validates the evaluator but does
+not count as adoption evidence.
+
+### Operator recovery and cache lifecycle
+
+Recovery projections are read-only: status classifies current-pointer/archive state,
+doctor classifies hook installation from activated trust health, and the doctrine lane
+checks a finite set of exact supersession relations. Candidate-cache inspection takes
+the union of live and archived ledger references, uses fixed clone-private roots and
+bounded inventory, and classifies identities as retained, prunable, or blocked.
+Confirmed pruning revalidates references and device/inode identity around same-parent,
+no-follow quarantine. Ambiguity, replacement, truncation, or interruption never
+becomes a successful deletion.
 
 ## Exact-host macOS adapter
 

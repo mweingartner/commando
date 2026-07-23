@@ -1,3 +1,6 @@
+Status: SUPERSEDED
+Superseded by: docs/candidate-scope-integrity.md
+
 # Strict objective-receipt reuse (`mpd gate --reuse`)
 
 ## Purpose

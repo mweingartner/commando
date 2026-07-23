@@ -9,6 +9,46 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The observed installation state of the commit gate.  This deliberately
+/// keeps the legacy marker hook distinct from the policy-activated wrapper:
+/// the latter is healthy only after the local-validation activation identity
+/// has been checked read-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookInstallation {
+    /// `root` is not a Git worktree or Git did not disclose a hooks directory.
+    NotApplicable,
+    /// No `pre-commit` hook was observed at the configured hooks path.
+    Missing,
+    /// The compatibility marker hook installed by [`install`].
+    ManualMpd { path: PathBuf },
+    /// The clone-private activated wrapper and its trusted coordinator/policy
+    /// bindings were all verified by `local_validation`.
+    ActivatedTrusted { path: PathBuf },
+    /// A hook exists but is neither a recognized manual hook nor a healthy
+    /// activated wrapper.  `reason` is local, bounded diagnostic text; it is
+    /// never a policy authorization.
+    Drifted { path: PathBuf, reason: String },
+}
+
+impl HookInstallation {
+    /// Compatibility projection for existing callers.  A manual marker hook
+    /// remains installed, while a drifted activated wrapper intentionally does
+    /// not become healthy merely because a file is present.
+    pub fn is_installed(&self) -> bool {
+        matches!(self, Self::ManualMpd { .. } | Self::ActivatedTrusted { .. })
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not-applicable",
+            Self::Missing => "missing",
+            Self::ManualMpd { .. } => "manual-mpd",
+            Self::ActivatedTrusted { .. } => "activated-trusted",
+            Self::Drifted { .. } => "drifted",
+        }
+    }
+}
+
 /// Run a git command in `root`, returning trimmed stdout on success.
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
@@ -97,13 +137,76 @@ pub fn install(root: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(hook))
 }
 
-/// Whether the mpd pre-commit hook is installed.
+/// Inspect the configured pre-commit hook without changing Git configuration,
+/// hook files, or trusted-policy state.  Marker text is sufficient only for
+/// the explicit compatibility hook; activated wrappers are accepted solely
+/// when the established activation/coordinator/policy health check succeeds.
+pub fn inspect_installation(root: &Path) -> HookInstallation {
+    if !is_git_repo(root) {
+        return HookInstallation::NotApplicable;
+    }
+    let Some(dir) = hooks_dir(root) else {
+        return HookInstallation::NotApplicable;
+    };
+    let hook = dir.join("pre-commit");
+    let metadata = match std::fs::symlink_metadata(&hook) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return HookInstallation::Missing,
+        Err(error) => {
+            return HookInstallation::Drifted {
+                path: hook,
+                reason: format!("cannot inspect hook: {error}"),
+            }
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return HookInstallation::Drifted {
+            path: hook,
+            reason: "hook is not a regular non-symlink file".into(),
+        };
+    }
+    let contents = match std::fs::read_to_string(&hook) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return HookInstallation::Drifted {
+                path: hook,
+                reason: format!("cannot read hook: {error}"),
+            }
+        }
+    };
+    if contents == PRE_COMMIT {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return HookInstallation::Drifted {
+                    path: hook,
+                    reason: "manual MPD hook is not executable".into(),
+                };
+            }
+        }
+        return HookInstallation::ManualMpd { path: hook };
+    }
+    if contents.contains("mpd pre-commit gate") {
+        return HookInstallation::Drifted {
+            path: hook,
+            reason: "manual MPD marker exists but hook bytes differ from the installed template"
+                .into(),
+        };
+    }
+
+    match crate::local_validation::doctor_activation_health(root) {
+        Ok(()) => HookInstallation::ActivatedTrusted { path: hook },
+        Err(reason) => HookInstallation::Drifted { path: hook, reason },
+    }
+}
+
+/// Whether an MPD pre-commit hook is installed.  This compatibility wrapper
+/// intentionally delegates to the typed diagnosis instead of trusting marker
+/// text for activated trusted hooks.
+#[allow(dead_code)]
 pub fn is_installed(root: &Path) -> bool {
-    hooks_dir(root)
-        .map(|d| d.join("pre-commit"))
-        .and_then(|h| std::fs::read_to_string(h).ok())
-        .map(|s| s.contains("mpd pre-commit gate"))
-        .unwrap_or(false)
+    inspect_installation(root).is_installed()
 }
 
 #[cfg(unix)]
@@ -117,4 +220,69 @@ fn make_executable(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    fn repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_and_manual_hooks_are_distinguished() {
+        let dir = repo("mpd-hook-inspection");
+        assert_eq!(inspect_installation(&dir), HookInstallation::Missing);
+        let installed = install(&dir).unwrap().unwrap();
+        assert_eq!(
+            inspect_installation(&dir),
+            HookInstallation::ManualMpd { path: installed }
+        );
+        assert!(is_installed(&dir));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unrecognized_hook_is_drifted_not_installed() {
+        let dir = repo("mpd-hook-drift");
+        let hook = hooks_dir(&dir).unwrap().join("pre-commit");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        let observed = inspect_installation(&dir);
+        assert!(matches!(observed, HookInstallation::Drifted { ref path, .. } if path == &hook));
+        assert!(!observed.is_installed());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn marker_text_does_not_authorize_modified_manual_hook() {
+        let dir = repo("mpd-hook-marker-drift");
+        let hook = hooks_dir(&dir).unwrap().join("pre-commit");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, "#!/bin/sh\n# mpd pre-commit gate\nexit 0\n").unwrap();
+        make_executable(&hook).unwrap();
+        assert!(matches!(
+            inspect_installation(&dir),
+            HookInstallation::Drifted { .. }
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

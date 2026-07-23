@@ -27,6 +27,13 @@ condition and those conditions must be resolved before archive. If the review-lo
 is reached, use one explicit `mpd reconcile --continue <bounded reason>`; do not widen
 scope to avoid the limit.
 
+`mpd next` may report a soft budget warning or refuse to commission another brief after
+a hard budget or the fixed two-blocker/30-minute anti-stall boundary. Do not delete
+history or invent usage to clear it. Provider token/cost evidence is optional in the
+current cooperative mode; absent evidence must remain `UNREPORTED`/`UNAVAILABLE`.
+Authenticated required mode must not be enabled until an external issuer is actually
+deployed and its exact public-key/tool contract is reviewed.
+
 ## Builder rules
 
 - Keep the written task plan as the contract. Canonical tasks have stable positive IDs.
@@ -39,6 +46,12 @@ scope to avoid the limit.
 - Add tests in the same pass for every new behavior and every fixed regression.
 - Update durable docs in the same change when behavior, architecture, security, local
   verification, hooks, release, or installation changes.
+- Treat `executed` and `reused` check dispositions as evidence, not interchangeable
+  labels. Security(code), outgoing secret scanning, Commit, and pre-push floors remain
+  fresh; a reuse source must be a current exact-identity executed result.
+- Use the documentation lane only when effective risk is Low and the manifest is
+  documentation-only. Do not relabel code/config/policy scope to obtain the narrow
+  profile; selection will fall back to the full profile or block on an incomplete lane.
 
 Use `apply_patch` for source edits. Stage explicit files only; never `git add -A`. Never
 commit secrets, `.git/mpd`, `.mpd/current`, `.mpd/tmp`, `.mpd/build-output`, `.mpd/local`,
@@ -73,6 +86,33 @@ Bootstrap may access the network and only prepares clone-private pinned inputs.
 Validation is offline. The only activation route is `mpd policy activate` for an
 immutable reviewed commit, exact canonical policy digest, absolute coordinator digest,
 and `.githooks`. There is no legacy trust-bootstrap route.
+
+When model routing is under review, use only the committed blind suite and bounded
+evidence schema:
+
+```sh
+mpd routing evaluate --evidence <routing-evidence.json>
+mpd routing apply --evidence <routing-evidence.json>
+# After reviewing the exact preview:
+mpd routing apply --evidence <routing-evidence.json> --yes
+```
+
+The suite under `benchmarks/routing-v1/` is a procedure and rubric, not proof that a
+route has won. If actual configured Sol/Terra sessions are missing, stale, unblinded,
+undersampled, or incomparable, record `MISSING`/`INSUFFICIENT` and leave mappings
+unchanged.
+
+Use cache recovery conservatively:
+
+```sh
+mpd cache inspect
+mpd cache prune       # preview only
+mpd cache prune --yes # only previewed, still-unreferenced identities
+```
+
+Neither cache command replaces `mpd archive --recover` or archive cleanup. Bare
+`mpd doctor` and `mpd status --json` are the read-only authorities for typed hook and
+current-selection diagnosis.
 
 ## Test expectations
 

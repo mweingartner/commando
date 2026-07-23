@@ -1,0 +1,42 @@
+{
+  "schema": "mpd-routing-tasks-v1",
+  "variants": [101, 202, 303],
+  "tasks": [
+    {
+      "id": "architect-boundary-plan",
+      "persona": "Architect",
+      "prompt": "Plan a backward-compatible additive ledger field for untrusted structured evidence. Name exact APIs, dependency order, migration behavior, abuse cases, tests, and Conditions for Builder. Do not implement.",
+      "acceptance": ["no implementation", "compatibility", "trust boundary", "test map", "builder conditions"]
+    },
+    {
+      "id": "designer-blocked-cli",
+      "persona": "Designer",
+      "prompt": "Specify human and JSON CLI states for CURRENT, MISSING, INSUFFICIENT, BLOCKED, and INVALID evidence. Cover hostile labels, narrow terminals, non-TTY, NO_COLOR, recovery actions, and exact acceptance criteria.",
+      "acceptance": ["all five states", "human JSON parity", "hostile output", "adaptive terminal", "recovery action"]
+    },
+    {
+      "id": "security-replay-review",
+      "persona": "Security",
+      "prompt": "Adversarially review a signed review-attestation design for replay, cross-phase binding, parser ambiguity, key confusion, verifier drift, TOCTOU, and private temporary-file risks. Cite concrete fixes and end PASS, CONDITIONAL PASS, or FAIL.",
+      "acceptance": ["replay", "exact binding", "parser ambiguity", "tool lock", "TOCTOU", "verdict"]
+    },
+    {
+      "id": "builder-exact-reuse",
+      "persona": "Builder",
+      "prompt": "Describe a minimal Rust implementation slice for exact per-check validation reuse. Include identity fields, executed-origin flattening, fresh-security exclusions, mismatch behavior, and focused tests. Keep scope bounded.",
+      "acceptance": ["exact identity", "flattening", "security exclusions", "mismatch executes", "tests"]
+    },
+    {
+      "id": "tester-routing-evidence",
+      "persona": "Tester",
+      "prompt": "Design a deterministic test matrix for an offline model-routing evidence evaluator. Cover bounded parsing, duplicate seeds, blindness, freshness, sample sufficiency, mixed currency, Pareto ties, config drift, and target-scope escalation.",
+      "acceptance": ["functional", "boundary", "property", "concurrency drift", "scope escalation", "omissions"]
+    },
+    {
+      "id": "documenter-operator-guide",
+      "persona": "Documenter",
+      "prompt": "Write a concise operator guide distinguishing cooperative provenance from authenticated provenance, NOT DEPLOYED readiness, preview versus apply, deployment versus installation, and exact verification commands. Do not overclaim maturity.",
+      "acceptance": ["cooperative distinction", "not deployed", "preview apply", "deployment installation", "verification"]
+    }
+  ]
+}

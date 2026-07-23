@@ -6941,6 +6941,209 @@ fn reconcile_before_security_does_not_skip_architecture() {
     assert_eq!(after["governance"]["risk"], "high");
 }
 
+/// Stage 5 acceptance: the routing command consumes only fresh blind evidence
+/// for an already-reviewed target, previews without changing configuration,
+/// and writes only that target under its collision lock.  This exercises the
+/// real binary rather than the pure evaluator fixtures in `routing.rs`.
+#[test]
+fn routing_cli_evaluates_previews_applies_allowlisted_routes_and_refuses_bad_evidence() {
+    fn evidence(now: u64, currency: &str, harness: &str) -> Value {
+        let sample = |model: &str, task: u64, quality: u64, cost: u64| {
+            serde_json::json!({
+                "harness": harness,
+                "persona": "Builder",
+                "model": model,
+                "task_id": format!("blind-task-{task}"),
+                "blind": true,
+                "seed": task,
+                "quality_bps": quality,
+                "escaped_defects": if model == "nova" { 0 } else { 2 },
+                "rework_steps": if model == "nova" { 0 } else { 2 },
+                "latency_ms": if model == "nova" { 20 } else { 200 },
+                "tokens": if model == "nova" { 20 } else { 200 },
+                "cost_micros": cost,
+                "currency": currency,
+            })
+        };
+        serde_json::json!({
+            "schema": "routing-evidence-v1",
+            "suite_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "rubric_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "generated_unix_secs": now,
+            "minimum_samples": 3,
+            "samples": [
+                sample("terra", 1, 7000, 200), sample("terra", 2, 7000, 200), sample("terra", 3, 7000, 200),
+                sample("nova", 1, 9000, 20), sample("nova", 2, 9000, 20), sample("nova", 3, 9000, 20)
+            ]
+        })
+    }
+
+    let sb = Sandbox::new("routing-cli");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    edit_config(&sb, |config| {
+        config["routing"] = serde_json::json!({
+            "schema": 1,
+            "maximum-age-secs": 600,
+            "minimum-samples": 3,
+            "allowed-targets": [{ "harness": "codex", "persona": "Builder" }]
+        });
+    });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sb.write(
+        "routing.json",
+        &serde_json::to_string_pretty(&evidence(now, "USD", "codex")).unwrap(),
+    );
+    let config_before = std::fs::read(sb.dir.join(".mpd/config.json")).unwrap();
+
+    let evaluated = sb.mpd(&[
+        "routing",
+        "evaluate",
+        "--evidence",
+        "routing.json",
+        "--json",
+    ]);
+    assert!(
+        evaluated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&evaluated.stderr)
+    );
+    assert_eq!(
+        json(&evaluated)["decision"]["Apply"]["updates"][0]["to_model"],
+        "nova"
+    );
+
+    let preview = sb.mpd(&["routing", "apply", "--evidence", "routing.json", "--json"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(json(&preview)["updates"][0]["target"]["persona"], "Builder");
+    assert_eq!(
+        std::fs::read(sb.dir.join(".mpd/config.json")).unwrap(),
+        config_before
+    );
+
+    // The write lock is exclusive; a pre-existing lock leaves config byte-identical.
+    sb.write(".mpd/tmp/routing-config.lock", "held\n");
+    let blocked = sb.mpd(&["routing", "apply", "--evidence", "routing.json", "--yes"]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("concurrently locked"));
+    assert_eq!(
+        std::fs::read(sb.dir.join(".mpd/config.json")).unwrap(),
+        config_before
+    );
+    std::fs::remove_file(sb.dir.join(".mpd/tmp/routing-config.lock")).unwrap();
+
+    let applied = sb.mpd(&["routing", "apply", "--evidence", "routing.json", "--yes"]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let after: Value =
+        serde_json::from_slice(&std::fs::read(sb.dir.join(".mpd/config.json")).unwrap()).unwrap();
+    assert_eq!(after["models"]["codex"]["Builder"], "nova");
+    assert_eq!(
+        after["models"]["codex"]["Architect"], "sol",
+        "apply must not widen its reviewed target"
+    );
+    assert!(after["routing"]["applied-evidence-digest"].is_string());
+
+    // Currency comparisons, unknown targets, and control-bearing labels are
+    // input refusals, never alternate route-selection paths.
+    // Make one candidate USD and one EUR so the route comparison is truly mixed.
+    let mut mixed_value = evidence(now, "USD", "codex");
+    for sample in mixed_value["samples"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .skip(3)
+    {
+        sample["currency"] = Value::String("EUR".into());
+    }
+    sb.write("mixed.json", &serde_json::to_string(&mixed_value).unwrap());
+    let mixed = sb.mpd(&["routing", "evaluate", "--evidence", "mixed.json"]);
+    assert!(!mixed.status.success());
+    assert!(String::from_utf8_lossy(&mixed.stderr).contains("mixed currencies"));
+
+    let mut outside = evidence(now, "USD", "codex");
+    outside["samples"][0]["persona"] = Value::String("Architect".into());
+    sb.write("outside.json", &serde_json::to_string(&outside).unwrap());
+    let outside = sb.mpd(&["routing", "evaluate", "--evidence", "outside.json"]);
+    assert!(!outside.status.success());
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("outside the reviewed allowlist"));
+
+    let mut hostile = evidence(now, "USD", "codex");
+    hostile["samples"][0]["harness"] = Value::String("codex\u{1b}[31m".into());
+    sb.write("hostile.json", &serde_json::to_string(&hostile).unwrap());
+    let hostile = sb.mpd(&["routing", "evaluate", "--evidence", "hostile.json"]);
+    assert!(!hostile.status.success());
+    assert!(String::from_utf8_lossy(&hostile.stderr).contains("unsafe harness identifier"));
+}
+
+/// Stage 7 acceptance: cache inventory is read-only and recognises a complete
+/// unreferenced candidate pair as prunable without treating it as a reference.
+#[test]
+fn cache_inspect_is_read_only_and_reports_a_complete_unreferenced_pair() {
+    let sb = Sandbox::new("cache-inspect");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    let id = "a".repeat(64);
+    let cache_root = sb.dir.join(".git/mpd");
+    let candidates = cache_root.join("candidates");
+    let records = cache_root.join("candidate-records");
+    std::fs::create_dir_all(candidates.join(&id)).unwrap();
+    std::fs::create_dir_all(&records).unwrap();
+    std::fs::write(records.join(format!("{id}.json")), "{}\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [&cache_root, &candidates, &records, &candidates.join(&id)] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::set_permissions(
+            records.join(format!("{id}.json")),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let sidecar_before = std::fs::read(records.join(format!("{id}.json"))).unwrap();
+    let inspected = sb.mpd(&["cache", "inspect", "--json"]);
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspection = json(&inspected);
+    assert_eq!(inspection["entries"][0]["id"], id);
+    assert_eq!(inspection["entries"][0]["disposition"]["state"], "prunable");
+    assert_eq!(
+        std::fs::read(records.join(format!("{id}.json"))).unwrap(),
+        sidecar_before
+    );
+
+    let preview = sb.mpd(&["cache", "prune", "--json"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(candidates.join(&id).is_dir(), "preview must be read-only");
+    assert!(
+        records.join(format!("{id}.json")).is_file(),
+        "preview must retain sidecar"
+    );
+}
+
 /// D8: `--introduced-by` validates before anything is created (no ledger, no
 /// scaffold, no `.mpd/current` change on an unresolvable target), then a
 /// valid link persists, surfaces in `mpd status`, and is grouped by

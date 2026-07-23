@@ -185,6 +185,9 @@ enum Command {
         /// Explicitly reuse an exact, valid executed evidence receipt.
         #[arg(long)]
         reuse: Option<String>,
+        /// Bounded exact-attempt usage and review-session attestation.
+        #[arg(long)]
+        attestation: Option<PathBuf>,
     },
     /// Record a bounded human decision before an excess review attempt.
     Reconcile {
@@ -280,6 +283,16 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Evaluate or preview/apply reviewed offline model-routing evidence.
+    Routing {
+        #[command(subcommand)]
+        command: RoutingCommand,
+    },
+    /// Inspect or explicitly prune identity-verified orphan candidate cache entries.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     /// One-time first trusted-policy adoption helpers. These commands never
     /// run configured validation profiles; they only inventory or reconcile
     /// explicitly reviewed checkpoint state.
@@ -312,6 +325,9 @@ enum Command {
     /// the exact materialized subject and executes no Git, profile, or tool.
     #[command(name = "__mpd-static-policy-check", hide = true)]
     InternalStaticPolicyCheck,
+    /// Internal finite documentation/doctrine check for the trusted docs lane.
+    #[command(name = "__mpd-doc-check", hide = true)]
+    InternalDocCheck,
     /// Fold a completed change's specs into the record and archive it. Also
     /// recovers/closes an interrupted archive closure (`--recover`/`--close`).
     Archive {
@@ -464,6 +480,38 @@ enum PolicyCommand {
         hooks: PathBuf,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RoutingCommand {
+    Evaluate {
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    Apply {
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    Inspect {
+        #[arg(long)]
+        json: bool,
+    },
+    Prune {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -714,6 +762,7 @@ pub fn run() -> i32 {
             failure_class,
             exploit,
             reuse,
+            attestation,
         } => cmd_gate(
             phase,
             change,
@@ -726,6 +775,7 @@ pub fn run() -> i32 {
             failure_class,
             exploit,
             reuse,
+            attestation,
         ),
         Command::Reconcile {
             continue_reason,
@@ -757,6 +807,8 @@ pub fn run() -> i32 {
         Command::Identity { path, json } => cmd_identity(path, json),
         Command::Hook { command } => cmd_hook(command),
         Command::Policy { command } => cmd_policy(command),
+        Command::Routing { command } => cmd_routing(command),
+        Command::Cache { command } => cmd_cache(command),
         #[cfg(test)]
         Command::FirstAdoption { command } => cmd_first_adoption(command),
         Command::InternalLimitedExec {
@@ -797,6 +849,18 @@ pub fn run() -> i32 {
             let root = find_root()?;
             crate::local_validation::static_policy_check(&root)?;
             println!("static validation policy: PASS");
+            Ok(0)
+        })(),
+        Command::InternalDocCheck => (|| -> CmdResult {
+            let root = find_root()?;
+            let result = crate::recovery::check_repository_doctrine(&root)?;
+            if !result.is_valid() {
+                return Err(format!(
+                    "documentation doctrine check failed: {}",
+                    result.errors.join("; ")
+                ));
+            }
+            println!("documentation doctrine: PASS");
             Ok(0)
         })(),
         // `--recover`/`--close` route to the closure logic HERE, ahead of
@@ -2016,6 +2080,7 @@ fn enforce_freshness_before_effects(
 
 fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     let root = find_root()?;
+    let current_selection = crate::recovery::inspect_current(&root);
     let change = resolve_change(&root, change)?;
     let ledger = ledger::load(&root, &change).map_err(|e| e.to_string())?;
     let config = Config::load(&root);
@@ -2090,6 +2155,11 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
         coherence.as_ref(),
         parity.as_ref(),
     );
+    let economics = governance_economics_report(&ledger, &config);
+    let attestation_state = config
+        .governance_economics
+        .as_ref()
+        .map(|policy| crate::attestation::readiness(&policy.attestation, false));
 
     if json {
         let gates: serde_json::Map<String, serde_json::Value> = ledger
@@ -2104,6 +2174,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             .collect();
         let v = serde_json::json!({
             "change": ledger.change,
+            "current_selection": current_selection,
             "ui": ledger.ui,
             "phase": ledger.phase.slug(),
             "stored_phase": freshness.stored_phase.slug(),
@@ -2127,6 +2198,8 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             "commit_coherence": coherence.as_ref().map(|c| serde_json::json!({"coherent":c.coherent,"head":c.head,"ready_to_commit":c.ready_to_commit,"blockers":c.blockers})),
             "remote_parity": parity,
             "workflow": workflow,
+            "economics": economics.as_ref().map(|(report, _)| report),
+            "attestation": &attestation_state,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
         return Ok(0);
@@ -2158,6 +2231,14 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
             workflow.gates.outcome.label(),
             harness::terminal_safe(&workflow.next_action)
         );
+        if let Some((report, _)) = &economics {
+            println!(
+                "Efficiency: budget {}, usage {}, provenance {}",
+                economics_budget_state(report),
+                economics_usage_coverage(report),
+                economics_provenance_state(&ledger)
+            );
+        }
         if ready {
             println!("Ready to archive: yes  →  mpd archive --yes");
         } else {
@@ -2176,6 +2257,7 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
     }
 
     println!("Change: {}  (ui: {})", ledger.change, ledger.ui);
+    println!("Current selection: {:?}", current_selection);
     if let Some(origin) = &ledger.introduced_by {
         println!(
             "Introduced by: {} (defect-escape provenance)",
@@ -2191,6 +2273,22 @@ fn cmd_status(change: Option<String>, json: bool, brief: bool) -> CmdResult {
         ledger.next_attempt(ledger.phase),
         risk.effective.attempt_limit()
     );
+    if let Some((report, _)) = &economics {
+        println!(
+            "Efficiency: budget {}, tokens {} ({}/{}) ; wall {} ms ({}/{}) ; provenance {}",
+            economics_budget_state(report),
+            report.tokens.value,
+            report.tokens.coverage.reported_attempts,
+            report.tokens.coverage.applicable_attempts,
+            report.wall_millis.value,
+            report.wall_millis.coverage.reported_attempts,
+            report.wall_millis.coverage.applicable_attempts,
+            economics_provenance_state(&ledger)
+        );
+    }
+    if let Some(state) = &attestation_state {
+        println!("Attestation: {}", render_attestation_state(state));
+    }
     if let Some(kind) = &attempt_authorization {
         println!(
             "Excess attempt {} authorized by {} reconciliation (base limit {}).",
@@ -2407,6 +2505,122 @@ fn print_release_closure_facts(facts: &serde_json::Value) {
     }
 }
 
+fn governance_economics_report(
+    ledger: &ledger::Ledger,
+    config: &Config,
+) -> Option<(crate::economics::EconomicsReport, String)> {
+    let policy = config.governance_economics.as_ref()?;
+    let attempts = ledger.history.iter().map(|event| {
+        let key = ledger::Ledger::attempt_key(event.phase, event.record.attempt);
+        (
+            ledger.usage_records.get(&key),
+            event.record.duration_secs().saturating_mul(1000),
+        )
+    });
+    let report = crate::economics::evaluate(
+        crate::economics::aggregate(attempts),
+        policy.budgets.for_risk(ledger.effective_risk()),
+    );
+    let digest = digest::Digest::of_bytes(
+        &serde_json::to_vec(&report).expect("economics report is serializable"),
+    )
+    .to_hex();
+    Some((report, digest))
+}
+
+fn economics_budget_state(report: &crate::economics::EconomicsReport) -> String {
+    use crate::economics::LimitState;
+    let states = [
+        report.tokens.state,
+        report.active_millis.state,
+        report.wall_millis.state,
+    ]
+    .into_iter()
+    .chain(report.costs.values().map(|metric| metric.state));
+    let mut hard = false;
+    let mut soft = false;
+    let mut unavailable = false;
+    for state in states {
+        hard |= state == LimitState::HardLimit;
+        soft |= state == LimitState::SoftLimit;
+        unavailable |= state == LimitState::Unavailable;
+    }
+    if hard {
+        "HARD_LIMIT".into()
+    } else if soft {
+        "SOFT_LIMIT".into()
+    } else if unavailable {
+        "UNAVAILABLE".into()
+    } else {
+        "WITHIN".into()
+    }
+}
+
+fn economics_usage_coverage(report: &crate::economics::EconomicsReport) -> String {
+    format!("{:?}", report.tokens.coverage.state()).to_ascii_uppercase()
+}
+
+fn economics_provenance_state(ledger: &ledger::Ledger) -> String {
+    if ledger.provenance_records.is_empty() {
+        "UNREPORTED".into()
+    } else if ledger
+        .provenance_records
+        .values()
+        .all(|record| record.state.state == crate::attestation::AttestationVerifierState::Locked)
+    {
+        "AUTHENTICATED".into()
+    } else {
+        "COOPERATIVE".into()
+    }
+}
+
+/// Human status reads this state from a persisted ledger. Keep its bounded
+/// typed code terminal-safe while JSON continues to render structured data.
+fn render_attestation_state(state: &crate::attestation::AttestationState) -> String {
+    let code = state
+        .code
+        .as_deref()
+        .map(harness::terminal_safe)
+        .map(|code| format!(" {code}"))
+        .unwrap_or_default();
+    format!("{:?}{code}", state.state)
+}
+
+fn current_typed_blockers(ledger: &ledger::Ledger) -> Vec<crate::economics::BlockerOutcome> {
+    let mut blockers = Vec::new();
+    for event in ledger.history.iter().rev() {
+        if event.phase != ledger.phase || event.record.verdict != Verdict::Fail {
+            break;
+        }
+        let class = match event.record.failure_class {
+            Some(FailureClass::Infrastructure) => crate::economics::BlockerClass::Infrastructure,
+            Some(FailureClass::Environment) => crate::economics::BlockerClass::Environment,
+            Some(FailureClass::Policy) => crate::economics::BlockerClass::Policy,
+            _ => break,
+        };
+        blockers.push(crate::economics::BlockerOutcome {
+            class,
+            at_epoch_millis: event.record.completed_at_epoch_secs.saturating_mul(1000),
+        });
+    }
+    blockers.reverse();
+    blockers
+}
+
+fn brief_subject_digest(
+    root: &Path,
+    change: &str,
+    ledger: &ledger::Ledger,
+    config: &Config,
+    phase: Phase,
+) -> Result<String, String> {
+    let values = closure::capture_dependency_values(root, change, ledger, config, phase)?;
+    let snapshot = closure::DependencySnapshot::for_phase(phase, &values)
+        .map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?;
+    Ok(digest::Digest::of_bytes(&bytes).to_hex())
+}
+
 fn cmd_next(
     change: Option<String>,
     harness_kind: String,
@@ -2446,10 +2660,20 @@ fn cmd_next(
         }
         return Ok(0);
     }
-    let cfg = Config::load(&root);
+    let cfg = if ledger.strict {
+        Config::load_strict(&root)?
+    } else {
+        Config::load(&root)
+    };
     if enforce_freshness_before_effects(&root, &change, &mut ledger, &observed, &cfg, json)? {
         return Ok(1);
     }
+    // Freshness maintenance may itself persist a risk/freshness update. All
+    // brief-time identity and the final mutation must start from a new exact
+    // image so concurrent `next` calls cannot overwrite one another.
+    let (fresh_ledger, next_observed) =
+        ledger::load_observed_exact(&root, &change).map_err(|error| error.to_string())?;
+    ledger = fresh_ledger;
     let release_closure = release_closure_facts(&root, &change, &ledger);
     if ledger.phase == Phase::Done {
         if json {
@@ -2501,6 +2725,81 @@ fn cmd_next(
             .map(|r| r.kind.label().to_string()),
         page_warning,
     );
+    if ledger.strict {
+        brief.gate_command = strict_gate_command(ledger.phase);
+    }
+    let attempt = ledger.next_attempt(ledger.phase);
+    let governance_enabled = cfg.governance_economics.is_some();
+    let subject_digest = if governance_enabled {
+        let expectation_key = ledger::Ledger::attempt_key(ledger.phase, attempt);
+        if let Some(existing) = ledger.brief_expectations.get(&expectation_key) {
+            if existing.harness != harness_kind || existing.model != brief.model {
+                return Err(
+                    "this exact attempt was already commissioned for a different harness/model"
+                        .into(),
+                );
+            }
+            Some(existing.subject_digest.clone())
+        } else {
+            Some(brief_subject_digest(
+                &root,
+                &change,
+                &ledger,
+                &cfg,
+                ledger.phase,
+            )?)
+        }
+    } else {
+        None
+    };
+    let economics = governance_economics_report(&ledger, &cfg);
+    let mut totals_digest = None;
+    let mut continuation_available = false;
+    if let (Some(policy), Some((report, digest))) =
+        (cfg.governance_economics.as_ref(), economics.as_ref())
+    {
+        totals_digest = Some(digest.clone());
+        continuation_available = ledger.continuations.iter().any(|record| {
+            !record.consumed
+                && record.change == change
+                && record.phase == ledger.phase
+                && record.attempt == attempt
+                && record.totals_digest == *digest
+        });
+        let continuation = continuation_available.then(|| crate::economics::Continuation {
+            change: change.clone(),
+            phase: ledger.phase,
+            attempt,
+            reason: "bounded reconciliation".into(),
+            totals_digest: digest.clone(),
+            consumed: false,
+        });
+        let now_millis = ledger::now_epoch_secs().saturating_mul(1000);
+        let last_advancement = ledger.phase_started_at_epoch_secs.saturating_mul(1000);
+        let anti_stall = crate::economics::anti_stall_decision(
+            &policy.anti_stall,
+            now_millis,
+            last_advancement,
+            &current_typed_blockers(&ledger),
+            continuation.as_ref(),
+        );
+        brief.efficiency = Some(harness::BriefEfficiency {
+            budget_state: economics_budget_state(report),
+            usage_coverage: economics_usage_coverage(report),
+            provenance_state: economics_provenance_state(&ledger),
+        });
+        if report.block_reason.is_some() && !continuation_available {
+            brief.issuance_block = report.block_reason.clone();
+        } else if let crate::economics::BriefDecision::Block(reason) = anti_stall {
+            brief.issuance_block = Some(reason);
+        }
+        if policy.attestation.mode == crate::config::AttestationMode::Required {
+            brief.gate_command.push_str(" --attestation <file>");
+            if policy.attestation.issuers.is_empty() {
+                brief.issuance_block = Some("attestation.not-deployed".into());
+            }
+        }
+    }
 
     // Resolve the phase persona's base directive(s) ONCE (round-4 F4-2), shared
     // with the `--full` display below. `base_modified` (a divergent base directive
@@ -2527,6 +2826,7 @@ fn cmd_next(
     // Record the brief-time weakening determination (config tuning + base_modified)
     // for (phase, attempt), monotonic weakest-seen; only when non-baseline, so an
     // untuned+unmodified project's ledger is byte-unchanged by `next` (Cond 11).
+    let mut ledger_mutated = false;
     {
         let resolved = harness::resolve_tuning_governed(&cfg, ledger.phase, risk.effective);
         let record = ledger::PersonaTuningRecord {
@@ -2537,11 +2837,55 @@ fn cmd_next(
             weakened: resolved.had_append || base_modified,
         };
         if !record.is_baseline() {
-            let attempt = ledger.next_attempt(ledger.phase);
             let phase = ledger.phase;
             ledger.record_brief_tuning(phase, attempt, record);
-            ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
+            ledger_mutated = true;
         }
+    }
+    if let Some(block) = &brief.issuance_block {
+        if json {
+            let mut value = serde_json::to_value(&brief).unwrap_or(serde_json::Value::Null);
+            if let Some(subject_digest) = &subject_digest {
+                value["subject_digest"] = serde_json::Value::String(subject_digest.clone());
+            }
+            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        } else {
+            println!(
+                "BLOCKED {}: new model work was not commissioned; run `mpd status` and record one explicit reconciliation before retrying.",
+                harness::terminal_safe(block)
+            );
+        }
+        return Ok(1);
+    }
+    if let Some(subject_digest) = &subject_digest {
+        ledger.record_brief_expectation(ledger::BriefExpectationV1 {
+            schema: 1,
+            phase: ledger.phase,
+            attempt,
+            harness: harness_kind.clone(),
+            model: brief.model.clone(),
+            subject_digest: subject_digest.clone(),
+            issued_at_epoch_secs: ledger::now_epoch_secs(),
+        })?;
+        ledger_mutated = true;
+    }
+    if continuation_available {
+        ledger.consume_continuation(
+            &change,
+            ledger.phase,
+            attempt,
+            totals_digest
+                .as_deref()
+                .ok_or("continuation totals digest is unavailable")?,
+        )?;
+        ledger_mutated = true;
+    }
+    if ledger_mutated {
+        resolve_candidate_save_outcome(
+            &root,
+            None,
+            ledger::save_exact_observed(&root, &ledger, &next_observed),
+        )?;
     }
     let evidence_hint = ledger
         .history
@@ -2602,7 +2946,10 @@ fn cmd_next(
                 Some((f, _)) => serde_json::Value::String(f.to_string()),
                 None => serde_json::Value::Null,
             };
-            v["gate_command"] = serde_json::Value::String(strict_gate_command(ledger.phase));
+            v["gate_command"] = serde_json::Value::String(brief.gate_command.clone());
+        }
+        if let Some(subject_digest) = &subject_digest {
+            v["subject_digest"] = serde_json::Value::String(subject_digest.clone());
         }
         v["evidence"] = evidence_hint.clone().unwrap_or(serde_json::Value::Null);
         v["release_closure"] = release_closure;
@@ -2868,6 +3215,7 @@ fn execute_strict_candidate_build(
     change: &str,
     expected_policy: &crate::config::LocalValidationConfig,
     profile: &str,
+    reuse_sources: &[crate::local_validation::ValidationReceiptV1],
 ) -> Result<
     (
         PendingCandidateBuild,
@@ -2884,12 +3232,13 @@ fn execute_strict_candidate_build(
     let outcome = (|| {
         pending.captured().rehash(root)?;
         crate::candidate::reopen_candidate(root, pending.capture())?;
-        let validation = crate::local_validation::validate_candidate_profile(
+        let validation = crate::local_validation::validate_candidate_profile_with_sources(
             root,
             pending.captured().root(),
             pending.capture(),
             profile,
             &candidate_policy,
+            reuse_sources,
         )?;
         if let Some(output) = validation.build_output {
             pending.attach_output(output);
@@ -3349,6 +3698,7 @@ fn cmd_gate(
     failure_class: Option<String>,
     exploit: Option<String>,
     reuse: Option<String>,
+    attestation: Option<PathBuf>,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
@@ -3443,7 +3793,7 @@ fn cmd_gate(
     // Freshness maintenance may itself have committed a risk-only ledger
     // update. Start the gate transaction from a new exact file observation so
     // the final compare-and-swap never relies on an image predating that write.
-    let (fresh_ledger, observed) =
+    let (fresh_ledger, mut observed) =
         ledger::load_observed_exact(&root, &change).map_err(|e| e.to_string())?;
     ledger = fresh_ledger;
     let effective_risk = ledger.effective_risk();
@@ -3461,12 +3811,16 @@ fn cmd_gate(
     // Canonical judgment truth is checked for PASS, CONDITIONAL, and FAIL
     // before any objective command or durable mutation. A strict condition is
     // therefore bound to the same authored artifact that declared it.
-    if ledger.strict && phase.judgment_artifact().is_some() {
-        if let Some(message) =
-            strict_artifact_blocking_message(&root, &change, phase, effective_risk, verdict, &actor)
-        {
-            return Ok(gate_blocked(&message));
+    let preflight_judgment_artifact_bytes = if ledger.strict && phase.judgment_artifact().is_some()
+    {
+        match strict_artifact_issues(&root, &change, phase, effective_risk, verdict, &actor) {
+            Ok(bytes) => bytes,
+            Err(message) => return Ok(gate_blocked(&message)),
         }
+    } else {
+        None
+    };
+    if ledger.strict && phase.judgment_artifact().is_some() {
         evidence = validate_evidence(&root, &change, phase, evidence)?;
     }
     let condition_binding = if verdict == Verdict::ConditionalPass && ledger.strict {
@@ -3484,6 +3838,112 @@ fn cmd_gate(
         return Err(format!("attempt {} exceeds the {}-risk limit; run `mpd reconcile --continue \"reason\"` (or narrow/change governance) first", ledger.next_attempt(phase), effective_risk));
     }
     let attempt = ledger.next_attempt(phase);
+    let gate_config = if ledger.strict || attestation.is_some() {
+        Config::load_strict(&root)?
+    } else {
+        Config::load(&root)
+    };
+    let attestation_policy = gate_config
+        .governance_economics
+        .as_ref()
+        .map(|economics| &economics.attestation);
+    let mut verified_attestation = None;
+    if let Some(policy) = attestation_policy {
+        let readiness = crate::attestation::readiness(policy, attestation.is_some());
+        if policy.mode == crate::config::AttestationMode::Required && policy.issuers.is_empty() {
+            return Ok(gate_blocked(
+                "Attestation preflight refused: NOT_DEPLOYED; no reviewed external issuer is activated",
+            ));
+        }
+        if attestation.is_none() && policy.mode == crate::config::AttestationMode::Required {
+            return Ok(gate_blocked(&format!(
+                "Attestation preflight refused: {:?}{}; supply --attestation <file> from a reviewed external issuer",
+                readiness.state,
+                readiness
+                    .code
+                    .as_deref()
+                    .map(|code| format!(" {code}"))
+                    .unwrap_or_default()
+            )));
+        }
+        if let Some(path) = attestation.as_ref() {
+            let key = ledger::Ledger::attempt_key(phase, attempt);
+            let Some(expectation) = ledger.brief_expectations.get(&key).cloned() else {
+                return Ok(gate_blocked(
+                    "Attestation preflight refused: INVALID attestation.signature; run `mpd next` to record the exact brief identity",
+                ));
+            };
+            let envelope = match crate::attestation::read_attestation(&root, path) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    return Ok(gate_blocked(
+                        "Attestation preflight refused: INVALID attestation.signature",
+                    ))
+                }
+            };
+            let artifact_digest = preflight_judgment_artifact_bytes
+                .as_ref()
+                .map(|bytes| digest::Digest::of_bytes(bytes).to_hex())
+                .unwrap_or_else(|| expectation.subject_digest.clone());
+            let private_root =
+                crate::local_validation::git_common_dir(&root)?.join("mpd/attestation-verifier");
+            let binding = crate::attestation::AttestationBinding {
+                change: &change,
+                phase,
+                attempt,
+                actor: &actor,
+                harness: &expectation.harness,
+                model: &expectation.model,
+                artifact_digest: &artifact_digest,
+                subject_digest: &expectation.subject_digest,
+                now_epoch_secs: ledger::now_epoch_secs(),
+                max_age_secs: 60 * 60,
+            };
+            let verified = match crate::attestation::verify_exact_bound(
+                &envelope,
+                &binding,
+                policy,
+                &root,
+                &private_root,
+            ) {
+                Ok(verified) => verified,
+                Err(state) => {
+                    return Ok(gate_blocked(&format!(
+                        "Attestation preflight refused: {:?}{}",
+                        state.state,
+                        state
+                            .code
+                            .as_deref()
+                            .map(|code| format!(" {code}"))
+                            .unwrap_or_default()
+                    )))
+                }
+            };
+            if let Err(code) = ledger.claim_attestation_digest(&verified.usage.evidence_digest) {
+                return Ok(gate_blocked(&format!(
+                    "Attestation preflight refused: REPLAYED {}",
+                    harness::terminal_safe(&code)
+                )));
+            }
+            // Replay consumption is its own exact transaction and deliberately
+            // precedes all objective work. A later test/build failure never
+            // releases this full-history claim.
+            resolve_candidate_save_outcome(
+                &root,
+                None,
+                ledger::save_exact_observed(&root, &ledger, &observed),
+            )?;
+            let (reloaded, new_observed) =
+                ledger::load_observed_exact(&root, &change).map_err(|error| error.to_string())?;
+            ledger = reloaded;
+            observed = new_observed;
+            verified_attestation = Some(verified);
+        }
+    } else if attestation.is_some() {
+        return Ok(gate_blocked(
+            "Attestation preflight refused: INVALID attestation.signature; governance-economics policy is not configured",
+        ));
+    }
     // The persona-tuning stamp for this gate — from the brief `mpd next` recorded
     // for this exact (phase, attempt), else a live fallback (design.md Cond 11).
     // Computed once and applied at BOTH GateRecord sites (reuse + execute, Cond 6).
@@ -3518,17 +3978,7 @@ fn cmd_gate(
         // deterministically, ahead of receipt evaluation. A waiver cannot reach
         // this path (waive + reuse is rejected at the top).
         let reused_judgment_artifact_bytes = if ledger.strict {
-            match strict_artifact_issues(
-                &root,
-                &change,
-                phase,
-                effective_risk,
-                Verdict::Pass,
-                &actor,
-            ) {
-                Ok(bytes) => bytes,
-                Err(msg) => return Ok(gate_blocked(&msg)),
-            }
+            preflight_judgment_artifact_bytes.clone()
         } else {
             None
         };
@@ -3596,6 +4046,24 @@ fn cmd_gate(
         } else {
             None
         };
+        if ledger.strict && phase.judgment_artifact().is_some() {
+            let adjacent = match strict_artifact_issues(
+                &root,
+                &change,
+                phase,
+                effective_risk,
+                Verdict::Pass,
+                &actor,
+            ) {
+                Ok(bytes) => bytes,
+                Err(message) => return Ok(gate_blocked(&message)),
+            };
+            if adjacent != reused_judgment_artifact_bytes {
+                return Ok(gate_blocked(
+                    "strict gate judgment artifact changed after attestation preflight",
+                ));
+            }
+        }
         let receipt = closure::EvidenceReceipt::reused_from(origin_receipt);
         let completed = ledger::now_epoch_secs();
         ledger.record(
@@ -3626,6 +4094,9 @@ fn cmd_gate(
                     .map(|bytes| crate::digest::Digest::of_bytes(bytes).to_hex()),
             },
         )?;
+        if let Some(verified) = verified_attestation {
+            ledger.record_attestation(phase, attempt, verified.usage, verified.provenance)?;
+        }
         // L1 (Security-code): the same exact compare-and-swap the execute
         // path uses (cli.rs ~3973), against the SAME `observed` image taken
         // after freshness maintenance re-loaded the ledger above (~3324) —
@@ -3653,6 +4124,9 @@ fn cmd_gate(
     // call below actually runs for this verdict/phase — never a second read
     // (security-plan.md Condition 5).
     let mut executed_judgment_artifact_bytes: Option<Vec<u8>> = None;
+    if ledger.strict {
+        executed_judgment_artifact_bytes = preflight_judgment_artifact_bytes.clone();
+    }
     // Enforcement: a PASS/CONDITIONAL on a test/secret phase must be backed by
     // a real run — the gate cannot accept the caller's word.
     if verdict.advances() {
@@ -3748,8 +4222,18 @@ fn cmd_gate(
                     if let Err(message) = enforce_prose_secret_scan(&root, &change, &cfg) {
                         return Ok(gate_blocked(&format!("Build gate refused: {message}")));
                     }
-                    let (pending, report) =
-                        execute_strict_candidate_build(&root, &change, local, profile)?;
+                    let reuse_sources: Vec<_> = ledger
+                        .history
+                        .iter()
+                        .filter_map(|event| event.record.validation_receipt.clone())
+                        .collect();
+                    let (pending, report) = execute_strict_candidate_build(
+                        &root,
+                        &change,
+                        local,
+                        profile,
+                        &reuse_sources,
+                    )?;
                     gate_candidate = Some(pending.capture().clone());
                     pending_candidate_build = Some(pending);
                     report
@@ -3774,12 +4258,18 @@ fn cmd_gate(
                     // before and after execution. This is deliberately not a
                     // new capture of the later ambient worktree.
                     crate::candidate::reopen_candidate(&root, &capture)?;
-                    let report = crate::local_validation::validate_candidate_profile(
+                    let reuse_sources: Vec<_> = ledger
+                        .history
+                        .iter()
+                        .filter_map(|event| event.record.validation_receipt.clone())
+                        .collect();
+                    let report = crate::local_validation::validate_candidate_profile_with_sources(
                         &root,
                         Path::new(&capture.clone_private_root),
                         &capture,
                         profile,
                         local,
+                        &reuse_sources,
                     )?;
                     crate::candidate::reopen_candidate(&root, &capture)?;
                     gate_candidate = Some(capture);
@@ -4069,16 +4559,24 @@ fn cmd_gate(
             // omitted. Validation is metadata-only; it never reads content into
             // output (Cond 2).
             evidence = validate_evidence(&root, &change, phase, evidence)?;
-            match strict_artifact_issues(
-                &root,
-                &change,
-                phase,
-                effective_risk,
-                Verdict::Pass,
-                &actor,
-            ) {
-                Ok(bytes) => executed_judgment_artifact_bytes = bytes,
-                Err(msg) => return Ok(gate_blocked(&msg)),
+            if phase.judgment_artifact().is_some() {
+                let adjacent = match strict_artifact_issues(
+                    &root,
+                    &change,
+                    phase,
+                    effective_risk,
+                    Verdict::Pass,
+                    &actor,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(message) => return Ok(gate_blocked(&message)),
+                };
+                if adjacent.as_ref() != preflight_judgment_artifact_bytes.as_ref() {
+                    return Ok(gate_blocked(
+                        "strict gate judgment artifact changed after attestation preflight",
+                    ));
+                }
+                executed_judgment_artifact_bytes = adjacent;
             }
         }
     }
@@ -4141,6 +4639,9 @@ fn cmd_gate(
                 .map(|bytes| crate::digest::Digest::of_bytes(bytes).to_hex()),
         },
     )?;
+    if let Some(verified) = verified_attestation {
+        ledger.record_attestation(phase, attempt, verified.usage, verified.provenance)?;
+    }
     if verdict == Verdict::ConditionalPass {
         let opener = phase.persona().name.to_string();
         let (condition_evidence, condition_evidence_digest) =
@@ -4257,7 +4758,19 @@ fn cmd_reconcile(
             ReconciliationKind::Continue | ReconciliationKind::Narrow => {}
         }
     }
+    let continuation_reason = matches!(kind, ReconciliationKind::Continue).then(|| reason.clone());
+    let continuation_totals = if continuation_reason.is_some() {
+        governance_economics_report(&ledger, &Config::load_strict(&root)?).map(|(_, digest)| digest)
+    } else {
+        None
+    };
     ledger.reconcile(kind, reason, value)?;
+    if let (Some(reason), Some(totals_digest)) = (
+        continuation_reason.as_deref(),
+        continuation_totals.as_deref(),
+    ) {
+        ledger.record_continuation(reason, totals_digest)?;
+    }
     ledger::save(&root, &ledger).map_err(|e| e.to_string())?;
     println!("Recorded reconciliation for {} attempt {}. Current governance: risk {}, threat profile {}.", ledger.phase.label(), ledger.next_attempt(ledger.phase), ledger.governance.risk, ledger.governance.threat_profile);
     Ok(0)
@@ -8727,10 +9240,11 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
         .as_ref()
         .map(|r| githooks::is_git_repo(r))
         .unwrap_or(false);
-    let hook = root
+    let hook_installation = root
         .as_ref()
-        .map(|r| githooks::is_installed(r))
-        .unwrap_or(false);
+        .map(|r| githooks::inspect_installation(r))
+        .unwrap_or(githooks::HookInstallation::NotApplicable);
+    let hook = hook_installation.is_installed();
     let gitleaks = checks::tool_available("gitleaks");
     let semgrep = checks::tool_available("semgrep");
     let configured = root.as_ref().map(|r| Config::load(r));
@@ -8784,6 +9298,7 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
             "directives_installed": directives_ok,
             "git_repo": git,
             "pre_commit_hook": hook,
+            "pre_commit_hook_state": hook_installation.label(),
             "secret_scanner_floor": "builtin",
             "gitleaks": gitleaks,
             "semgrep": semgrep,
@@ -8823,7 +9338,11 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
     println!("  mpd schema:          {}", yn(schema_ok));
     println!("  directives:          {}", yn(directives_ok));
     println!("  git repo:            {}", yn(git));
-    println!("  pre-commit gate:     {}", yn(hook));
+    println!(
+        "  pre-commit gate:     {} ({})",
+        yn(hook),
+        hook_installation.label()
+    );
     println!("  secret scanner:      builtin (always-on floor)");
     println!("  gitleaks available:  {}", yn(gitleaks));
     println!("  semgrep available:   {}", yn(semgrep));
@@ -8895,26 +9414,317 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
     Ok(0)
 }
 
+fn routing_context(
+    root: &Path,
+    evidence_path: &Path,
+) -> Result<
+    (
+        Config,
+        crate::routing::RoutingEvidenceV1,
+        crate::routing::RoutingEvaluationInput,
+        String,
+    ),
+    String,
+> {
+    let config_path = root.join(".mpd/config.json");
+    let config_bytes =
+        openspec_core::read_contained_capped(root, &config_path, openspec_core::DEFAULT_MAX_BYTES)
+            .map_err(|error| format!("routing config is unavailable: {error}"))?;
+    let config_digest = digest::Digest::of_bytes(config_bytes.as_bytes()).to_hex();
+    let config = Config::load_strict(root)?;
+    let policy = config
+        .routing
+        .as_ref()
+        .ok_or("routing policy is not configured")?;
+    policy.validate()?;
+    let evidence_bytes = openspec_core::read_contained_capped(root, evidence_path, 1024 * 1024)
+        .map_err(|error| format!("routing evidence is unavailable: {error}"))?;
+    let evidence = crate::routing::RoutingEvidenceV1::parse(evidence_bytes.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let allowed_targets: std::collections::BTreeSet<_> =
+        policy.allowed_targets.iter().cloned().collect();
+    let mut current_routes = std::collections::BTreeMap::new();
+    for target in &allowed_targets {
+        let model = config
+            .models
+            .get(&target.harness)
+            .and_then(|routes| routes.get(&target.persona))
+            .ok_or_else(|| {
+                format!(
+                    "reviewed routing target {}/{} is not an existing model entry",
+                    target.harness, target.persona
+                )
+            })?;
+        current_routes.insert(target.clone(), model.clone());
+    }
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "routing clock is unavailable")?
+        .as_secs();
+    let input = crate::routing::RoutingEvaluationInput {
+        now_unix_secs,
+        maximum_age_secs: policy.maximum_age_secs,
+        minimum_samples: policy.minimum_samples,
+        required_targets: allowed_targets.clone(),
+        allowed_targets,
+        current_routes,
+    };
+    Ok((config, evidence, input, config_digest))
+}
+
+fn cmd_routing(command: RoutingCommand) -> CmdResult {
+    let root = find_root()?;
+    let (evidence_path, apply, yes, json) = match command {
+        RoutingCommand::Evaluate { evidence, json } => (evidence, false, false, json),
+        RoutingCommand::Apply {
+            evidence,
+            yes,
+            json,
+        } => (evidence, true, yes, json),
+    };
+    let evidence_path = if evidence_path.is_absolute() {
+        evidence_path
+    } else {
+        root.join(evidence_path)
+    };
+    let (mut config, evidence, input, config_digest) = routing_context(&root, &evidence_path)?;
+    let evaluation =
+        crate::routing::evaluate(&evidence, &input).map_err(|error| error.to_string())?;
+    if !apply {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&evaluation).map_err(|e| e.to_string())?
+            );
+        } else {
+            println!("Routing evidence: CURRENT");
+            println!("Evidence digest: {}", evaluation.evidence_digest);
+            println!("Decision: {:?}", evaluation.decision);
+        }
+        return Ok(0);
+    }
+    let plan = crate::routing::preview_apply(&evaluation, &config_digest, &input)
+        .map_err(|error| error.to_string())?;
+    if !yes {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?
+            );
+        } else {
+            println!("Routing apply preview (no write):");
+            println!("  evidence: {}", plan.evidence_digest);
+            for update in &plan.updates {
+                println!(
+                    "  {}/{}: {} -> {}",
+                    update.target.harness,
+                    update.target.persona,
+                    update.from_model,
+                    update.to_model
+                );
+            }
+            println!("Re-run with --yes to apply this reviewed preview.");
+        }
+        return Ok(0);
+    }
+
+    let lock_dir = root.join(".mpd/tmp");
+    openspec_core::assert_contained(&root, &lock_dir)
+        .map_err(|error| format!("unsafe routing lock directory: {error}"))?;
+    std::fs::create_dir_all(&lock_dir)
+        .map_err(|error| format!("cannot create routing lock directory: {error}"))?;
+    let lock_path = lock_dir.join("routing-config.lock");
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|error| format!("routing config is concurrently locked: {error}"))?;
+    drop(lock);
+    let write_result = (|| -> Result<(), String> {
+        let observed_config = openspec_core::read_contained_capped(
+            &root,
+            &root.join(".mpd/config.json"),
+            openspec_core::DEFAULT_MAX_BYTES,
+        )
+        .map_err(|error| format!("routing config changed or disappeared: {error}"))?;
+        let observed_evidence =
+            openspec_core::read_contained_capped(&root, &evidence_path, 1024 * 1024)
+                .map_err(|error| format!("routing evidence changed or disappeared: {error}"))?;
+        let observed_evidence_digest =
+            crate::routing::RoutingEvidenceV1::parse(observed_evidence.as_bytes())
+                .map_err(|error| error.to_string())?
+                .digest()
+                .map_err(|error| error.to_string())?;
+        crate::routing::revalidate_apply_plan(
+            &plan,
+            &digest::Digest::of_bytes(observed_config.as_bytes()).to_hex(),
+            &observed_evidence_digest,
+            &input,
+        )
+        .map_err(|error| error.to_string())?;
+        for update in &plan.updates {
+            let model = config
+                .models
+                .get_mut(&update.target.harness)
+                .and_then(|routes| routes.get_mut(&update.target.persona))
+                .ok_or("reviewed routing target disappeared before write")?;
+            if model != &update.from_model {
+                return Err("routing model changed after preview".into());
+            }
+            *model = update.to_model.clone();
+        }
+        config
+            .routing
+            .as_mut()
+            .ok_or("routing policy disappeared before write")?
+            .applied_evidence_digest = Some(plan.evidence_digest.clone());
+        config.save(&root).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    let cleanup = std::fs::remove_file(&lock_path)
+        .map_err(|error| format!("routing lock cleanup failed: {error}"));
+    write_result?;
+    cleanup?;
+    println!(
+        "Applied reviewed routing evidence {}.",
+        plan.evidence_digest
+    );
+    Ok(0)
+}
+
+fn collect_cache_references(root: &Path) -> Result<crate::cache::CacheReferences, String> {
+    let mut references = crate::cache::CacheReferences::default();
+    let state_dir = root.join(".mpd/state");
+    let mut entries = std::fs::read_dir(&state_dir)
+        .map_err(|error| format!("cannot enumerate ledger state: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot enumerate ledger state: {error}"))?;
+    if entries.len() > 10_000 {
+        return Err("ledger inventory exceeds cache reference cap".into());
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let file_name = entry.file_name();
+        let Some(change) = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        openspec_core::validate_change_name(change)?;
+        let ledger = ledger::load(root, change)
+            .map_err(|error| format!("cannot load ledger {change:?}: {error}"))?;
+        for record in ledger
+            .gates
+            .values()
+            .chain(ledger.history.iter().map(|event| &event.record))
+        {
+            if let Some(candidate) = &record.candidate {
+                references
+                    .candidate_ids
+                    .insert(candidate.subject.id.clone());
+            }
+            if let Some(output) = &record.build_output {
+                if let Some(candidate) = &output.candidate_id {
+                    references.candidate_ids.insert(candidate.clone());
+                }
+            }
+        }
+        if let Some(candidate) = ledger
+            .archive_closure
+            .as_ref()
+            .and_then(|closure| closure.candidate_id.as_ref())
+        {
+            references.candidate_ids.insert(candidate.clone());
+        }
+    }
+    Ok(references)
+}
+
+fn cmd_cache(command: CacheCommand) -> CmdResult {
+    let root = find_root()?;
+    let references = collect_cache_references(&root)?;
+    let (prune, yes, json) = match command {
+        CacheCommand::Inspect { json } => (false, false, json),
+        CacheCommand::Prune { yes, json } => (true, yes, json),
+    };
+    let recovery = if prune && yes {
+        crate::cache::recover(&root, &references)
+    } else {
+        Vec::new()
+    };
+    // Confirmed prune recovers bounded interrupted transactions first, then
+    // obtains a fresh preview. Recovery outcomes never masquerade as entries
+    // selected by this invocation's new inspection.
+    let inspection = crate::cache::inspect(&root, &references);
+    if !prune || !yes {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inspection).map_err(|e| e.to_string())?
+            );
+        } else {
+            println!("Candidate cache inspection (read-only):");
+            println!("  entries: {}", inspection.entries.len());
+            println!("  truncated: {}", inspection.truncated);
+            if let Some(blocker) = &inspection.scan_blocker {
+                println!("  BLOCKED: {}", harness::terminal_safe(blocker));
+            }
+            if prune {
+                println!("Re-run with --yes to prune only previewed orphan entries.");
+            }
+        }
+        return Ok(0);
+    }
+    if inspection.truncated || inspection.scan_blocker.is_some() {
+        return Err("candidate cache prune blocked by incomplete inspection".into());
+    }
+    let outcomes: Vec<_> = inspection
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.disposition, crate::cache::CacheDisposition::Prunable))
+        .map(|entry| crate::cache::prune(&root, entry, &references))
+        .collect();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "recovery": recovery,
+                "prune": outcomes,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("Candidate cache recovery outcomes: {}", recovery.len());
+        println!("Candidate cache prune outcomes: {}", outcomes.len());
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         archived_closure_fallback_scope, bounded_record_hint, canonical_artifact_actor,
         canonical_artifact_verdict, change_name_from_dated_archive_dir, check_documentation,
-        check_sections, closure_recovery_hint, current_validation_status, dated_archive_matches,
-        doctor_expected_pending_remote, doctor_installed_deploy_health,
+        check_sections, closure_recovery_hint, current_typed_blockers, current_validation_status,
+        dated_archive_matches, doctor_expected_pending_remote, doctor_installed_deploy_health,
+        economics_budget_state, economics_provenance_state, economics_usage_coverage,
         enforce_landing_commit_scope, enforce_prose_secret_scan, enforce_scope_drift,
         evaluate_strict_objective_reuse, extract_section, gitleaks_lane_verdict,
         has_unfilled_placeholder, is_phase_judgment_artifact, is_valid_date_prefix, parse_exploit,
-        receipt_failure_fact, removed_manifest_change_name, require_closure_plan,
-        resolve_runtime_head, resolve_runtime_ledger, retained_candidate_for_objective_gate,
-        revalidate_recorded_build_output, runtime_doctor_findings_with_receipt, sandbox_blocker,
-        stages_removal_of, strict_actor_separation_issue, strict_gate_command, union_closure_scope,
+        receipt_failure_fact, removed_manifest_change_name, render_attestation_state,
+        require_closure_plan, resolve_runtime_head, resolve_runtime_ledger,
+        retained_candidate_for_objective_gate, revalidate_recorded_build_output,
+        runtime_doctor_findings_with_receipt, sandbox_blocker, stages_removal_of,
+        strict_actor_separation_issue, strict_gate_command, union_closure_scope,
         upstream_artifact_pointers, validate_candidate_report_binding, validate_evidence,
         validate_introduced_by, validate_origin_receipt_candidate_binding,
         verify_judgment_artifact_digest, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
     };
     use crate::closure;
-    use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, RiskLevel, Verdict};
+    use crate::ledger::{
+        self, ChangeKind, CheckSummary, FailureClass, GateEvent, GateRecord, RiskLevel, Verdict,
+    };
     use crate::phase::{Applicability, Phase};
     use clap::Parser as _;
     use proptest::prelude::*;
@@ -11994,6 +12804,8 @@ mod tests {
             count: Some(1),
             duration_millis: 1,
             log_digest: "2".repeat(64),
+            check_digest: "3".repeat(64),
+            disposition: crate::local_validation::ValidationDispositionV1::Executed,
         }];
         let (validation, containment) =
             current_validation_status("build", "receipt", &sandbox, &results, "passed", false);
@@ -12184,6 +12996,116 @@ mod tests {
             "security-code.md#Findings",
             "the own artifact (anchor stripped for resolution) is recorded verbatim"
         );
+    }
+
+    #[test]
+    fn shared_economics_and_attestation_projections_keep_missing_distinct_from_zero() {
+        let zero = crate::attestation::UsageRecord {
+            schema: 1,
+            evidence_digest: "a".repeat(64),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            active_millis: 0,
+            currency: None,
+            cost_micros: None,
+            reported: true,
+        };
+        let explicit_zero = crate::economics::evaluate(
+            crate::economics::aggregate([(Some(&zero), 0)]),
+            &crate::config::BudgetLimits::default(),
+        );
+        let missing = crate::economics::evaluate(
+            crate::economics::aggregate([(None, 0)]),
+            &crate::config::BudgetLimits::default(),
+        );
+        assert_eq!(economics_usage_coverage(&explicit_zero), "COMPLETE");
+        assert_eq!(economics_budget_state(&explicit_zero), "WITHIN");
+        assert_eq!(economics_usage_coverage(&missing), "UNREPORTED");
+        // No configured budget means missing evidence is not fabricated as an
+        // overrun; coverage remains the distinct UNREPORTED state above.
+        assert_eq!(economics_budget_state(&missing), "WITHIN");
+
+        let state = crate::attestation::AttestationState {
+            state: crate::attestation::AttestationVerifierState::Blocked,
+            code: Some("attestation.verifier-drift\u{1b}[31m\u{7}".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::json!({
+                "state": "BLOCKED",
+                "code": "attestation.verifier-drift\u{1b}[31m\u{7}",
+            })
+        );
+        let human = render_attestation_state(&state);
+        assert_eq!(human, "Blocked attestation.verifier-drift[31m");
+        assert!(!human.contains('\u{1b}'));
+        assert!(!human.contains('\u{7}'));
+        assert!(
+            !human.contains("\u{1b}["),
+            "human output deliberately uses no ANSI/NO_COLOR-dependent styling"
+        );
+
+        let mut ledger = ledger::Ledger::new("provenance", "schema", false, ChangeKind::Feature);
+        assert_eq!(economics_provenance_state(&ledger), "UNREPORTED");
+        ledger.provenance_records.insert(
+            "architecture:1".into(),
+            crate::attestation::ProvenanceRecord {
+                schema: 1,
+                evidence_digest: "c".repeat(64),
+                issuer: "cooperative".into(),
+                key_id: "none".into(),
+                session_id_digest: "d".repeat(64),
+                state: crate::attestation::AttestationState {
+                    state: crate::attestation::AttestationVerifierState::Cooperative,
+                    code: None,
+                },
+            },
+        );
+        assert_eq!(economics_provenance_state(&ledger), "COOPERATIVE");
+        ledger
+            .provenance_records
+            .get_mut("architecture:1")
+            .unwrap()
+            .state
+            .state = crate::attestation::AttestationVerifierState::Locked;
+        assert_eq!(economics_provenance_state(&ledger), "AUTHENTICATED");
+    }
+
+    #[test]
+    fn typed_blockers_and_one_use_continuation_have_a_bounded_lifecycle() {
+        let mut ledger = ledger::Ledger::new("bounded", "schema", false, ChangeKind::Feature);
+        ledger.phase = Phase::Architecture;
+        for (attempt, class) in [
+            (1, FailureClass::Infrastructure),
+            (2, FailureClass::Environment),
+        ] {
+            let mut record = doctor_gate_record();
+            record.verdict = Verdict::Fail;
+            record.attempt = attempt;
+            record.failure_class = Some(class);
+            record.completed_at_epoch_secs = attempt as u64;
+            ledger.history.push(GateEvent {
+                phase: Phase::Architecture,
+                record,
+            });
+        }
+        assert_eq!(current_typed_blockers(&ledger).len(), 2);
+        let totals = "b".repeat(64);
+        ledger
+            .record_continuation("bounded retry", &totals)
+            .unwrap();
+        let continuation = ledger.continuations.last().unwrap();
+        assert_eq!(continuation.phase, Phase::Architecture);
+        assert_eq!(continuation.attempt, 3);
+        assert!(!continuation.consumed);
+        ledger
+            .consume_continuation("bounded", Phase::Architecture, 3, &totals)
+            .unwrap();
+        assert!(ledger.continuations.last().unwrap().consumed);
+        assert!(ledger
+            .consume_continuation("bounded", Phase::Architecture, 3, &totals)
+            .is_err());
     }
 
     proptest! {

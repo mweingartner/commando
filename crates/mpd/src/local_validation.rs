@@ -2439,6 +2439,28 @@ pub struct ValidationCheckResult {
     pub count: Option<u64>,
     pub duration_millis: u64,
     pub log_digest: String,
+    /// Digest of every result-affecting input for this individual check.
+    /// Legacy receipts decode with an empty value and remain readable, but an
+    /// empty identity is never eligible as a reuse source.
+    #[serde(default)]
+    pub check_digest: String,
+    /// Whether this check executed for this receipt or reused one exact,
+    /// passing executed origin. Legacy results are conservatively classified
+    /// as executed, but their absent `check_digest` prevents reuse.
+    #[serde(default)]
+    pub disposition: ValidationDispositionV1,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ValidationDispositionV1 {
+    #[default]
+    Executed,
+    Reused {
+        source_receipt_id: String,
+        source_check_digest: String,
+        source_duration_millis: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4131,6 +4153,7 @@ fn run_promotion_profile(
             trusted_oid,
             trusted_digest,
             started,
+            &[],
         )
     })();
     let cleanup = remove_owned_tree(&materialized.root, &materialized.identity).map_err(|error| {
@@ -6903,12 +6926,31 @@ pub fn load_candidate_policy(
 /// This path never materializes HEAD and never publishes a Git note or Commit
 /// receipt. The returned Build output, when applicable, is exported outside
 /// the projection and bound to the exact candidate ID.
+#[allow(dead_code)]
 pub fn validate_candidate_profile(
     root: &Path,
     candidate_root: &Path,
     capture: &crate::candidate::CandidateCapture,
     profile: &str,
     expected_policy: &LocalValidationConfig,
+) -> Result<CandidateProfileValidation, String> {
+    validate_candidate_profile_with_sources(
+        root,
+        candidate_root,
+        capture,
+        profile,
+        expected_policy,
+        &[],
+    )
+}
+
+pub fn validate_candidate_profile_with_sources(
+    root: &Path,
+    candidate_root: &Path,
+    capture: &crate::candidate::CandidateCapture,
+    profile: &str,
+    expected_policy: &LocalValidationConfig,
+    reuse_sources: &[ValidationReceiptV1],
 ) -> Result<CandidateProfileValidation, String> {
     if candidate_root.to_str() != Some(capture.clone_private_root.as_str()) {
         return Err("candidate profile root does not match its compact binding".into());
@@ -6937,6 +6979,7 @@ pub fn validate_candidate_profile(
                 trusted_oid,
                 trusted_digest,
                 started,
+                reuse_sources,
             )
         },
     )
@@ -7014,7 +7057,7 @@ where
             }
         };
         let mut owned_build_output = None;
-        if report.status == "passed" && profile == candidate_policy.gates.build {
+        if report.status == "passed" && profile_produces_build_output(profile, &candidate_policy) {
             let contract = candidate_policy
                 .build_output
                 .as_ref()
@@ -7120,6 +7163,7 @@ fn validate_profile_inner(
             &trusted_oid,
             &trusted_digest,
             started,
+            &[],
         )
     })();
     let cleanup = remove_owned_tree(&materialized.root, &materialized.identity).map_err(|error| {
@@ -7168,6 +7212,7 @@ fn run_profile(
     trusted_oid: &str,
     trusted_digest: &str,
     started: u64,
+    reuse_sources: &[ValidationReceiptV1],
 ) -> Result<ValidationReport, String> {
     let effective_checks = config.effective_checks(profile_name)?;
     let authority_digest = sandbox_authority_digest(subject, config, profile_name)?;
@@ -7226,6 +7271,54 @@ fn run_profile(
         .get("advisory-db")
         .cloned()
         .ok_or("preflight omitted advisory digest")?;
+    let checks_bytes =
+        serde_json::to_vec(&effective_checks).map_err(|e| format!("cannot encode checks: {e}"))?;
+    let checks_digest = Digest::of_bytes(&checks_bytes).to_hex();
+    let policy_digest = Digest::of_bytes(&canonical_policy_bytes(config)?).to_hex();
+    let sandbox_inputs = sandbox_receipt_inputs(adapter, config)?;
+    // The reusable-input key intentionally excludes result/timing/run-specific
+    // fields. Construct it before any child starts so a prior exact receipt can
+    // supply individual executed checks without weakening the current profile.
+    let expected_reuse_identity = ValidationReceiptV1 {
+        schema: VALIDATION_SCHEMA,
+        id: String::new(),
+        subject: subject.clone(),
+        profile: profile_name.into(),
+        config_digest: policy_digest.clone(),
+        checks_digest: checks_digest.clone(),
+        trusted_policy_oid: trusted_oid.into(),
+        trusted_before_policy_digest: trusted_digest.into(),
+        candidate_policy_digest: policy_digest.clone(),
+        effective_policy_digest: policy_digest.clone(),
+        sandbox: SandboxReceiptBindingV1 {
+            contract_version: config.sandbox.contract_version,
+            adapter_digest: sandbox.into(),
+            profile_digest: sandbox_inputs.profile_digest.clone(),
+            environment_keys: sandbox_inputs.environment_keys.clone(),
+            certified_host: sandbox_inputs.certified_host.clone(),
+            adapter_abi_digest: sandbox_inputs.adapter_abi_digest.clone(),
+            canary_contract_digest: sandbox_inputs.canary_contract_digest.clone(),
+            residual_limitations: sandbox_inputs.residual_limitations.clone(),
+            run_request_digests: Vec::new(),
+            run_authority_digests: Vec::new(),
+            run_root_inventory_digests: Vec::new(),
+            run_canary_digests: Vec::new(),
+        },
+        validation_contract_version: 1,
+        validator_version: env!("CARGO_PKG_VERSION").into(),
+        validator_digest: validator_digest.clone(),
+        platform: platform_receipt_binding(config),
+        toolchain: toolchain_receipt_binding(config),
+        cargo_lock_digest: cargo_lock_digest.clone(),
+        advisory: advisory_receipt_binding(config, advisory_lock_digest.clone()),
+        tool_policy_digest: digest_json(&config.tools)?,
+        tool_digests: tools.clone(),
+        results: Vec::new(),
+        started_epoch_secs: 0,
+        completed_epoch_secs: 0,
+        outcome: "passed".into(),
+        build_output: None,
+    };
     let mut failed = false;
     // Console-only diagnostic for the first failing check (name, exit, and a
     // bounded terminal-safe output tail). Raw child bytes remain transient:
@@ -7238,6 +7331,28 @@ fn run_profile(
             .checks
             .get(name)
             .ok_or("profile references missing check")?;
+        let check_digest = digest_json(&(
+            VALIDATION_SCHEMA,
+            subject,
+            profile_name,
+            name,
+            check,
+            tools.get(&check.program),
+            trusted_oid,
+            trusted_digest,
+            sandbox,
+            &validator_digest,
+            config,
+        ))?;
+        let check_reuse_allowed = check_reuse_allowed(subject, profile_name, check.kind, config);
+        if !failed && check_reuse_allowed {
+            if let Some(reused) =
+                reuse_exact_check(&expected_reuse_identity, reuse_sources, name, &check_digest)?
+            {
+                results.push(reused);
+                continue;
+            }
+        }
         if failed {
             results.push(ValidationCheckResult {
                 name: name.clone(),
@@ -7247,6 +7362,8 @@ fn run_profile(
                 count: None,
                 duration_millis: 0,
                 log_digest: Digest::of_bytes(b"").to_hex(),
+                check_digest,
+                disposition: ValidationDispositionV1::Executed,
             });
             continue;
         }
@@ -7339,7 +7456,7 @@ fn run_profile(
             && result_policy_passes(&check.result_policy, count, &stdout, &stderr);
         if policy_passed
             && matches!(check.kind, crate::config::CheckKind::ReleaseBuild)
-            && profile_name == config.gates.build
+            && profile_produces_build_output(profile_name, config)
         {
             let configured = config
                 .build_output
@@ -7376,14 +7493,11 @@ fn run_profile(
             count,
             duration_millis: began.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             log_digest,
+            check_digest,
+            disposition: ValidationDispositionV1::Executed,
         });
         if !policy_passed && profile_failure.is_none() {
-            let source = if stderr.is_empty() { &stdout } else { &stderr };
-            let tail_start = source.len().saturating_sub(512);
-            let tail =
-                crate::harness::terminal_safe(&String::from_utf8_lossy(&source[tail_start..]))
-                    .trim()
-                    .to_string();
+            let tail = bounded_failure_output(&stdout, &stderr);
             profile_failure = Some(format!(
                 "check {name:?} {state} (exit {exit:?}; output tail: {tail})"
             ));
@@ -7400,10 +7514,6 @@ fn run_profile(
     };
     finalize_private_logs(&log_root, &manifest, &config.receipts)?;
     runtime.cleanup()?;
-    let checks_bytes =
-        serde_json::to_vec(&effective_checks).map_err(|e| format!("cannot encode checks: {e}"))?;
-    let policy_digest = Digest::of_bytes(&canonical_policy_bytes(config)?).to_hex();
-    let sandbox_inputs = sandbox_receipt_inputs(adapter, config)?;
     let run_request_digests = sandbox_attestations
         .iter()
         .map(|attestation| attestation.request_digest.clone())
@@ -7426,7 +7536,7 @@ fn run_profile(
         subject: subject.clone(),
         profile: profile_name.into(),
         config_digest: policy_digest.clone(),
-        checks_digest: Digest::of_bytes(&checks_bytes).to_hex(),
+        checks_digest,
         trusted_policy_oid: trusted_oid.into(),
         trusted_before_policy_digest: trusted_digest.into(),
         candidate_policy_digest: policy_digest.clone(),
@@ -7486,6 +7596,34 @@ fn run_profile(
         counts,
         actions,
     })
+}
+
+/// Preserve the diagnostically useful end of both child streams without
+/// increasing the existing 512-byte console disclosure budget. Rust's test
+/// harness writes failing-test details to stdout while Cargo commonly writes
+/// hints to stderr, so selecting one non-empty stream can erase the cause.
+fn bounded_failure_output(stdout: &[u8], stderr: &[u8]) -> String {
+    const TOTAL_CAP: usize = 512;
+
+    fn safe_tail(bytes: &[u8], cap: usize) -> String {
+        let start = bytes.len().saturating_sub(cap);
+        crate::harness::terminal_safe(&String::from_utf8_lossy(&bytes[start..]))
+            .trim()
+            .to_string()
+    }
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        // Test harness failure summaries and assertions are carried on stdout;
+        // reserve three quarters there while retaining a bounded stderr hint.
+        (false, false) => format!(
+            "stdout={}; stderr={}",
+            safe_tail(stdout, TOTAL_CAP * 3 / 4),
+            safe_tail(stderr, TOTAL_CAP / 4)
+        ),
+        (false, true) => format!("stdout={}", safe_tail(stdout, TOTAL_CAP)),
+        (true, false) => format!("stderr={}", safe_tail(stderr, TOTAL_CAP)),
+        (true, true) => "<empty>".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7640,9 +7778,50 @@ fn sandbox_adapter(root: &Path) -> Result<crate::sandbox::SandboxAdapter, String
     crate::sandbox::SandboxAdapter::select(std::env::consts::OS, root, path)
 }
 
+fn profile_produces_build_output(profile: &str, config: &LocalValidationConfig) -> bool {
+    profile == config.gates.build || config.gates.docs_build.as_deref() == Some(profile)
+}
+
+fn check_reuse_allowed(
+    subject: &Subject,
+    profile: &str,
+    kind: crate::config::CheckKind,
+    config: &LocalValidationConfig,
+) -> bool {
+    subject.pushed_kind == "candidate"
+        && profile != config.gates.security_code
+        && kind != crate::config::CheckKind::SecretScan
+        && !(profile_produces_build_output(profile, config)
+            && kind == crate::config::CheckKind::ReleaseBuild)
+}
+
 fn sandbox_identity(adapter: &crate::sandbox::SandboxAdapter) -> Result<String, String> {
-    let bytes = format!("{adapter:?}").into_bytes();
-    Ok(Digest::of_bytes(&bytes).to_hex())
+    // Adapter paths include the per-run exact-subject materialization root, so
+    // hashing Debug output makes an otherwise identical validation identity
+    // change on every invocation. Bind the adapter kind and reviewed bytes;
+    // paths are transport locations, not semantic inputs.
+    match adapter {
+        crate::sandbox::SandboxAdapter::Macos { profile } => {
+            digest_json(&("macos-v1", digest_regular_file(profile)?))
+        }
+        crate::sandbox::SandboxAdapter::Linux {
+            executable,
+            profile,
+        } => digest_json(&(
+            "linux-v1",
+            digest_regular_file(executable)?,
+            digest_regular_file(profile)?,
+        )),
+    }
+}
+
+fn digest_regular_file(path: &Path) -> Result<String, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect identity input: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("identity input is not a no-follow regular file".into());
+    }
+    digest_file(path)
 }
 
 fn sandbox_authority_digest(
@@ -8891,6 +9070,33 @@ fn validate_receipt(receipt: &ValidationReceiptV1, subject: &Subject) -> Result<
     {
         return Err("invalid validation receipt bounded fields".into());
     }
+    for result in &receipt.results {
+        if !result.check_digest.is_empty() {
+            Digest::from_hex(&result.check_digest)
+                .map_err(|_| "invalid validation check identity digest")?;
+        }
+        if let ValidationDispositionV1::Reused {
+            source_receipt_id,
+            source_check_digest,
+            ..
+        } = &result.disposition
+        {
+            // Legacy executed results may lack the new identity. Reused
+            // results never may: both the origin receipt and exact check
+            // identity are mandatory and self-reuse is forbidden.
+            Digest::from_hex(source_receipt_id)
+                .map_err(|_| "invalid reused validation source receipt")?;
+            Digest::from_hex(source_check_digest)
+                .map_err(|_| "invalid reused validation source check")?;
+            if result.check_digest.is_empty()
+                || source_check_digest != &result.check_digest
+                || source_receipt_id == &receipt.id
+                || result.outcome != "passed"
+            {
+                return Err("invalid reused validation check binding".into());
+            }
+        }
+    }
     for digest in [
         &receipt.config_digest,
         &receipt.checks_digest,
@@ -8914,13 +9120,18 @@ fn validate_receipt(receipt: &ValidationReceiptV1, subject: &Subject) -> Result<
         receipt.sandbox.run_root_inventory_digests.len(),
         receipt.sandbox.run_canary_digests.len(),
     ];
+    let executed_checks = receipt
+        .results
+        .iter()
+        .filter(|result| matches!(result.disposition, ValidationDispositionV1::Executed))
+        .count();
     if attestation_lengths.iter().any(|length| *length > 65)
         || attestation_lengths
             .iter()
             .any(|length| *length != attestation_lengths[0])
         || (receipt.outcome == "passed"
             && receipt.sandbox.certified_host.starts_with("macOS ")
-            && receipt.sandbox.run_request_digests.len() < receipt.results.len())
+            && receipt.sandbox.run_request_digests.len() < executed_checks)
         || receipt
             .sandbox
             .run_canary_digests
@@ -8986,6 +9197,45 @@ fn receipt_profile_key(receipt: &ValidationReceiptV1) -> Result<String, String> 
         &receipt.tool_policy_digest,
         &receipt.tool_digests,
     ))
+}
+
+/// Select one exact, passing executed check from the current subject/profile
+/// identity. This is deliberately stricter than name equality: the receipt's
+/// full reusable-input key and the individual check identity must both match.
+/// Reused origins are rejected so reuse chains always flatten to an execution.
+pub fn reuse_exact_check(
+    expected: &ValidationReceiptV1,
+    sources: &[ValidationReceiptV1],
+    check_name: &str,
+    check_digest: &str,
+) -> Result<Option<ValidationCheckResult>, String> {
+    Digest::from_hex(check_digest).map_err(|_| "invalid expected validation check digest")?;
+    let expected_key = receipt_profile_key(expected)?;
+    for source in sources {
+        if validate_receipt(source, &expected.subject).is_err()
+            || source.outcome != "passed"
+            || receipt_profile_key(source)? != expected_key
+        {
+            continue;
+        }
+        let Some(origin) = source.results.iter().find(|result| {
+            result.name == check_name
+                && result.outcome == "passed"
+                && result.check_digest == check_digest
+                && matches!(result.disposition, ValidationDispositionV1::Executed)
+        }) else {
+            continue;
+        };
+        let mut reused = origin.clone();
+        reused.duration_millis = 0;
+        reused.disposition = ValidationDispositionV1::Reused {
+            source_receipt_id: source.id.clone(),
+            source_check_digest: origin.check_digest.clone(),
+            source_duration_millis: origin.duration_millis,
+        };
+        return Ok(Some(reused));
+    }
+    Ok(None)
 }
 
 fn sandbox_static_key(
@@ -9391,6 +9641,20 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
+    #[test]
+    fn failure_diagnostic_retains_bounded_tails_from_both_streams() {
+        let stdout = format!("{}stdout-cause\u{1b}[31m", "s".repeat(300));
+        let stderr = format!("{}stderr-hint", "e".repeat(300));
+        let diagnostic = bounded_failure_output(stdout.as_bytes(), stderr.as_bytes());
+
+        assert!(diagnostic.contains("stdout-cause"));
+        assert!(diagnostic.contains("stderr-hint"));
+        assert!(!diagnostic.contains('\u{1b}'));
+        assert!(!diagnostic.contains(&"s".repeat(385)));
+        assert!(!diagnostic.contains(&"e".repeat(129)));
+        assert_eq!(bounded_failure_output(&[], &[]), "<empty>");
+    }
+
     fn test_policy() -> LocalValidationConfig {
         let mut tools = BTreeMap::new();
         tools.insert(
@@ -9490,6 +9754,76 @@ mod tests {
             build_output: None,
             deploy_output: None,
         }
+    }
+
+    #[test]
+    fn sandbox_identity_ignores_materialization_path_but_binds_reviewed_bytes() {
+        let root = push_fixture("sandbox-semantic-identity");
+        let first = root.join("candidate-a/security/sandbox/validation.sb");
+        let second = root.join("candidate-b/security/sandbox/validation.sb");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&first, b"reviewed profile\n").unwrap();
+        fs::write(&second, b"reviewed profile\n").unwrap();
+
+        let first_adapter = crate::sandbox::SandboxAdapter::Macos { profile: first };
+        let second_adapter = crate::sandbox::SandboxAdapter::Macos {
+            profile: second.clone(),
+        };
+        assert_eq!(
+            sandbox_identity(&first_adapter).unwrap(),
+            sandbox_identity(&second_adapter).unwrap()
+        );
+
+        fs::write(&second, b"different profile\n").unwrap();
+        assert_ne!(
+            sandbox_identity(&first_adapter).unwrap(),
+            sandbox_identity(&second_adapter).unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_full_and_docs_build_profiles_produce_the_typed_deploy_artifact() {
+        let mut policy = test_policy();
+        assert!(profile_produces_build_output("profile", &policy));
+        assert!(!profile_produces_build_output("docs-build", &policy));
+        policy.gates.docs_build = Some("docs-build".into());
+        assert!(profile_produces_build_output("docs-build", &policy));
+        assert!(!profile_produces_build_output("docs-test", &policy));
+
+        let candidate = Subject {
+            requested: "candidate:test".into(),
+            pushed_oid: "a".repeat(40),
+            pushed_kind: "candidate".into(),
+            tag_chain: Vec::new(),
+            commit: "a".repeat(40),
+            tree: "b".repeat(40),
+        };
+        assert!(!check_reuse_allowed(
+            &candidate,
+            "profile",
+            CheckKind::ReleaseBuild,
+            &policy
+        ));
+        assert!(!check_reuse_allowed(
+            &candidate,
+            "docs-build",
+            CheckKind::ReleaseBuild,
+            &policy
+        ));
+        assert!(!check_reuse_allowed(
+            &candidate,
+            "docs-test",
+            CheckKind::SecretScan,
+            &policy
+        ));
+        assert!(check_reuse_allowed(
+            &candidate,
+            "docs-test",
+            CheckKind::Format,
+            &policy
+        ));
     }
 
     #[cfg(unix)]
@@ -13844,6 +14178,8 @@ mod tests {
                 count: None,
                 duration_millis: 1,
                 log_digest: "f".repeat(64),
+                check_digest: "c".repeat(64),
+                disposition: ValidationDispositionV1::Executed,
             }],
             started_epoch_secs: 1,
             completed_epoch_secs: 2,
@@ -14031,6 +14367,8 @@ mod tests {
                 count: Some(1),
                 duration_millis: 1,
                 log_digest: "f".repeat(64),
+                check_digest: "c".repeat(64),
+                disposition: ValidationDispositionV1::Executed,
             }],
             started_epoch_secs: 1,
             completed_epoch_secs: 2,
@@ -14039,6 +14377,74 @@ mod tests {
         };
         receipt.id = receipt_id(&receipt).unwrap();
         receipt
+    }
+
+    #[test]
+    fn exact_check_reuse_requires_an_executed_origin_and_flattens_duration() {
+        let subject = Subject {
+            requested: "candidate:test".into(),
+            pushed_oid: "a".repeat(40),
+            pushed_kind: "candidate".into(),
+            tag_chain: Vec::new(),
+            commit: "a".repeat(40),
+            tree: "b".repeat(40),
+        };
+        let source = test_receipt(subject, "build");
+        let expected = source.clone();
+        let reused = reuse_exact_check(
+            &expected,
+            std::slice::from_ref(&source),
+            "check",
+            &"c".repeat(64),
+        )
+        .unwrap()
+        .expect("exact executed check is reusable");
+        assert_eq!(reused.duration_millis, 0);
+        assert!(matches!(
+            &reused.disposition,
+            ValidationDispositionV1::Reused {
+                source_duration_millis: 1,
+                ..
+            }
+        ));
+
+        let mut chained = source.clone();
+        chained.results[0].disposition = reused.disposition;
+        chained.id = receipt_id(&chained).unwrap();
+        assert!(
+            reuse_exact_check(&expected, &[chained], "check", &"c".repeat(64))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_check_reuse_rejects_any_profile_identity_or_check_identity_drift() {
+        let subject = Subject {
+            requested: "candidate:test".into(),
+            pushed_oid: "a".repeat(40),
+            pushed_kind: "candidate".into(),
+            tag_chain: Vec::new(),
+            commit: "a".repeat(40),
+            tree: "b".repeat(40),
+        };
+        let source = test_receipt(subject, "build");
+        let mut changed = source.clone();
+        changed.tool_policy_digest = "0".repeat(64);
+        changed.id = receipt_id(&changed).unwrap();
+        assert!(
+            reuse_exact_check(&source, &[changed], "check", &"c".repeat(64))
+                .unwrap()
+                .is_none()
+        );
+        assert!(reuse_exact_check(
+            &source,
+            std::slice::from_ref(&source),
+            "check",
+            &"d".repeat(64),
+        )
+        .unwrap()
+        .is_none());
     }
 
     fn plant_note_bytes(root: &Path, subject: &Subject, bytes: &[u8]) {

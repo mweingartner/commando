@@ -57,7 +57,7 @@ fn safe_string(value: &str) -> String {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum ChangeRow {
-    Readable(ChangeStats),
+    Readable(Box<ChangeStats>),
     Unreadable { change: String, error_class: String },
 }
 
@@ -77,6 +77,15 @@ pub struct RewindCounts {
     pub total: usize,
 }
 
+/// Coverage is deliberately distinct from a numeric total: absence is not a
+/// zero-cost assertion.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UsageCoverageStats {
+    pub applicable_attempts: usize,
+    pub reported_attempts: usize,
+    pub authenticated_attempts: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeStats {
     pub change: String,
@@ -94,6 +103,7 @@ pub struct ChangeStats {
     pub failure_classes: BTreeMap<String, usize>,
     pub weakened_tuning_incidents: usize,
     pub active_deferrals: usize,
+    pub usage_coverage: UsageCoverageStats,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -106,6 +116,7 @@ pub struct AggregateStats {
     pub wallclock_secs_by_phase: BTreeMap<&'static str, u64>,
     pub failure_classes: BTreeMap<String, usize>,
     pub defect_escapes_by_originating_change: BTreeMap<String, usize>,
+    pub usage_coverage: UsageCoverageStats,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,6 +230,21 @@ fn change_stats(change: String, ledger: &Ledger) -> ChangeStats {
         .iter()
         .filter(|deferral| deferral.is_active())
         .count();
+    let applicable_attempts = ledger.history.len().max(ledger.gates.len());
+    let usage_coverage = UsageCoverageStats {
+        applicable_attempts,
+        reported_attempts: ledger.usage_records.len(),
+        authenticated_attempts: ledger
+            .provenance_records
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.state.state,
+                    crate::attestation::AttestationVerifierState::Locked
+                )
+            })
+            .count(),
+    };
     ChangeStats {
         change: safe_string(&change),
         kind: change_kind_label(ledger.kind),
@@ -241,6 +267,7 @@ fn change_stats(change: String, ledger: &Ledger) -> ChangeStats {
         failure_classes,
         weakened_tuning_incidents: weakened_history.saturating_add(weakened_brief),
         active_deferrals,
+        usage_coverage,
     }
 }
 
@@ -311,7 +338,7 @@ fn load_row(root: &Path, stem: &str) -> ChangeRow {
                     error_class: "change-identity-mismatch".to_string(),
                 };
             }
-            ChangeRow::Readable(change_stats(stem.to_string(), &loaded))
+            ChangeRow::Readable(Box::new(change_stats(stem.to_string(), &loaded)))
         }
         Err(error) => ChangeRow::Unreadable {
             change: safe_string(stem),
@@ -369,6 +396,18 @@ pub fn collect(root: &Path, change_filter: Option<&str>) -> StatsReport {
                         .entry(origin.clone())
                         .or_insert(0) += 1;
                 }
+                aggregate.usage_coverage.applicable_attempts = aggregate
+                    .usage_coverage
+                    .applicable_attempts
+                    .saturating_add(stats.usage_coverage.applicable_attempts);
+                aggregate.usage_coverage.reported_attempts = aggregate
+                    .usage_coverage
+                    .reported_attempts
+                    .saturating_add(stats.usage_coverage.reported_attempts);
+                aggregate.usage_coverage.authenticated_attempts = aggregate
+                    .usage_coverage
+                    .authenticated_attempts
+                    .saturating_add(stats.usage_coverage.authenticated_attempts);
             }
             ChangeRow::Unreadable { .. } => {
                 aggregate.unreadable = aggregate.unreadable.saturating_add(1);
@@ -467,6 +506,12 @@ pub fn render_human(report: &StatsReport) -> String {
                 if stats.active_deferrals > 0 {
                     out.push_str(&format!("  active deferrals: {}\n", stats.active_deferrals));
                 }
+                out.push_str(&format!(
+                    "  usage coverage: {}/{} reported, {} authenticated\n",
+                    stats.usage_coverage.reported_attempts,
+                    stats.usage_coverage.applicable_attempts,
+                    stats.usage_coverage.authenticated_attempts
+                ));
             }
             ChangeRow::Unreadable {
                 change,
@@ -507,6 +552,12 @@ pub fn render_human(report: &StatsReport) -> String {
             .join(", ");
         out.push_str(&format!("  failure classes: {classes}\n"));
     }
+    out.push_str(&format!(
+        "  usage coverage: {}/{} reported, {} authenticated\n",
+        report.aggregate.usage_coverage.reported_attempts,
+        report.aggregate.usage_coverage.applicable_attempts,
+        report.aggregate.usage_coverage.authenticated_attempts
+    ));
     if !report
         .aggregate
         .defect_escapes_by_originating_change
@@ -910,6 +961,61 @@ mod tests {
         let text = render_human(&report);
         assert!(text.contains("renderable"));
         assert!(text.contains("broken"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usage_coverage_distinguishes_missing_from_explicit_zero_and_locked_provenance() {
+        let root = test_root("usage-coverage");
+        let mut ledger = Ledger::new("observed", "mpd", false, ChangeKind::Feature);
+        ledger.history.push(GateEvent {
+            phase: Phase::Architecture,
+            record: gate_record("Architect", 1, 0, 1),
+        });
+        ledger.history.push(GateEvent {
+            phase: Phase::Architecture,
+            record: gate_record("Architect", 2, 1, 2),
+        });
+        let digest = "a".repeat(64);
+        ledger.usage_records.insert(
+            Ledger::attempt_key(Phase::Architecture, 1),
+            crate::attestation::UsageRecord {
+                schema: 1,
+                evidence_digest: digest.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                active_millis: 0,
+                currency: None,
+                cost_micros: None,
+                reported: true,
+            },
+        );
+        ledger.provenance_records.insert(
+            Ledger::attempt_key(Phase::Architecture, 1),
+            crate::attestation::ProvenanceRecord {
+                schema: 1,
+                evidence_digest: digest,
+                issuer: "external".into(),
+                key_id: "key".into(),
+                session_id_digest: "b".repeat(64),
+                state: crate::attestation::AttestationState {
+                    state: crate::attestation::AttestationVerifierState::Locked,
+                    code: None,
+                },
+            },
+        );
+        ledger::save(&root, &ledger).unwrap();
+
+        let report = collect(&root, None);
+        let ChangeRow::Readable(row) = &report.changes[0] else {
+            panic!("expected readable stats row");
+        };
+        assert_eq!(row.usage_coverage.applicable_attempts, 2);
+        assert_eq!(row.usage_coverage.reported_attempts, 1);
+        assert_eq!(row.usage_coverage.authenticated_attempts, 1);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["changes"][0]["usage_coverage"]["reported_attempts"], 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

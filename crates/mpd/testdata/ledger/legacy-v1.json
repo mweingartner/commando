@@ -1,0 +1,11 @@
+{
+  "change": "legacy-fixture",
+  "schema": "mpd",
+  "ui": false,
+  "phase": "architecture",
+  "gates": {},
+  "governance": {
+    "risk": "medium",
+    "threat_profile": "local-trusted-user"
+  }
+}

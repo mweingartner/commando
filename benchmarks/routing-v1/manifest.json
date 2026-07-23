@@ -1,0 +1,13 @@
+{
+  "schema": "mpd-routing-suite-v1",
+  "suite_id": "routing-v1",
+  "blind": true,
+  "seed_policy": "recorded-per-sample",
+  "required_metrics": ["quality_bps", "escaped_defects", "rework_steps", "latency_ms", "tokens", "cost_micros", "currency"],
+  "required_routes": ["codex/Architect", "codex/Designer", "codex/Security", "codex/Builder", "codex/Tester", "codex/Documenter"],
+  "minimum_samples_per_route_model": 3,
+  "tasks": "tasks.json",
+  "rubric": "rubric.md",
+  "scoring_schema": "evidence.schema.json",
+  "operator_instructions": "OPERATOR.md"
+}

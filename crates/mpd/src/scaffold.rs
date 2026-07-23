@@ -147,6 +147,8 @@ pub fn init(root: &Path, test_cmd: Option<String>) -> io::Result<InitReport> {
     let cfg = Config {
         test: test_cmd,
         governance: None,
+        governance_economics: None,
+        routing: None,
         deploy: None,
         docs_dir: None,
         models,

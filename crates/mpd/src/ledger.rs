@@ -13,7 +13,7 @@ use openspec_core::{
     TaskPlan,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -734,6 +734,36 @@ pub struct GateEvent {
     pub record: GateRecord,
 }
 
+/// Exact brief identity recorded before a persona is commissioned.  This is
+/// additive ledger data; it is not a claim that a model actually ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefExpectationV1 {
+    pub schema: u32,
+    pub phase: Phase,
+    pub attempt: usize,
+    pub harness: String,
+    pub model: String,
+    pub subject_digest: String,
+    #[serde(default)]
+    pub issued_at_epoch_secs: u64,
+}
+
+/// One bounded reconciliation continuation.  Consumption is monotonic; the
+/// caller must hold the existing ledger file lock across check-and-save.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationRecordV1 {
+    pub schema: u32,
+    pub change: String,
+    pub phase: Phase,
+    pub attempt: usize,
+    pub reason: String,
+    pub totals_digest: String,
+    #[serde(default)]
+    pub consumed: bool,
+    #[serde(default)]
+    pub issued_at_epoch_secs: u64,
+}
+
 /// The durable state of one change's trip through the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
@@ -769,6 +799,23 @@ pub struct Ledger {
     /// optional so pre-existing ledgers deserialize with an empty history.
     #[serde(default)]
     pub history: Vec<GateEvent>,
+    /// Normalized per-attempt usage, keyed by a bounded exact-attempt key.
+    /// Legacy ledgers have no usage rather than a fabricated zero value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub usage_records: BTreeMap<String, crate::attestation::UsageRecord>,
+    /// Authenticated/cooperative provenance is recorded separately from the
+    /// verdict so telemetry can never turn a FAIL into a PASS.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provenance_records: BTreeMap<String, crate::attestation::ProvenanceRecord>,
+    /// Brief-time model/subject expectations used by future gate preflight.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub brief_expectations: BTreeMap<String, BriefExpectationV1>,
+    /// Full-history replay claims. A consumed digest remains consumed even when
+    /// later objective validation fails.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub consumed_attestation_digests: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continuations: Vec<ContinuationRecordV1>,
     #[serde(default)]
     pub governance: Governance,
     /// Most recent mutating-command risk assessment. Status recomputes a
@@ -937,6 +984,11 @@ impl Ledger {
             conditions: Vec::new(),
             task_deferrals: Vec::new(),
             history: Vec::new(),
+            usage_records: BTreeMap::new(),
+            provenance_records: BTreeMap::new(),
+            brief_expectations: BTreeMap::new(),
+            consumed_attestation_digests: BTreeSet::new(),
+            continuations: Vec::new(),
             governance,
             risk_assessment: None,
             strict: false,
@@ -957,6 +1009,131 @@ impl Ledger {
             .as_ref()
             .map(|assessment| assessment.effective)
             .unwrap_or(self.governance.risk)
+    }
+
+    /// Produce a stable bounded attempt key used for expectations and normalized
+    /// evidence. The phase and ordinal are deliberately explicit, preventing a
+    /// later retry from inheriting an earlier record.
+    pub fn attempt_key(phase: Phase, attempt: usize) -> String {
+        format!("{}:{attempt}", phase.slug())
+    }
+
+    pub fn record_brief_expectation(
+        &mut self,
+        expectation: BriefExpectationV1,
+    ) -> Result<(), String> {
+        if expectation.schema != 1
+            || expectation.attempt == 0
+            || expectation.harness.is_empty()
+            || expectation.harness.len() > 64
+            || expectation.model.is_empty()
+            || expectation.model.len() > 128
+            || validate_sha256(
+                &expectation.subject_digest,
+                "brief expectation subject digest",
+            )
+            .is_err()
+        {
+            return Err("invalid brief expectation".into());
+        }
+        let key = Self::attempt_key(expectation.phase, expectation.attempt);
+        if let Some(existing) = self.brief_expectations.get(&key) {
+            if existing.schema != expectation.schema
+                || existing.phase != expectation.phase
+                || existing.attempt != expectation.attempt
+                || existing.harness != expectation.harness
+                || existing.model != expectation.model
+                || existing.subject_digest != expectation.subject_digest
+            {
+                return Err(
+                    "brief expectation already exists with different exact identity".into(),
+                );
+            }
+            return Ok(());
+        }
+        self.brief_expectations.insert(key, expectation);
+        Ok(())
+    }
+
+    /// Claim first, then let the caller run objective validation. This operation
+    /// is intentionally monotonic: callers must save under `LedgerFileLock` so
+    /// concurrent processes cannot both observe the digest as unused.
+    pub fn claim_attestation_digest(&mut self, digest: &str) -> Result<(), String> {
+        validate_sha256(digest, "attestation digest")?;
+        if !self
+            .consumed_attestation_digests
+            .insert(digest.to_ascii_lowercase())
+        {
+            return Err("attestation.replay-consumed".into());
+        }
+        Ok(())
+    }
+
+    pub fn record_attestation(
+        &mut self,
+        phase: Phase,
+        attempt: usize,
+        usage: crate::attestation::UsageRecord,
+        provenance: crate::attestation::ProvenanceRecord,
+    ) -> Result<(), String> {
+        if usage.schema != 1
+            || provenance.schema != 1
+            || usage.evidence_digest != provenance.evidence_digest
+        {
+            return Err("attestation normalized record mismatch".into());
+        }
+        let key = Self::attempt_key(phase, attempt);
+        self.usage_records.insert(key.clone(), usage);
+        self.provenance_records.insert(key, provenance);
+        Ok(())
+    }
+
+    pub fn consume_continuation(
+        &mut self,
+        change: &str,
+        phase: Phase,
+        attempt: usize,
+        totals_digest: &str,
+    ) -> Result<(), String> {
+        let Some(record) = self.continuations.iter_mut().find(|record| {
+            !record.consumed
+                && record.change == change
+                && record.phase == phase
+                && record.attempt == attempt
+                && record.totals_digest == totals_digest
+        }) else {
+            return Err("continuation unavailable".into());
+        };
+        record.consumed = true;
+        Ok(())
+    }
+
+    pub fn record_continuation(&mut self, reason: &str, totals_digest: &str) -> Result<(), String> {
+        let reason = bounded_text(reason, "continuation reason")?;
+        validate_sha256(totals_digest, "continuation totals digest")?;
+        if self.continuations.len() >= 64 {
+            return Err("continuation history exceeds 64 records".into());
+        }
+        let record = ContinuationRecordV1 {
+            schema: 1,
+            change: self.change.clone(),
+            phase: self.phase,
+            attempt: self.next_attempt(self.phase),
+            reason,
+            totals_digest: totals_digest.to_ascii_lowercase(),
+            consumed: false,
+            issued_at_epoch_secs: now_epoch_secs(),
+        };
+        if self.continuations.iter().any(|existing| {
+            !existing.consumed
+                && existing.change == record.change
+                && existing.phase == record.phase
+                && existing.attempt == record.attempt
+        }) {
+            return Err("an unconsumed continuation already exists for this attempt".into());
+        }
+        self.continuations.push(record);
+        Ok(())
     }
 
     /// Apply one causal freshness rewind. Latest downstream approvals stop
@@ -2047,6 +2224,90 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[test]
+    fn exact_brief_identity_is_idempotent_but_cannot_be_rebound() {
+        let mut ledger = Ledger::new("brief-id", "schema", false, ChangeKind::Feature);
+        let expectation = BriefExpectationV1 {
+            schema: 1,
+            phase: ledger.phase,
+            attempt: 1,
+            harness: "codex".into(),
+            model: "terra".into(),
+            subject_digest: "a".repeat(64),
+            issued_at_epoch_secs: 1,
+        };
+        ledger
+            .record_brief_expectation(expectation.clone())
+            .unwrap();
+        let mut repeated = expectation.clone();
+        repeated.issued_at_epoch_secs = 2;
+        ledger.record_brief_expectation(repeated).unwrap();
+        let mut rebound = expectation;
+        rebound.model = "sol".into();
+        assert!(ledger.record_brief_expectation(rebound).is_err());
+    }
+
+    #[test]
+    fn attestation_replay_claim_is_monotonic() {
+        let mut ledger = Ledger::new("replay", "schema", false, ChangeKind::Feature);
+        let digest = "b".repeat(64);
+        ledger.claim_attestation_digest(&digest).unwrap();
+        assert_eq!(
+            ledger.claim_attestation_digest(&digest).unwrap_err(),
+            "attestation.replay-consumed"
+        );
+    }
+
+    #[test]
+    fn legacy_ledger_fixture_defaults_evidence_fields_without_fabricating_usage() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-legacy-ledger-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        init_locking_fixture(&root);
+        let path = state_path(&root, "legacy-fixture");
+        std::fs::write(&path, include_str!("../testdata/ledger/legacy-v1.json")).unwrap();
+
+        let ledger = load(&root, "legacy-fixture").unwrap();
+        assert_eq!(ledger.format, 1);
+        assert!(ledger.usage_records.is_empty());
+        assert!(ledger.provenance_records.is_empty());
+        assert!(ledger.brief_expectations.is_empty());
+        assert!(ledger.consumed_attestation_digests.is_empty());
+        assert!(ledger.continuations.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_claim_survives_full_history_and_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-replay-history-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        init_locking_fixture(&root);
+        let digest = "c".repeat(64);
+        let mut ledger = Ledger::new("replay-history", "mpd", false, ChangeKind::Fix);
+        ledger.claim_attestation_digest(&digest).unwrap();
+        ledger
+            .record(Phase::Architecture, pass("Architect"))
+            .unwrap();
+        ledger
+            .record(Phase::SecurityPlan, pass("Security"))
+            .unwrap();
+        save(&root, &ledger).unwrap();
+
+        let mut reloaded = load(&root, "replay-history").unwrap();
+        assert_eq!(reloaded.history.len(), 2);
+        assert!(reloaded.consumed_attestation_digests.contains(&digest));
+        assert_eq!(
+            reloaded.claim_attestation_digest(&digest).unwrap_err(),
+            "attestation.replay-consumed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn init_locking_fixture(root: &Path) {
         std::fs::create_dir_all(root.join(".mpd/state")).unwrap();
         assert!(std::process::Command::new("git")
@@ -2651,6 +2912,141 @@ mod tests {
         );
         let durable = load(&root, "cas-race").unwrap();
         assert!(durable == first || durable == second);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_replay_claim_cas_allows_exactly_one_concurrent_consumer() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "mpd-replay-claim-cas-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_locking_fixture(&root);
+        let digest = "d".repeat(64);
+        let ledger = Ledger::new("replay-claim-cas", "mpd", false, ChangeKind::Fix);
+        save(&root, &ledger).unwrap();
+        let (observed, observation) = load_observed_exact(&root, "replay-claim-cas").unwrap();
+        let mut left = observed.clone();
+        let mut right = observed;
+        left.claim_attestation_digest(&digest).unwrap();
+        right.claim_attestation_digest(&digest).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |proposed: Ledger| {
+            let root = root.clone();
+            let observation = observation.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                save_exact_observed(&root, &proposed, &observation)
+            })
+        };
+        let left = spawn(left);
+        let right = spawn(right);
+        let outcomes = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ExactSaveOutcome::Committed))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    ExactSaveOutcome::NotCommitted(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                ))
+                .count(),
+            1
+        );
+        let mut durable = load(&root, "replay-claim-cas").unwrap();
+        assert!(durable.consumed_attestation_digests.contains(&digest));
+        assert_eq!(
+            durable.claim_attestation_digest(&digest).unwrap_err(),
+            "attestation.replay-consumed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn continuation_is_single_use_and_cas_preserves_that_consumption() {
+        use std::sync::{Arc, Barrier};
+
+        let root = std::env::temp_dir().join(format!(
+            "mpd-continuation-cas-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_locking_fixture(&root);
+        let digest = "e".repeat(64);
+        let mut ledger = Ledger::new("continuation-cas", "mpd", false, ChangeKind::Fix);
+        ledger
+            .record_continuation("bounded reconciliation", &digest)
+            .unwrap();
+        let phase = ledger.phase;
+        let attempt = ledger.next_attempt(phase);
+        let change = ledger.change.clone();
+        ledger
+            .consume_continuation(&change, phase, attempt, &digest)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .consume_continuation(&change, phase, attempt, &digest)
+                .unwrap_err(),
+            "continuation unavailable"
+        );
+
+        let mut reusable = Ledger::new("continuation-cas", "mpd", false, ChangeKind::Fix);
+        reusable
+            .record_continuation("bounded reconciliation", &digest)
+            .unwrap();
+        save(&root, &reusable).unwrap();
+        let (observed, observation) = load_observed_exact(&root, "continuation-cas").unwrap();
+        let phase = observed.phase;
+        let attempt = observed.next_attempt(phase);
+        let change = observed.change.clone();
+        let mut left = observed.clone();
+        let mut right = observed;
+        left.consume_continuation(&change, phase, attempt, &digest)
+            .unwrap();
+        right
+            .consume_continuation(&change, phase, attempt, &digest)
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |proposed: Ledger| {
+            let root = root.clone();
+            let observation = observation.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                save_exact_observed(&root, &proposed, &observation)
+            })
+        };
+        let left = spawn(left);
+        let right = spawn(right);
+        let outcomes = [left.join().unwrap(), right.join().unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, ExactSaveOutcome::Committed))
+                .count(),
+            1
+        );
+        let durable = load(&root, "continuation-cas").unwrap();
+        assert!(durable.continuations.iter().all(|record| record.consumed));
         std::fs::remove_dir_all(root).unwrap();
     }
 

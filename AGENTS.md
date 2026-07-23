@@ -24,7 +24,7 @@ Set `<harness>` by which agent is reading this file:
   Opus when Fable is unavailable; every other phase resolves to Sonnet.
 - **Codex** sessions use `--harness codex`. Deep phases resolve to GPT-5.6 Sol;
   every other phase resolves to Terra (this repo's `.mpd/config.json` overrides
-  the Codex Documenter to Luna).
+  the Codex Documenter to the user-authorized Terra route).
 
 `mpd next --harness <harness>` prints the resolved model for each phase; treat
 that output as authoritative over any prose table, including this one. Note
@@ -62,6 +62,17 @@ Keep the adversarial review; cut the mechanical re-work:
 - **Batch small same-scope changes** into one traversal instead of one change per fix.
 - **Record non-blocking / comment-only findings as notes in the artifact**, not as
   a FAIL or an artifact edit that triggers a re-drive.
+- **Keep efficiency claims coverage-aware.** Never report missing token, active-time,
+  currency, or cost evidence as zero. Soft budgets warn; hard budgets and the fixed
+  two-blocker/30-minute anti-stall boundary stop only a new brief. Cooperative actor,
+  model, and session labels are not authenticated provenance; this repository has no
+  external issuer, so authenticated provenance is `NOT DEPLOYED`.
+- **Do not optimize routing from fixtures.** `benchmarks/routing-v1/` defines the blind
+  suite, but only sufficient fresh actual-session evidence may support `routing apply`.
+  Evaluate and review the preview first; `MISSING`/`INSUFFICIENT` preserves mappings.
+- **Preserve reuse floors.** Check-level reuse requires a current exact-identity
+  executed origin. Security(code), outgoing secret scanning, Commit, and pre-push stay
+  fresh. The docs lane applies only to effective-Low documentation-only scope.
 - **Declare the manifest completely up front** — source/spec paths plus
   `openspec/changes/<change>/**` and `docs/<change>.md`; NOT the ledger
   `.mpd/state/<change>.json` (folded via SystemScope; declaring it trips the
@@ -144,6 +155,8 @@ passed. A narrower compiler process-tree probe is feasibility evidence only.
   `.githooks` wrappers. There is no legacy trust-bootstrap policy route.
 - Normal Git alone performs transport. `mpd hook pre-push` only authorizes the exact
   invocation; `mpd publish --verify` separately observes parity.
+- Candidate-cache inspection is read-only. Pruning requires `mpd cache prune --yes`,
+  retains live and archived references, and is not a substitute for archive recovery.
 
 ## Completion evidence
 

@@ -8,6 +8,8 @@
 #![deny(unsafe_code)]
 
 mod allowlist;
+mod attestation;
+mod cache;
 pub mod candidate;
 mod checks;
 mod cli;
@@ -15,6 +17,7 @@ mod closure;
 mod config;
 mod digest;
 mod directives;
+mod economics;
 mod git;
 mod githooks;
 mod harness;
@@ -23,6 +26,8 @@ mod local_validation;
 mod pathmatch;
 mod personas;
 mod phase;
+mod recovery;
+pub mod routing;
 mod sandbox;
 #[cfg(target_os = "macos")]
 mod sandbox_macos;

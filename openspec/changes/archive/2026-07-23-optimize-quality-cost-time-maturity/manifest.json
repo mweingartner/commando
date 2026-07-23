@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "paths": [
+    ".mpd/config.json",
+    ".mpd/directives/**",
+    "AGENTS.md",
+    "README.md",
+    "ARCHITECTURE.md",
+    "SECURITY.md",
+    "security/tool-lock.json",
+    "CONTRIBUTING.md",
+    "benchmarks/**",
+    "crates/mpd/**",
+    "docs/**",
+    "openspec/changes/optimize-quality-cost-time-maturity/**",
+    "openspec/specs/**"
+  ],
+  "shared_paths": []
+}

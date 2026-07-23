@@ -2360,13 +2360,42 @@ pub fn classify_effective_risk(
 /// missing its mandatory floor: at least one `secret-scan`-kind check
 /// always, plus at least one `doc-check`-kind check for `docs-build` and
 /// `docs-test` (design.md D3, Condition 4).
-pub fn select_gate_profile(
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateProfileReason {
+    DocsLaneSelected,
+    DocsLaneNotConfigured,
+    DocsLaneIneligible,
+    HighRiskTest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GateProfileSelection {
+    pub profile: String,
+    pub reason: GateProfileReason,
+}
+
+pub fn select_gate_profile_detailed(
     local: &crate::config::LocalValidationConfig,
     phase: Phase,
     manifest: &ChangeManifest,
     change: &str,
     effective: RiskLevel,
-) -> Result<String, String> {
+) -> Result<GateProfileSelection, String> {
+    let docs_mapping_count = [
+        local.gates.docs_build.as_ref(),
+        local.gates.docs_security_code.as_ref(),
+        local.gates.docs_test.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .count();
+    if !matches!(docs_mapping_count, 0 | 3) {
+        return Err(
+            "config-policy blocker: documentation lane mappings must be wholly absent or configure build, security-code, and test together"
+                .into(),
+        );
+    }
     let docs_lane = effective == RiskLevel::Low && scope_is_documentation_only(manifest, change);
     let (full, docs, requires_doc_check) = match phase {
         Phase::Build => (&local.gates.build, local.gates.docs_build.as_ref(), true),
@@ -2376,7 +2405,10 @@ pub fn select_gate_profile(
             false,
         ),
         Phase::Test if effective == RiskLevel::High => {
-            return Ok(local.gates.high_risk_test.clone());
+            return Ok(GateProfileSelection {
+                profile: local.gates.high_risk_test.clone(),
+                reason: GateProfileReason::HighRiskTest,
+            });
         }
         Phase::Test => (&local.gates.test, local.gates.docs_test.as_ref(), true),
         other => {
@@ -2387,7 +2419,14 @@ pub fn select_gate_profile(
         }
     };
     let Some(docs_profile) = docs.filter(|_| docs_lane) else {
-        return Ok(full.clone());
+        return Ok(GateProfileSelection {
+            profile: full.clone(),
+            reason: if docs_mapping_count == 0 {
+                GateProfileReason::DocsLaneNotConfigured
+            } else {
+                GateProfileReason::DocsLaneIneligible
+            },
+        });
     };
 
     // Selection-time floor (never config convention alone): resolve the
@@ -2419,7 +2458,21 @@ pub fn select_gate_profile(
             phase.label()
         ));
     }
-    Ok(docs_profile.clone())
+    Ok(GateProfileSelection {
+        profile: docs_profile.clone(),
+        reason: GateProfileReason::DocsLaneSelected,
+    })
+}
+
+pub fn select_gate_profile(
+    local: &crate::config::LocalValidationConfig,
+    phase: Phase,
+    manifest: &ChangeManifest,
+    change: &str,
+    effective: RiskLevel,
+) -> Result<String, String> {
+    select_gate_profile_detailed(local, phase, manifest, change, effective)
+        .map(|selection| selection.profile)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2441,6 +2494,8 @@ fn stale_dependency_rewind(receipt_phase: Phase, reason: &StaleReason) -> Phase 
         StaleReason::SchemaChanged { .. } => receipt_phase,
         StaleReason::DependencyChanged(key) => match key {
             DependencyKey::DesignMockArtifact => Phase::DesignMock,
+            DependencyKey::Scope if receipt_phase == Phase::DesignMock => Phase::DesignMock,
+            DependencyKey::Governance if receipt_phase == Phase::DesignMock => Phase::DesignMock,
             DependencyKey::Scope
             | DependencyKey::Config
             | DependencyKey::DesignArtifacts
@@ -6183,6 +6238,37 @@ mod select_gate_profile_tests {
             select_gate_profile(&local, Phase::Test, &manifest, "my-change", RiskLevel::High)
                 .unwrap();
         assert_eq!(chosen, "high");
+        let detailed = select_gate_profile_detailed(
+            &local,
+            Phase::Build,
+            &manifest,
+            "my-change",
+            RiskLevel::Low,
+        )
+        .unwrap();
+        assert_eq!(detailed.reason, GateProfileReason::DocsLaneNotConfigured);
+    }
+
+    #[test]
+    fn partial_docs_mapping_is_a_policy_blocker_even_when_scope_is_ineligible() {
+        let mut partial = gates(false);
+        partial.docs_build = Some("docs-build".into());
+        let local = policy(
+            partial,
+            vec![(
+                "docs-build",
+                docs_profile(&["format", "doc-staleness", "secret-scan"]),
+            )],
+        );
+        let error = select_gate_profile_detailed(
+            &local,
+            Phase::Build,
+            &mixed_manifest(),
+            "my-change",
+            RiskLevel::High,
+        )
+        .unwrap_err();
+        assert!(error.contains("wholly absent"), "{error}");
     }
 
     #[test]
@@ -6209,6 +6295,18 @@ mod select_gate_profile_tests {
             select_gate_profile(&local, Phase::Test, &manifest, "my-change", RiskLevel::Low)
                 .unwrap(),
             "docs-test"
+        );
+        assert_eq!(
+            select_gate_profile_detailed(
+                &local,
+                Phase::Build,
+                &manifest,
+                "my-change",
+                RiskLevel::Low,
+            )
+            .unwrap()
+            .reason,
+            GateProfileReason::DocsLaneSelected
         );
     }
 
@@ -6615,6 +6713,23 @@ mod evidence_validity_tests {
                 .any(|r| matches!(r, StaleReason::SchemaChanged { .. }))),
             other => panic!("expected Stale, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stale_design_mock_scope_or_governance_rewinds_to_design_mock_not_a_looping_architecture() {
+        for key in [DependencyKey::Scope, DependencyKey::Governance] {
+            assert_eq!(
+                stale_dependency_rewind(Phase::DesignMock, &StaleReason::DependencyChanged(key)),
+                Phase::DesignMock
+            );
+        }
+        assert_eq!(
+            stale_dependency_rewind(
+                Phase::Architecture,
+                &StaleReason::DependencyChanged(DependencyKey::Scope)
+            ),
+            Phase::Architecture
+        );
     }
 
     #[test]

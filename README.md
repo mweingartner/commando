@@ -42,6 +42,49 @@ commit coherence, push authorization, observed transfer, remote parity, installa
 and containment certification. Remote parity does not repair missing or bypassed push
 authorization. A Build receipt does not fill the full Test-profile field.
 
+## Quality, cost, and time maturity
+
+MPD's quality controls are **managed and evidence-gated**: written intent, separated
+roles, exact Candidate identity, adversarial Security review, structured local
+validation, and distinct Deploy/publication observations are enforced by the ledger.
+This is strong local process assurance, not proof that a model answer is correct and
+not protection from a repository owner who replaces or bypasses the coordinator.
+
+Cost and time controls are coverage-aware, but less mature than the quality gates.
+`.mpd/config.json` defines risk-specific soft/hard token and wall-time budgets plus the
+fixed two-consecutive-blocker/30-minute anti-stall rule. Soft limits warn; hard limits
+and anti-stall stop issuance of a new brief, not `status`, evidence inspection, or
+already-recorded truth. Missing provider usage is never inferred: token, active-time,
+currency, and cost totals remain `UNREPORTED`, `PARTIAL`, or `UNAVAILABLE` unless
+bounded attempt evidence covers the applicable attempts.
+
+Authenticated model/session provenance is **NOT DEPLOYED** in this repository. The
+configured mode is `cooperative` with no external issuers. An omitted attestation does
+not block; actor/model/session labels remain cooperative. Required mode is fail-closed
+and is suitable only after a real external issuer is configured and independently
+verified. Fixtures or owner-self-signed samples are test evidence, not production
+provenance.
+
+When evidence is available, bind it to the exact gate attempt:
+
+```sh
+mpd gate <phase> --pass --by <actor> --evidence <artifact> \
+  --attestation <attestation.json>
+```
+
+Routing optimization is controlled experimental. The versioned blind suite is in
+`benchmarks/routing-v1/`, but no sufficient adoption-evidence envelope is committed by
+default. Current Sol/Terra mappings are therefore not claimed Pareto-optimal:
+
+```sh
+mpd routing evaluate --evidence <routing-evidence.json>
+mpd routing apply --evidence <routing-evidence.json>       # preview only
+mpd routing apply --evidence <routing-evidence.json> --yes # revalidate, then write
+```
+
+See [the scored maturity assessment](docs/optimize-quality-cost-time-maturity.md)
+for evidence requirements and limitations.
+
 ## Ordered gates
 
 Every strict change follows:
@@ -106,6 +149,12 @@ external mutable state feeds validation — the ambient reads that remain (cargo
 under `$CARGO_HOME`, the SDK via `DEVELOPER_DIR`, the cargo/rustc binaries, OS beyond
 os-arch) are pinned by offline+locked builds, `Cargo.lock` checksums, and
 execution-time tool-digest verification against `security/tool-lock.json`.
+
+Validation receipts also identify each check as `executed` or `reused`. Check reuse is
+limited to a current-change/current-subject passing executed origin with the same check
+digest and complete Candidate/profile/policy/tool/host/adapter/environment identity.
+Reuse chains flatten to that executed origin. Security(code), outgoing secret scanning,
+Commit, and pre-push validation retain their fresh-execution floors.
 
 Effective risk drives *depth*, not attempt pressure: at High, Security and Tester
 resolve to the deep model with a raised effort floor and Test runs the heavier
@@ -183,10 +232,20 @@ mpd doctor --scope runtime-health --enforce
 
 # Fast staged check, normally called by pre-commit.
 bash scripts/ci-local.sh --staged
+
+# Read-only candidate-cache inventory and preview-first pruning.
+mpd cache inspect
+mpd cache prune
+mpd cache prune --yes
 ```
 
 `mpd doctor --fix` only heals `.mpd/.gitignore` additively. It does not change policy,
 hooks, configuration, receipts, installation, or remote state.
+
+Bare `mpd doctor` reports typed pre-commit states instead of trusting marker text as
+proof of an activated wrapper. `mpd status` and `mpd status --json` likewise distinguish
+active, archived-current, pending-archive, awaiting-commit, closed, and invalid
+current-pointer states without recreating active state.
 
 ## Git-local enforcement and publication
 

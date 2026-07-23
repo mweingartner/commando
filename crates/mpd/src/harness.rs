@@ -17,6 +17,15 @@ use crate::personas;
 use crate::phase::Phase;
 use serde::Serialize;
 
+/// Additive, typed efficiency projection for a next brief.  The CLI wiring
+/// supplies it from the ledger; an absent value preserves legacy briefs.
+#[derive(Debug, Clone, Serialize)]
+pub struct BriefEfficiency {
+    pub budget_state: String,
+    pub usage_coverage: String,
+    pub provenance_state: String,
+}
+
 /// Ordinal rank of a reasoning-effort label (`medium` < `high` < `max`). Effort
 /// composition MUST compare on this rank, NEVER on `String` order — lexically
 /// `"high" < "max" < "medium"`, so a naive `String::max` would select the WEAKEST
@@ -90,6 +99,12 @@ pub struct NextBrief {
     pub attempt_authorization: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_warning: Option<String>,
+    /// Model-work accounting is advisory/observational unless `issuance_block`
+    /// is present. It never rewrites the phase or verdict surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub efficiency: Option<BriefEfficiency>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuance_block: Option<String>,
     // --- persona tuning (design.md persona-tuning) ---
     // All five carry `skip_serializing_if` so an untuned brief's `--json` envelope
     // is byte-identical at baseline (design.md Cond 1).
@@ -393,6 +408,8 @@ pub fn brief(
         reconciliation_required,
         attempt_authorization,
         artifact_warning,
+        efficiency: None,
+        issuance_block: None,
         effort: tuning.effort,
         reviewers: tuning.reviewers,
         directive_append: tuning.directive_append,

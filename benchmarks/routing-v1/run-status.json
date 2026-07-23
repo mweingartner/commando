@@ -1,0 +1,28 @@
+{
+  "schema": "mpd-routing-run-status-v1",
+  "generated_unix_secs": 1784794280,
+  "status": "INSUFFICIENT",
+  "suite_manifest_sha256": "15e1d2b82b5606884e94e43a259358bc997c41534d5137937cf2a11f8c726d81",
+  "tasks_sha256": "c8583616f15231d71cdda9371778e144f87be1c87a5d3ed54edae9f5bff106b6",
+  "rubric_sha256": "1e96a7a4f9f7fb68f8ec5a96ce09b3a053f3bfc39caf67dc8a3524e19e308d0c",
+  "actual_session_coverage": {
+    "codex-sol": {
+      "personas": ["Architect", "Designer"],
+      "samples": 6,
+      "seeds": [101, 202, 303]
+    },
+    "codex-terra": {
+      "personas": ["Security", "Builder", "Tester", "Documenter"],
+      "samples": 12,
+      "seeds": [101, 202, 303]
+    }
+  },
+  "missing_required_evidence": [
+    "trusted per-sample input/output/cached token counts",
+    "trusted per-sample active duration",
+    "trusted per-sample currency and cost micro-units",
+    "independent blind rubric scores bound to an evidence envelope"
+  ],
+  "decision": "PRESERVE_CURRENT_MAPPING",
+  "note": "Actual configured Sol and Terra sessions ran every committed role task for all three seeds. Raw prompts and model output are intentionally not retained in routing adoption evidence. The harness did not expose trusted usage/cost/session attestations, so no routing-evidence-v1 envelope was minted and routing apply was not invoked."
+}

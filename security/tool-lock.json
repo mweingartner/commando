@@ -68,6 +68,26 @@
       "package_root": "/opt/homebrew/Cellar/gitleaks/8.30.1",
       "executable_sha256": "f414bc2fb952be6c9072b75cb411e3368614ef4b16d48dbd9ad238034afd2302",
       "platform": "aarch64-apple-darwin"
+    },
+    {
+      "name": "ssh-keygen",
+      "version": "apple-openssh-verified",
+      "acquisition": "system-absolute",
+      "absolute_path": "/usr/bin/ssh-keygen",
+      "executable_sha256": "4ed0e089766a35cb8acbaf6e2804e9ec5b187f1baabce5dc832f5a192cb3d7cd",
+      "platform": "aarch64-apple-darwin",
+      "argv_contract": [
+        "-Y",
+        "verify",
+        "-f",
+        "<allowed-signers>",
+        "-I",
+        "<identity>",
+        "-n",
+        "mpd-attestation-v1",
+        "-s",
+        "<signature>"
+      ]
     }
   ]
 }

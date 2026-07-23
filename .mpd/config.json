@@ -1,5 +1,49 @@
 {
   "test": "cargo test --workspace",
+  "governance_economics": {
+    "schema": 1,
+    "budgets": {
+      "low": {
+        "soft-tokens": 100000,
+        "hard-tokens": 200000,
+        "soft-wall-millis": 1800000,
+        "hard-wall-millis": 3600000
+      },
+      "medium": {
+        "soft-tokens": 300000,
+        "hard-tokens": 600000,
+        "soft-wall-millis": 7200000,
+        "hard-wall-millis": 14400000
+      },
+      "high": {
+        "soft-tokens": 1000000,
+        "hard-tokens": 2000000,
+        "soft-wall-millis": 21600000,
+        "hard-wall-millis": 43200000
+      }
+    },
+    "anti-stall": {
+      "consecutive-blockers": 2,
+      "no-advancement-millis": 1800000
+    },
+    "attestation": {
+      "mode": "cooperative",
+      "issuers": {}
+    }
+  },
+  "routing": {
+    "schema": 1,
+    "maximum-age-secs": 2592000,
+    "minimum-samples": 3,
+    "allowed-targets": [
+      {"harness": "codex", "persona": "Architect"},
+      {"harness": "codex", "persona": "Designer"},
+      {"harness": "codex", "persona": "Security"},
+      {"harness": "codex", "persona": "Builder"},
+      {"harness": "codex", "persona": "Tester"},
+      {"harness": "codex", "persona": "Documenter"}
+    ]
+  },
   "local_validation": {
     "schema": 1,
     "required-toolchain": {
@@ -118,6 +162,13 @@
         "timeout-secs": 180,
         "result-policy": "exit-zero"
       },
+      "doc-doctrine": {
+        "kind": "doc-check",
+        "program": "mpd-self",
+        "args": ["__mpd-doc-check"],
+        "timeout-secs": 180,
+        "result-policy": "exit-zero"
+      },
       "phase-model-tests": {
         "kind": "nonfunctional",
         "program": "cargo",
@@ -150,6 +201,15 @@
       "high-risk-test": {
         "includes": ["test"],
         "checks": ["phase-model-tests", "scoped-digest-throughput"]
+      },
+      "docs-build": {
+        "checks": ["format", "doc-doctrine", "gitleaks", "release-build"]
+      },
+      "docs-security-code": {
+        "checks": ["gitleaks"]
+      },
+      "docs-test": {
+        "checks": ["format", "doc-doctrine", "gitleaks"]
       }
     },
     "gates": {
@@ -157,7 +217,10 @@
       "security-code": "security-code",
       "test": "test",
       "pre-push": "pre-push",
-      "high-risk-test": "high-risk-test"
+      "high-risk-test": "high-risk-test",
+      "docs-build": "docs-build",
+      "docs-security-code": "docs-security-code",
+      "docs-test": "docs-test"
     },
     "hooks": {
       "path": ".githooks",
@@ -236,7 +299,7 @@
       "Security": "terra",
       "Builder": "terra",
       "Tester": "terra",
-      "Documenter": "luna"
+      "Documenter": "terra"
     }
   },
   "closure": {

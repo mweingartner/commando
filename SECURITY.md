@@ -54,6 +54,14 @@ reusable authorization.
    bytes, and never executes the candidate for identity.
 8. Human and JSON rendering derive from one typed result, remain meaningful without
    color, and cannot print terminal PASS before durable state exists.
+9. Usage and review attestations bind one exact brief/gate attempt. Required evidence
+   is consumed atomically before objective execution, so concurrent replay cannot
+   validate two attempts; cooperative labels never become authenticated provenance.
+10. Budget and anti-stall limits may refuse a new brief but cannot hide status, alter a
+    gate verdict, erase an attempt, or turn missing usage into zero cost.
+11. Routing writes are limited to reviewed existing targets and require fresh matching
+    evidence/config digests after preview. Candidate-cache deletion retains every live
+    or archived reference and revalidates no-follow object identity after quarantine.
 
 ## Exact-host compatibility adapter
 
@@ -102,6 +110,37 @@ PASS.
 
 Never commit credentials, private keys, `.env`, `.git/mpd`, validation logs/receipts,
 build output, installed binaries, Cargo caches, or target products.
+
+## Attestation, economics, routing, and cache effects
+
+Attestation files, issuer labels, public keys, signatures, usage counters, clocks, and
+routing evidence are untrusted structured input. Parsing is bounded and strict;
+unknown fields, floats, duplicate bindings, invalid identifiers, stale evidence,
+unblinded/duplicate samples, mixed-currency comparisons, and arithmetic overflow fail
+closed or remain explicitly unavailable. No provider credentials, private issuer keys,
+prompts, raw model output, or network endpoints are representable in policy.
+
+The only authenticated envelope is SSHSIG Ed25519 verified offline by the tool-locked
+`/usr/bin/ssh-keygen -Y verify` contract and fixed `mpd-attestation-v1` namespace.
+Issuer trust is configuration-bound public material. Verifier absence or digest drift
+is `BLOCKED`, binding or signature failure is `INVALID`, and a consumed digest is
+`REPLAYED`.
+
+This repository has `attestation.mode = cooperative` and an empty issuer map.
+Consequently authenticated model/session provenance is **NOT DEPLOYED**. Omitted
+evidence is allowed, but usage/provenance coverage remains missing; fixtures and
+owner-generated signatures must never be presented as independent assurance.
+
+Routing evidence can influence spend and review depth, so `routing apply` is a policy
+mutation. Evaluate first, inspect the exact preview, and use `--yes` only for sufficient
+fresh blind evidence covering every required target. The writer refuses new/deleted
+targets, cross-harness edits, non-routing changes, and concurrent digest drift.
+`MISSING` or `INSUFFICIENT` evidence must preserve the current mapping.
+
+Candidate-cache pruning is destructive. Inspection is the default; `--yes` is required
+for effects. Enumeration is capped and rooted in owner-only clone-private directories.
+Symlinks, malformed sidecars, referenced IDs, identity races, incomplete scans, and
+post-quarantine mismatch block deletion. Archive cleanup remains a separate operation.
 
 ## Git authorization
 

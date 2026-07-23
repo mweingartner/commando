@@ -87,6 +87,14 @@ pub struct Config {
     /// Optional project defaults for newly begun changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance: Option<GovernanceDefaults>,
+    /// Offline evidence, provenance, and model-work limits.  This is optional
+    /// so legacy project configuration remains byte-for-byte compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance_economics: Option<GovernanceEconomicsConfig>,
+    /// Reviewed offline routing-evidence policy. Evidence may update only
+    /// these already-existing harness/persona targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingPolicyConfig>,
     /// The command that runs the test suite (e.g. `cargo test`). Required for
     /// the Build/Test gates to verify a real, non-zero pass count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -576,6 +584,7 @@ impl LocalValidationConfig {
             }
         }
         self.validate_required_lane_coverage()?;
+        self.validate_docs_lane_coverage()?;
         Ok(())
     }
 
@@ -727,6 +736,47 @@ impl LocalValidationConfig {
                         "gate {gate:?} profile {profile_name:?} omits required lane {kind:?}"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_docs_lane_coverage(&self) -> Result<(), String> {
+        let mappings = [
+            ("docs-build", self.gates.docs_build.as_ref(), true),
+            (
+                "docs-security-code",
+                self.gates.docs_security_code.as_ref(),
+                false,
+            ),
+            ("docs-test", self.gates.docs_test.as_ref(), true),
+        ];
+        let configured = mappings
+            .iter()
+            .filter(|(_, profile, _)| profile.is_some())
+            .count();
+        if configured == 0 {
+            return Ok(());
+        }
+        if configured != mappings.len() {
+            return Err(
+                "documentation gate profiles must be wholly absent or configured together".into(),
+            );
+        }
+        for (gate, profile, needs_doc_check) in mappings {
+            let profile = profile.expect("all mappings checked above");
+            validate_identifier(profile)?;
+            let checks = self.effective_checks(profile)?;
+            let kinds: Vec<_> = checks.iter().map(|name| self.checks[name].kind).collect();
+            if !kinds.contains(&CheckKind::SecretScan) {
+                return Err(format!(
+                    "gate {gate:?} profile {profile:?} omits required secret-scan lane"
+                ));
+            }
+            if needs_doc_check && !kinds.contains(&CheckKind::DocCheck) {
+                return Err(format!(
+                    "gate {gate:?} profile {profile:?} omits required doc-check lane"
+                ));
             }
         }
         Ok(())
@@ -898,6 +948,251 @@ pub struct GovernanceDefaults {
     pub threat_profile: Option<ThreatProfile>,
 }
 
+/// Strict, opt-in policy for accounting model work.  It deliberately contains
+/// no provider URL, credential, prompt, or price-table: MPD accepts bounded
+/// offline evidence only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GovernanceEconomicsConfig {
+    #[serde(default = "economics_schema_v1")]
+    pub schema: u32,
+    #[serde(default)]
+    pub budgets: RiskBudgetLimits,
+    #[serde(default)]
+    pub anti_stall: AntiStallPolicy,
+    #[serde(default)]
+    pub attestation: AttestationPolicy,
+}
+
+fn economics_schema_v1() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RiskBudgetLimits {
+    #[serde(default)]
+    pub low: BudgetLimits,
+    #[serde(default)]
+    pub medium: BudgetLimits,
+    #[serde(default)]
+    pub high: BudgetLimits,
+}
+
+impl RiskBudgetLimits {
+    #[allow(dead_code)]
+    pub fn for_risk(&self, risk: RiskLevel) -> &BudgetLimits {
+        match risk {
+            RiskLevel::Low => &self.low,
+            RiskLevel::Medium => &self.medium,
+            RiskLevel::High => &self.high,
+        }
+    }
+}
+
+/// Limits use integer micro-units and milliseconds.  `None` means that metric
+/// is not governed; zero is rejected rather than silently becoming unlimited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BudgetLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_active_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_active_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_wall_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_wall_millis: Option<u64>,
+    /// Per-currency amount in integer micro-units (for example USD µunits).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub soft_cost_micros: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hard_cost_micros: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AntiStallPolicy {
+    #[serde(default = "default_consecutive_blockers")]
+    pub consecutive_blockers: u8,
+    #[serde(default = "default_no_advancement_millis")]
+    pub no_advancement_millis: u64,
+}
+
+fn default_consecutive_blockers() -> u8 {
+    2
+}
+fn default_no_advancement_millis() -> u64 {
+    30 * 60 * 1000
+}
+
+impl Default for AntiStallPolicy {
+    fn default() -> Self {
+        Self {
+            consecutive_blockers: default_consecutive_blockers(),
+            no_advancement_millis: default_no_advancement_millis(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttestationMode {
+    #[default]
+    Cooperative,
+    Required,
+}
+
+/// Trust material is intentionally data-only.  A future CLI integration may
+/// load a locator only through its fixed clone-private root; private keys are
+/// not representable here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AttestationPolicy {
+    #[serde(default)]
+    pub mode: AttestationMode,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub issuers: BTreeMap<String, IssuerTrustConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct IssuerTrustConfig {
+    /// A canonical `ssh-ed25519` public key, never a private key.
+    pub public_key: String,
+    /// Digest of the exact reviewed public-key material.
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct RoutingPolicyConfig {
+    #[serde(default = "economics_schema_v1")]
+    pub schema: u32,
+    pub maximum_age_secs: u64,
+    pub minimum_samples: u32,
+    #[serde(default)]
+    pub allowed_targets: Vec<crate::routing::RoutingTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_evidence_digest: Option<String>,
+}
+
+impl RoutingPolicyConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 1
+            || self.maximum_age_secs == 0
+            || self.maximum_age_secs > 365 * 24 * 60 * 60
+            || self.minimum_samples == 0
+            || self.minimum_samples > 4096
+            || self.allowed_targets.is_empty()
+            || self.allowed_targets.len() > 64
+        {
+            return Err("routing policy bounds are invalid".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for target in &self.allowed_targets {
+            target.validate().map_err(|error| error.to_string())?;
+            if !seen.insert(target) {
+                return Err("routing policy contains a duplicate target".into());
+            }
+        }
+        if let Some(digest) = &self.applied_evidence_digest {
+            crate::digest::Digest::from_hex(digest)
+                .map_err(|_| "routing applied evidence digest is invalid")?;
+        }
+        Ok(())
+    }
+}
+
+impl GovernanceEconomicsConfig {
+    #[allow(dead_code)]
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 1 {
+            return Err("unsupported governance-economics schema".into());
+        }
+        for limits in [&self.budgets.low, &self.budgets.medium, &self.budgets.high] {
+            validate_budget_limits(limits)?;
+        }
+        if self.anti_stall.consecutive_blockers != 2
+            || self.anti_stall.no_advancement_millis != 30 * 60 * 1000
+        {
+            return Err("anti-stall policy must retain the fixed 2-blocker/30-minute floor".into());
+        }
+        for (issuer, trust) in &self.attestation.issuers {
+            validate_identifier(issuer)?;
+            if !crate::attestation::canonical_public_key(&trust.public_key) {
+                return Err(format!(
+                    "issuer {issuer:?} must use canonical comment-free ssh-ed25519 material"
+                ));
+            }
+            if trust.sha256.len() != 64
+                || !trust
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(format!("issuer {issuer:?} sha256 must be lowercase hex"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_budget_limits(limits: &BudgetLimits) -> Result<(), String> {
+    for (soft, hard, name) in [
+        (limits.soft_tokens, limits.hard_tokens, "tokens"),
+        (
+            limits.soft_active_millis,
+            limits.hard_active_millis,
+            "active-millis",
+        ),
+        (
+            limits.soft_wall_millis,
+            limits.hard_wall_millis,
+            "wall-millis",
+        ),
+    ] {
+        if soft.is_some_and(|v| v == 0) || hard.is_some_and(|v| v == 0) {
+            return Err(format!("budget {name} limits must be positive"));
+        }
+        if soft.zip(hard).is_some_and(|(s, h)| s > h) {
+            return Err(format!(
+                "budget {name} soft limit must not exceed hard limit"
+            ));
+        }
+    }
+    for (currency, hard) in &limits.hard_cost_micros {
+        if currency.is_empty()
+            || currency.len() > 8
+            || !currency.chars().all(|c| c.is_ascii_uppercase())
+            || *hard == 0
+        {
+            return Err("cost hard budget currency/amount is invalid".into());
+        }
+        if limits
+            .soft_cost_micros
+            .get(currency)
+            .is_some_and(|soft| *soft > *hard || *soft == 0)
+        {
+            return Err("cost soft budget must be positive and not exceed hard".into());
+        }
+    }
+    for (currency, soft) in &limits.soft_cost_micros {
+        if currency.is_empty()
+            || currency.len() > 8
+            || !currency.chars().all(|c| c.is_ascii_uppercase())
+            || *soft == 0
+        {
+            return Err("cost soft budget currency/amount is invalid".into());
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// The documentation subdirectory, defaulting to `docs`.
     pub fn docs_dir(&self) -> &str {
@@ -1011,8 +1306,15 @@ impl Config {
         let text =
             openspec_core::read_contained_capped(root, &path, openspec_core::DEFAULT_MAX_BYTES)
                 .map_err(|e| format!("local validation config is unavailable: {e}"))?;
-        serde_json::from_str(&text)
-            .map_err(|e| format!("local validation config is malformed: {e}"))
+        let config: Config = serde_json::from_str(&text)
+            .map_err(|e| format!("local validation config is malformed: {e}"))?;
+        if let Some(economics) = &config.governance_economics {
+            economics.validate()?;
+        }
+        if let Some(routing) = &config.routing {
+            routing.validate()?;
+        }
+        Ok(config)
     }
 
     /// Persist config as pretty JSON. The symlink guard is intrinsic to `save`
