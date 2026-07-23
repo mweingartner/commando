@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "paths": [
+    "README.md",
+    "docs/add-harness-first-readme-quickstart.md",
+    "openspec/changes/add-harness-first-readme-quickstart",
+    "openspec/changes/add-harness-first-readme-quickstart/**",
+    "openspec/changes/archive/2026-07-23-add-harness-first-readme-quickstart"
+  ],
+  "shared_paths": []
+}

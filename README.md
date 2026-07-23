@@ -5,6 +5,43 @@ change into an explicit sequence of design, architecture, security, implementati
 test, documentation, deployment-readiness, and Git-delivery facts. GitHub Actions is
 not required and is not accepted as validation evidence.
 
+## Use MPD with ChatGPT or Claude Code
+
+**You focus on the outcome you want. The model drives the MPD workflow.**
+
+1. Open your MPD-enabled repository in ChatGPT/Codex or Claude Code. If MPD is not set
+   up yet, see [Everyday flow](#everyday-flow).
+2. Paste the matching prompt below and replace only `[describe the outcome you want]`.
+
+**ChatGPT / Codex**
+
+```text
+Use MPD to deliver this outcome: [describe the outcome you want].
+
+You drive the workflow: start with `mpd conduct`, follow every
+`mpd next --harness codex --context` brief, complete and gate each applicable phase,
+test the real result, and keep updates focused on outcomes, risks, and decisions.
+Do not ask me to run MPD commands. Stop only for a genuine product decision or
+external-release authorization you do not already have.
+```
+
+**Claude Code**
+
+```text
+Use MPD to deliver this outcome: [describe the outcome you want].
+
+You drive the workflow: start with `mpd conduct`, follow every
+`mpd next --harness claude-code --context` brief, complete and gate each applicable
+phase, test the real result, and keep updates focused on outcomes, risks, and decisions.
+Do not ask me to run MPD commands. Stop only for a genuine product decision or
+external-release authorization you do not already have.
+```
+
+That is the whole user workflow. The model creates the change, calls the stages in order,
+writes the required artifacts, builds and tests the result, fixes failures, and reports
+what actually shipped. If MPD is missing or the repository is not configured, the model
+should report the blocker and the exact setup step instead of pretending the workflow ran.
+
 MPD is deliberately not an oracle or an independent attestation service. Its trust
 boundary is a cooperative repository owner. An owner can replace the executable, edit
 Git state, or bypass hooks with `--no-verify`; MPD records and checks the normal path but
