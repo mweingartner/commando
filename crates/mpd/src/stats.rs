@@ -572,6 +572,7 @@ mod tests {
             build_output: None,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
         }
     }
 

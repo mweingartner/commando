@@ -1255,6 +1255,57 @@ fn check_staged_blocks_on_secret() {
     );
 }
 
+/// security-plan.md Condition 10 (commit-floor pinning): a secret staged in
+/// `design.md` (a pre-Build canonical process artifact) and, separately, in
+/// `test.md` (a post-Build one) is each caught by `scan_staged_postimages`
+/// via `mpd check --staged` (which backs `mpd hook pre-commit`) —
+/// independent of the D4 gate lanes and of Build/Test ever having run at
+/// all. This is the floor design.md D4 leaves deliberately unchanged.
+#[test]
+fn staged_commit_scan_catches_a_secret_in_both_a_pre_build_and_a_post_build_process_artifact() {
+    // Assembled from split literals so this test file itself carries no
+    // contiguous credential pattern.
+    let secret_line = format!("aws_key = AKIA{}\n", "IOSFODNN7EXAMPLE");
+
+    let sb = Sandbox::new("staged-secret-design");
+    sb.mpd(&["init"]);
+    sb.write("openspec/changes/staged-secret/design.md", &secret_line);
+    run(
+        "git",
+        &["add", "openspec/changes/staged-secret/design.md"],
+        &sb.dir,
+    );
+    let out = sb.mpd(&["check", "--staged"]);
+    assert!(
+        !out.status.success(),
+        "a staged secret in design.md must block"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("aws-access-key-id"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let sb = Sandbox::new("staged-secret-test");
+    sb.mpd(&["init"]);
+    sb.write("openspec/changes/staged-secret/test.md", &secret_line);
+    run(
+        "git",
+        &["add", "openspec/changes/staged-secret/test.md"],
+        &sb.dir,
+    );
+    let out = sb.mpd(&["check", "--staged"]);
+    assert!(
+        !out.status.success(),
+        "a staged secret in test.md must block"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("aws-access-key-id"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// SECURITY(plan) Condition 2 (scan-secrets-fail-closed): the wrapper-level
 /// unit tests prove `scan_secrets` returns `Err` on a tracked symlink; only a
 /// black-box run proves the CALLER blocks instead of swallowing it. A temp
@@ -2218,6 +2269,136 @@ fn strict_build_gate_refuses_and_then_accepts_missing_process_scope_entries() {
         retried_err.contains("trusted-policy-missing"),
         "the only remaining blocker must be the unrelated trusted-policy boundary: {retried_err}"
     );
+}
+
+/// design.md D5 (the d482a20 escape class): a TRACKED, dirty file outside
+/// the change's own declared manifest scope refuses the strict Build gate —
+/// reachable through the real binary since D5's guard runs before any
+/// Candidate is captured (before the certified-host trust wall). Untracked
+/// drift never refuses and `.mpd/state/<change>.json` never trips it — see
+/// closure.rs's own `scope_drift` unit tests for that coverage; every
+/// passing strict e2e test in this suite already proves the ledger
+/// exemption implicitly (its own gate calls dirty a tracked `.mpd/state/**`
+/// file between every strict gate without ever refusing).
+#[test]
+fn strict_build_gate_refuses_on_tracked_out_of_scope_drift_the_d482a20_shape() {
+    let sb = Sandbox::new("tracked-drift");
+    // A tracked, committed file that pre-dates the change entirely (ordinary
+    // pre-existing project content) — committed BEFORE `mpd init` installs
+    // the pre-commit hook, so this plain commit is never itself subject to
+    // change-scope governance (which does not exist yet).
+    sb.write("unrelated/thing.txt", "committed baseline\n");
+    let add_out = run("git", &["add", "unrelated/thing.txt"], &sb.dir);
+    assert!(
+        add_out.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let commit_out = run(
+        "git",
+        &["commit", "-q", "-m", "unrelated committed baseline"],
+        &sb.dir,
+    );
+    assert!(
+        commit_out.status.success(),
+        "git commit: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    write_strict_local_validation_config(&sb);
+
+    let change = "trackeddrift";
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix"])
+        .status
+        .success());
+    sb.write(
+        &format!("openspec/changes/{change}/manifest.json"),
+        &format!(
+            "{{\n  \"version\": 1,\n  \"paths\": [\"crates/**\", \"openspec/changes/{change}/**\", \"docs/{change}.md\"],\n  \"shared_paths\": []\n}}\n"
+        ),
+    );
+    write_thing_spec(&sb, change);
+    fill_artifacts(&sb, change);
+
+    author_judgment(&sb, change, "architecture");
+    assert_gate_ok(&sb, "architecture");
+    author_judgment(&sb, change, "security-plan");
+    assert_gate_ok(&sb, "security-plan");
+
+    // Dirty the tracked out-of-scope file WITHOUT committing — the exact
+    // d482a20 class: swept unvalidated into the landing commit today.
+    sb.write("unrelated/thing.txt", "dirty and out of scope\n");
+
+    let blocked = sb.mpd(&["gate", "build", "--pass"]);
+    assert!(
+        !blocked.status.success(),
+        "tracked out-of-scope drift must refuse the strict Build gate"
+    );
+    let err = String::from_utf8_lossy(&blocked.stderr);
+    assert!(err.contains("unrelated/thing.txt"), "{err}");
+    assert!(err.contains("declared scope are dirty"), "{err}");
+}
+
+/// design.md D4 (the prose secret-scan lane): a secret in `security-plan.md`
+/// — an already-PASSed judgment artifact that carries no freshness
+/// dependency binding, so editing it never rewinds an earlier phase, unlike
+/// `design.md` — refuses the strict Build gate, reachable through the real
+/// binary since the D4 lane runs before any Candidate is even captured.
+#[test]
+fn strict_build_gate_refuses_on_a_secret_in_an_already_passed_process_artifact() {
+    let sb = Sandbox::new("build-prose-secret");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    write_strict_local_validation_config(&sb);
+
+    let change = "prosesecret";
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix"])
+        .status
+        .success());
+    sb.write(
+        &format!("openspec/changes/{change}/manifest.json"),
+        &format!(
+            "{{\n  \"version\": 1,\n  \"paths\": [\"crates/**\", \"openspec/changes/{change}/**\", \"docs/{change}.md\"],\n  \"shared_paths\": []\n}}\n"
+        ),
+    );
+    write_thing_spec(&sb, change);
+    fill_artifacts(&sb, change);
+    author_judgment(&sb, change, "architecture");
+    assert_gate_ok(&sb, "architecture");
+    author_judgment(&sb, change, "security-plan");
+    assert_gate_ok(&sb, "security-plan");
+
+    // Plant a secret in security-plan.md — uncommitted, in-scope process
+    // prose, already gated PASS. Split from the literal so this test file
+    // itself stays scanner-clean (checks/secrets.rs's own fixture
+    // convention) while the runtime value exercises the built-in AWS-key
+    // rule at full strength.
+    let secret_line = format!("key = AKIA{}", "IOSFODNN7EXAMPLE");
+    let security_plan_path = sb
+        .dir
+        .join(format!("openspec/changes/{change}/security-plan.md"));
+    let mut security_plan = std::fs::read_to_string(&security_plan_path).unwrap();
+    security_plan.push_str(&format!("\n{secret_line}\n"));
+    sb.write(
+        &format!("openspec/changes/{change}/security-plan.md"),
+        &security_plan,
+    );
+
+    let blocked = sb.mpd(&["gate", "build", "--pass"]);
+    assert!(
+        !blocked.status.success(),
+        "a secret in a process artifact must refuse the strict Build gate"
+    );
+    let err = String::from_utf8_lossy(&blocked.stderr);
+    assert!(err.contains("secret finding"), "{err}");
 }
 
 /// Security-code condition CA / design.md Condition 2: drive strict Build's

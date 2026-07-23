@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-pub const CANDIDATE_SCHEMA: u32 = 1;
+pub const CANDIDATE_SCHEMA: u32 = 2;
 const CANDIDATE_RECORD_SCHEMA: u32 = 1;
 const MAX_CANDIDATE_ENTRIES: usize = 100_000;
 const MAX_CANDIDATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -283,7 +283,11 @@ impl CapturedCandidate {
             return Err("candidate base HEAD drifted".into());
         }
         let statuses = git::status_v2(root).map_err(|e| e.to_string())?;
-        let (plan, _) = overlay_plan(&manifest, &statuses)?;
+        let (plan, _) = overlay_plan(
+            &manifest,
+            &self.projection.capture.subject.change,
+            &statuses,
+        )?;
         if overlay_digest(&plan)? != self.projection.capture.declared_status_digest {
             return Err("candidate declared status drifted".into());
         }
@@ -318,6 +322,7 @@ impl CapturedCandidate {
         let observed = inventory_read_only_projection(
             self.root(),
             &manifest,
+            &self.projection.capture.subject.change,
             &deleted_paths(&self.projection.entries)?,
         )?;
         if observed != self.projection.entries {
@@ -363,7 +368,11 @@ pub fn reopen_candidate(
     capture: &CandidateCapture,
 ) -> Result<CandidateProjection, String> {
     if capture.subject.version != CANDIDATE_SCHEMA {
-        return Err("unsupported candidate subject version".into());
+        return Err(
+            "unsupported candidate subject version; rewind Build to recapture under the \
+             current schema"
+                .into(),
+        );
     }
     Digest::from_hex(&capture.subject.id).map_err(|_| "candidate ID is invalid")?;
     let candidates = candidate_parent_read_only(root)?;
@@ -400,6 +409,7 @@ pub fn reopen_candidate(
         &candidates,
         &capture.subject.id,
         &manifest,
+        &capture.subject.change,
         &deletions,
         &first.record.entries,
     )?;
@@ -553,9 +563,9 @@ where
     let base = local_validation::capture_subject(root, Some("HEAD"))?;
     let index_before = git::index_identity(root).map_err(|e| e.to_string())?;
     let status_before = git::status_v2(root).map_err(|e| e.to_string())?;
-    let (plan, mut excluded) = overlay_plan(&manifest, &status_before)?;
+    let (plan, mut excluded) = overlay_plan(&manifest, change, &status_before)?;
     validate_plan_collisions(&plan)?;
-    validate_worktree_surface(root, &manifest, &plan)?;
+    validate_worktree_surface(root, &manifest, change, &plan)?;
 
     let candidates = candidate_parent(root)?;
     let mut materialized =
@@ -563,6 +573,7 @@ where
     let mut preserve_published_root_on_error = false;
     let capture_result = (|| {
         prune_mutable_process_paths(&materialized.root)?;
+        prune_change_process_artifacts(&materialized.root, change)?;
         let mut observed_overlays = BTreeMap::new();
         for item in &plan {
             let observed = apply_overlay(root, &materialized.root, item, hook)?;
@@ -576,7 +587,7 @@ where
             .filter(|item| item.source == OverlaySource::Deleted)
             .map(|item| item.path.clone())
             .collect();
-        let entries = inventory_projection(&materialized.root, &manifest, &deletion_set)?;
+        let entries = inventory_projection(&materialized.root, &manifest, change, &deletion_set)?;
         validate_inventory(&entries)?;
 
         hook(CaptureHookPoint::BeforeGitReobserve, root);
@@ -590,7 +601,8 @@ where
             overlays: &observed_overlays,
         };
         reobserve_inputs(root, &expected, hook)?;
-        let second_inventory = inventory_projection(&materialized.root, &manifest, &deletion_set)?;
+        let second_inventory =
+            inventory_projection(&materialized.root, &manifest, change, &deletion_set)?;
         if second_inventory != entries {
             return Err("candidate projection changed during capture".into());
         }
@@ -671,6 +683,7 @@ where
                     &candidates,
                     &subject.id,
                     &manifest,
+                    change,
                     &deletion_set,
                     &entries,
                 )?;
@@ -800,6 +813,7 @@ where
                     &candidates,
                     &subject.id,
                     &manifest,
+                    change,
                     &deletion_set,
                     &entries,
                 )?;
@@ -902,7 +916,12 @@ fn may_contain_declared_descendant(manifest: &ChangeManifest, directory: &str) -
         .any(|pattern| crate::pathmatch::glob_may_match_descendant(pattern, directory))
 }
 
-fn mutable_process_path(path: &str) -> bool {
+/// Whether `path` is one of the MPD-owned mutable process paths that are
+/// never part of a Candidate — always excluded regardless of manifest
+/// declaration. `pub(crate)` (design.md D2/D5) so `closure::scope_drift`
+/// reuses this exact classifier rather than re-listing it, and the two
+/// subsystems cannot silently drift apart.
+pub(crate) fn mutable_process_path(path: &str) -> bool {
     path == ".mpd/state"
         || path.starts_with(".mpd/state/")
         || path == ".mpd/current"
@@ -951,20 +970,36 @@ fn status_choice(xy: &str) -> Result<OverlaySource, String> {
 
 fn overlay_plan(
     manifest: &ChangeManifest,
+    change: &str,
     statuses: &[StatusEntry],
 ) -> Result<(Vec<OverlayPlanEntry>, Vec<ExcludedDirtyPath>), String> {
     let mut plan = BTreeMap::<String, OverlayPlanEntry>::new();
     let mut excluded = Vec::new();
     let mut add = |path: &str, source: OverlaySource, status: String| -> Result<(), String> {
         validate_candidate_path(path)?;
-        if mutable_process_path(path) || !declared(manifest, path) {
+        if mutable_process_path(path) {
             excluded.push(ExcludedDirtyPath {
                 path_bytes: path.as_bytes().to_vec(),
-                status: if mutable_process_path(path) {
-                    format!("process-state-excluded:{status}")
-                } else {
-                    status
-                },
+                status: format!("process-state-excluded:{status}"),
+            });
+            return Ok(());
+        }
+        // design.md D2: the change's own eleven canonical process artifacts
+        // are excluded here too — NOT just when undeclared — because
+        // `missing_process_scope` requires the manifest to declare
+        // `openspec/changes/<change>/**`, so a process artifact would
+        // otherwise pass `declared(manifest, path)` and enter the Candidate.
+        if closure::is_change_process_artifact(change, path) {
+            excluded.push(ExcludedDirtyPath {
+                path_bytes: path.as_bytes().to_vec(),
+                status: format!("change-artifact-excluded:{status}"),
+            });
+            return Ok(());
+        }
+        if !declared(manifest, path) {
+            excluded.push(ExcludedDirtyPath {
+                path_bytes: path.as_bytes().to_vec(),
+                status,
             });
             return Ok(());
         }
@@ -1046,6 +1081,7 @@ fn validate_plan_collisions(plan: &[OverlayPlanEntry]) -> Result<(), String> {
 fn validate_worktree_surface(
     root: &Path,
     manifest: &ChangeManifest,
+    change: &str,
     plan: &[OverlayPlanEntry],
 ) -> Result<(), String> {
     let tracked: BTreeSet<String> = git::ls_files(root)
@@ -1054,13 +1090,22 @@ fn validate_worktree_surface(
         .collect();
     let planned: BTreeSet<&str> = plan.iter().map(|entry| entry.path.as_str()).collect();
     let mut remaining = MAX_CANDIDATE_ENTRIES;
-    validate_worktree_directory(root, root, manifest, &tracked, &planned, &mut remaining)
+    validate_worktree_directory(
+        root,
+        root,
+        manifest,
+        change,
+        &tracked,
+        &planned,
+        &mut remaining,
+    )
 }
 
 fn validate_worktree_directory(
     root: &Path,
     directory: &Path,
     manifest: &ChangeManifest,
+    change: &str,
     tracked: &BTreeSet<String>,
     planned: &BTreeSet<&str>,
     remaining: &mut usize,
@@ -1082,7 +1127,12 @@ fn validate_worktree_directory(
         }
         let metadata = fs::symlink_metadata(&path)
             .map_err(|e| format!("cannot inspect candidate worktree entry: {e}"))?;
-        if mutable_process_path(&relative) {
+        // design.md D2: the change's own eleven canonical process artifacts
+        // are deliberately excluded from the overlay/tracked union
+        // regardless of git status, so their absence here is never the
+        // omission bug this independent walk exists to catch.
+        if mutable_process_path(&relative) || closure::is_change_process_artifact(change, &relative)
+        {
             continue;
         }
         let relevant = declared(manifest, &relative)
@@ -1103,7 +1153,9 @@ fn validate_worktree_directory(
             continue;
         }
         if metadata.is_dir() {
-            validate_worktree_directory(root, &path, manifest, tracked, planned, remaining)?;
+            validate_worktree_directory(
+                root, &path, manifest, change, tracked, planned, remaining,
+            )?;
         } else if metadata.is_file() {
             if declared(manifest, &relative)
                 && !tracked.contains(&relative)
@@ -2111,6 +2163,7 @@ where
 fn inventory_projection(
     root: &Path,
     manifest: &ChangeManifest,
+    change: &str,
     deletions: &BTreeSet<String>,
 ) -> Result<Vec<CandidateEntry>, String> {
     let mut entries = Vec::new();
@@ -2120,6 +2173,7 @@ fn inventory_projection(
         root,
         root,
         manifest,
+        change,
         &mut entries,
         &mut remaining_entries,
         &mut remaining_bytes,
@@ -2141,10 +2195,11 @@ fn inventory_projection(
 fn inventory_read_only_projection(
     root: &Path,
     manifest: &ChangeManifest,
+    change: &str,
     deletions: &BTreeSet<String>,
 ) -> Result<Vec<CandidateEntry>, String> {
     let before = projection_metadata_snapshot(root)?;
-    let inventory = inventory_projection(root, manifest, deletions)?;
+    let inventory = inventory_projection(root, manifest, change, deletions)?;
     let after = projection_metadata_snapshot(root)?;
     if before != after {
         return Err("candidate projection metadata drifted during inventory".into());
@@ -2321,6 +2376,7 @@ fn verify_retained_projection(
     parent: &Path,
     id: &str,
     manifest: &ChangeManifest,
+    change: &str,
     deletions: &BTreeSet<String>,
     expected: &[CandidateEntry],
 ) -> Result<(u64, u64), String> {
@@ -2341,7 +2397,7 @@ fn verify_retained_projection(
             return Err("retained candidate is not owner-only and read-only".into());
         }
     }
-    if inventory_read_only_projection(root, manifest, deletions)? != expected {
+    if inventory_read_only_projection(root, manifest, change, deletions)? != expected {
         return Err("retained candidate inventory does not match its ID".into());
     }
     let middle = fs::symlink_metadata(root)
@@ -2349,7 +2405,7 @@ fn verify_retained_projection(
     if !same_directory_identity(&before, &middle) {
         return Err("retained candidate changed identity during inventory".into());
     }
-    if inventory_read_only_projection(root, manifest, deletions)? != expected {
+    if inventory_read_only_projection(root, manifest, change, deletions)? != expected {
         return Err("retained candidate inventory changed during retry".into());
     }
     let after =
@@ -2392,6 +2448,7 @@ fn inventory_directory(
     projection_root: &Path,
     directory: &Path,
     manifest: &ChangeManifest,
+    change: &str,
     out: &mut Vec<CandidateEntry>,
     remaining_entries: &mut usize,
     remaining_bytes: &mut u64,
@@ -2422,6 +2479,7 @@ fn inventory_directory(
                 projection_root,
                 &path,
                 manifest,
+                change,
                 out,
                 remaining_entries,
                 remaining_bytes,
@@ -2430,6 +2488,17 @@ fn inventory_directory(
             *remaining_bytes = remaining_bytes
                 .checked_sub(metadata.len())
                 .ok_or("candidate aggregate bytes exceed their cap")?;
+            // Fail-closed defense in depth (security-plan.md Condition 2/6):
+            // `prune_change_process_artifacts` already removed every one of
+            // `change`'s eleven canonical process artifacts from the base
+            // tree before overlay, so physically encountering one here proves
+            // the prune did not run (or was bypassed) — this is always an
+            // ERROR, never a skip, regardless of manifest declaration.
+            if closure::is_change_process_artifact(change, &relative) {
+                return Err(format!(
+                    "candidate projection retains a change process artifact: {relative:?}"
+                ));
+            }
             if declared(manifest, &relative) && !mutable_process_path(&relative) {
                 out.push(hash_projection_file(&path, &relative)?);
             }
@@ -2543,6 +2612,46 @@ fn prune_mutable_process_paths(root: &Path) -> Result<(), String> {
         ".mpd/cache",
     ] {
         remove_projection_path(&root.join(relative))?;
+    }
+    Ok(())
+}
+
+/// Prune `change`'s own eleven canonical process artifacts (design.md
+/// D1/D2) from a materialized base-HEAD projection, immediately after
+/// [`prune_mutable_process_paths`]. Deliberately file-only and NOT a mirror
+/// of [`remove_projection_path`]'s directory recursion: every one of the
+/// eleven paths is always a plain markdown file, so a directory or special
+/// file occupying one refuses instead of being recursively pruned
+/// (security-plan.md Condition 6 — "an artifact-path directory is an error,
+/// not a recursive prune"). A symlink in the base tree also refuses. Absence
+/// is legitimate (the artifact simply hasn't been authored yet) and is not
+/// an error.
+fn prune_change_process_artifacts(root: &Path, change: &str) -> Result<(), String> {
+    for relative in closure::change_process_artifact_paths(change) {
+        let path = root.join(&relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "change process artifact is a symlink in base tree: {relative:?}"
+                ));
+            }
+            Ok(metadata) if metadata.is_file() => {
+                fs::remove_file(&path).map_err(|e| {
+                    format!("cannot prune change process artifact {relative:?}: {e}")
+                })?;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "change process artifact path is not a regular file in base tree: {relative:?}"
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect change process artifact {relative:?}: {error}"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -3177,6 +3286,7 @@ mod tests {
             build_output: None,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
         }
     }
 
@@ -3746,6 +3856,57 @@ mod tests {
 
             reopen_candidate(&repo.root, &recovered.projection.capture).unwrap();
             recovered.cleanup().unwrap();
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+        /// design.md D1/D2's central claim, pinned as a property (design.md
+        /// Condition 14 / tasks.md 2.4): ARBITRARY UNCOMMITTED bytes written
+        /// to the change's own `design.md` (one of the eleven canonical
+        /// process artifacts) never move the Candidate id — no matter what
+        /// the prose says, including empty, multi-line, or Unicode content —
+        /// while a single flip of a byte in a DECLARED CODE file always does.
+        /// This is the reuse goal's foundation: a prose-only rewind must
+        /// leave `--reuse` eligible.
+        #[test]
+        fn prose_edits_never_move_the_candidate_id_but_a_declared_code_byte_flip_always_does(
+            prose_before in "[ -~\\n]{0,120}",
+            prose_after in "[ -~\\n]{0,120}",
+        ) {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CASE: AtomicUsize = AtomicUsize::new(0);
+            let case = CASE.fetch_add(1, Ordering::Relaxed);
+            let repo = Repo::new(&format!("prose-invariance-{case}"));
+            let change = "prose-invariance";
+            repo.write("src/value", b"fn f() { 1 }");
+            repo.manifest(change, &["src/**"]);
+            repo.write(
+                &format!("openspec/changes/{change}/design.md"),
+                prose_before.as_bytes(),
+            );
+            repo.commit_all("base with design.md");
+
+            let base = capture_candidate(&repo.root, change, &"a".repeat(64)).unwrap();
+            let base_id = base.projection.capture.subject.id.clone();
+            base.cleanup().unwrap();
+
+            // An arbitrary UNCOMMITTED prose rewrite: same id, every time.
+            repo.write(
+                &format!("openspec/changes/{change}/design.md"),
+                prose_after.as_bytes(),
+            );
+            let prose_edited =
+                capture_candidate(&repo.root, change, &"a".repeat(64)).unwrap();
+            prop_assert_eq!(&prose_edited.projection.capture.subject.id, &base_id);
+            prose_edited.cleanup().unwrap();
+
+            // A single declared CODE byte flip: always a different id.
+            repo.write("src/value", b"fn f() { 2 }");
+            let code_edited =
+                capture_candidate(&repo.root, change, &"a".repeat(64)).unwrap();
+            prop_assert_ne!(&code_edited.projection.capture.subject.id, &base_id);
+            code_edited.cleanup().unwrap();
         }
     }
 
@@ -4688,6 +4849,7 @@ mod tests {
         };
         assert!(overlay_plan(
             &manifest,
+            "reject",
             &[StatusEntry::Unmerged {
                 xy: "UU".into(),
                 path: "src/conflict".into()
@@ -4697,6 +4859,7 @@ mod tests {
         .contains("unmerged"));
         assert!(overlay_plan(
             &manifest,
+            "reject",
             &[StatusEntry::Ignored {
                 path: "src/ignored".into()
             }]
@@ -4710,11 +4873,13 @@ mod tests {
             .unwrap_err()
             .contains("entry cap"));
         let too_long = format!("src/{}", "x".repeat(MAX_CANDIDATE_PATH_BYTES));
-        assert!(
-            overlay_plan(&manifest, &[StatusEntry::Untracked { path: too_long }])
-                .unwrap_err()
-                .contains("path exceeds")
-        );
+        assert!(overlay_plan(
+            &manifest,
+            "reject",
+            &[StatusEntry::Untracked { path: too_long }]
+        )
+        .unwrap_err()
+        .contains("path exceeds"));
 
         let ignored_repo = Repo::new("reject-ignored");
         ignored_repo.write(".gitignore", b"src/ignored\n");
@@ -4746,12 +4911,229 @@ mod tests {
             &repo.root,
             &repo.root,
             &manifest,
+            "surface-pruning",
             &tracked,
             &planned,
             &mut remaining,
         )
         .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    // =====================================================================
+    // D1/D2 — change process artifact exclusion (candidate-scope-integrity)
+    // =====================================================================
+
+    /// design.md D2 / tasks.md 2.4: an untracked, uncommitted, DECLARED
+    /// process artifact (design.md, inside `openspec/changes/<change>/**`,
+    /// which the manifest declares) is routed to `excluded_dirty_paths` with
+    /// a `change-artifact-excluded:` status label, never into the candidate's
+    /// declared entries.
+    #[test]
+    fn dirty_untracked_change_process_artifact_is_excluded_with_a_change_artifact_status_label() {
+        let repo = Repo::new("dirty-prose-exclusion");
+        let change = "dirty-prose-exclusion";
+        repo.write("src/value", b"code");
+        let scope_pattern = format!("openspec/changes/{change}/**");
+        repo.manifest(change, &["src/**", &scope_pattern]);
+        repo.commit_all("base");
+        // Untracked, uncommitted.
+        repo.write(
+            &format!("openspec/changes/{change}/design.md"),
+            b"# dirty design\n",
+        );
+
+        let captured = capture_candidate(&repo.root, change, &"a".repeat(64)).unwrap();
+        let design_path = format!("openspec/changes/{change}/design.md");
+        let excluded = captured
+            .projection
+            .excluded_dirty_paths
+            .iter()
+            .find(|entry| entry.path_bytes == design_path.as_bytes())
+            .expect("dirty design.md must appear in excluded_dirty_paths");
+        assert!(
+            excluded.status.starts_with("change-artifact-excluded:"),
+            "{}",
+            excluded.status
+        );
+        assert!(
+            !captured
+                .projection
+                .entries
+                .iter()
+                .any(|e| e.path_bytes == design_path.as_bytes()),
+            "dirty design.md must be absent from the candidate's declared entries"
+        );
+        captured.cleanup().unwrap();
+    }
+
+    /// design.md D2: a COMMITTED process artifact is physically pruned from
+    /// the materialized candidate tree (not merely absent from `entries`) —
+    /// proves the prune actually removed base-HEAD bytes, not just that the
+    /// inventory happened to skip them.
+    #[test]
+    fn committed_change_process_artifact_is_pruned_from_the_candidate_projection() {
+        let repo = Repo::new("prune-committed-prose");
+        let change = "prune-committed-prose";
+        repo.write("src/value", b"code");
+        let scope_pattern = format!("openspec/changes/{change}/**");
+        repo.manifest(change, &["src/**", &scope_pattern]);
+        repo.write(
+            &format!("openspec/changes/{change}/design.md"),
+            b"# committed design\n",
+        );
+        repo.commit_all("base with committed design.md");
+
+        let captured = capture_candidate(&repo.root, change, &"a".repeat(64)).unwrap();
+        let design_in_candidate = captured
+            .root()
+            .join(format!("openspec/changes/{change}/design.md"));
+        assert!(
+            !design_in_candidate.exists(),
+            "a committed process artifact must be pruned from the retained candidate tree"
+        );
+        let design_path = format!("openspec/changes/{change}/design.md");
+        assert!(
+            !captured
+                .projection
+                .entries
+                .iter()
+                .any(|e| e.path_bytes == design_path.as_bytes()),
+            "design.md must not appear in the candidate's declared entries"
+        );
+        captured.cleanup().unwrap();
+    }
+
+    /// design.md D2 (rehash): a prose-only edit — even a DECLARED-scope one —
+    /// never drifts the retained candidate, while a declared CODE edit is
+    /// still detected exactly as before.
+    #[test]
+    fn rehash_stays_green_across_prose_edits_but_detects_drift_on_a_declared_code_edit() {
+        let repo = Repo::new("rehash-prose-vs-code");
+        let change = "rehash-prose-vs-code";
+        repo.write("src/value", b"code v1");
+        let scope_pattern = format!("openspec/changes/{change}/**");
+        repo.manifest(change, &["src/**", &scope_pattern]);
+        repo.write(&format!("openspec/changes/{change}/design.md"), b"# v1\n");
+        repo.commit_all("base");
+
+        let captured = capture_candidate(&repo.root, change, &"a".repeat(64)).unwrap();
+
+        repo.write(
+            &format!("openspec/changes/{change}/design.md"),
+            b"# v2 edited\n",
+        );
+        captured
+            .rehash(&repo.root)
+            .expect("a prose-only edit must never drift the candidate");
+
+        repo.write("src/value", b"code v2");
+        let error = captured.rehash(&repo.root).unwrap_err();
+        assert!(error.contains("drifted"), "{error}");
+
+        captured.cleanup().unwrap();
+    }
+
+    /// security-plan.md Condition 6: `prune_change_process_artifacts` errors
+    /// (never skips) on a symlink AND on a directory occupying one of the
+    /// eleven canonical paths in the base tree — an artifact-path directory
+    /// is an error, not a recursive prune (the directory and its contents
+    /// must still exist afterward).
+    #[test]
+    fn prune_change_process_artifacts_refuses_a_symlink_and_a_directory_in_base_tree() {
+        #[cfg(unix)]
+        {
+            let repo = Repo::new("prune-artifact-symlink");
+            let change = "prune-artifact-symlink";
+            let design_path = repo
+                .root
+                .join(format!("openspec/changes/{change}/design.md"));
+            fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("/etc/hosts", &design_path).unwrap();
+            let error = prune_change_process_artifacts(&repo.root, change).unwrap_err();
+            assert!(error.contains("symlink"), "{error}");
+        }
+
+        let repo = Repo::new("prune-artifact-directory");
+        let change = "prune-artifact-directory";
+        let design_path = repo
+            .root
+            .join(format!("openspec/changes/{change}/design.md"));
+        fs::create_dir_all(design_path.join("nested")).unwrap();
+        fs::write(design_path.join("nested/child"), b"decoy").unwrap();
+        let error = prune_change_process_artifacts(&repo.root, change).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
+        assert!(
+            design_path.join("nested/child").is_file(),
+            "an artifact-path directory must be refused, never recursively pruned"
+        );
+    }
+
+    /// security-plan.md Condition 6 (direct unit test): encountering a
+    /// physically present process artifact during inventory is an ERROR,
+    /// never a skip — proves the fail-closed defense-in-depth check, exactly
+    /// what would fire if `prune_change_process_artifacts` were ever bypassed
+    /// or ran against a materialized tree it hadn't yet visited.
+    #[test]
+    fn inventory_directory_fails_closed_on_a_physically_present_process_artifact() {
+        let repo = Repo::new("planted-artifact");
+        let change = "planted-artifact";
+        repo.write(
+            &format!("openspec/changes/{change}/design.md"),
+            b"# leaked\n",
+        );
+        let manifest = ChangeManifest {
+            version: 1,
+            paths: vec![format!("openspec/changes/{change}/**")],
+            shared_paths: Vec::new(),
+            publish: None,
+        };
+        let mut entries = Vec::new();
+        let mut remaining_entries = MAX_CANDIDATE_ENTRIES;
+        let mut remaining_bytes = MAX_CANDIDATE_TOTAL_BYTES;
+        let error = inventory_directory(
+            &repo.root,
+            &repo.root,
+            &manifest,
+            change,
+            &mut entries,
+            &mut remaining_entries,
+            &mut remaining_bytes,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("retains a change process artifact"),
+            "{error}"
+        );
+    }
+
+    /// design.md D3 / security-plan.md Condition 8: `CANDIDATE_SCHEMA` is 2
+    /// (participates in the id preimage, candidate.rs :2766-2779), and reopen
+    /// refuses a capture claiming a different schema, naming the Build-
+    /// rewind remedy (Condition 8).
+    #[test]
+    fn reopen_refuses_a_v1_subject_and_names_the_build_rewind_remedy() {
+        assert_eq!(
+            CANDIDATE_SCHEMA, 2,
+            "design.md D3: CANDIDATE_SCHEMA must be bumped 1 -> 2"
+        );
+        let repo = Repo::new("v1-reopen-refusal");
+        repo.write("src/value", b"code");
+        repo.manifest("v1-reopen-refusal", &["src/**"]);
+        repo.commit_all("base");
+        let captured = capture_candidate(&repo.root, "v1-reopen-refusal", &"a".repeat(64)).unwrap();
+        let mut v1_capture = captured.projection.capture.clone();
+        v1_capture.subject.version = 1;
+        let error = reopen_candidate(&repo.root, &v1_capture).unwrap_err();
+        assert!(
+            error.contains("unsupported candidate subject version"),
+            "{error}"
+        );
+        assert!(
+            error.contains("rewind Build to recapture under the current schema"),
+            "{error}"
+        );
+        captured.cleanup().unwrap();
     }
 
     #[test]

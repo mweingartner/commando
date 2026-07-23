@@ -9949,6 +9949,7 @@ mod tests {
             build_output: output,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
         };
         for stage in [
             "directory-created",
@@ -10127,6 +10128,7 @@ mod tests {
             build_output,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
         }
     }
 
@@ -10960,6 +10962,7 @@ mod tests {
             build_output,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
         };
         let mut ledger = crate::ledger::Ledger::new(
             "candidate-build",

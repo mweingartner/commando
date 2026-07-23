@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "paths": [
+    "crates/mpd/src/candidate.rs",
+    "crates/mpd/src/closure.rs",
+    "crates/mpd/src/cli.rs",
+    "crates/mpd/src/ledger.rs",
+    "crates/mpd/src/config.rs",
+    "crates/mpd/src/phase.rs",
+    "crates/mpd/src/checks/mod.rs",
+    "crates/mpd/src/checks/secrets.rs",
+    "crates/mpd/src/local_validation.rs",
+    "crates/mpd/src/stats.rs",
+    "crates/mpd/tests/e2e.rs",
+    "README.md",
+    "AGENTS.md",
+    ".mpd/directives/protocol.md",
+    "crates/mpd/assets/directives/protocol.md",
+    "docs/adoption-quickstart.md",
+    "docs/candidate-scope-integrity.md",
+    "openspec/changes/candidate-scope-integrity/**"
+  ],
+  "shared_paths": []
+}

@@ -3214,6 +3214,128 @@ fn evaluate_strict_objective_reuse(
     })
 }
 
+/// D5 (design.md): refuse a strict Build/Security(code)/Test gate — execute
+/// or `--reuse` — on TRACKED drift outside `change`'s own declared scope, the
+/// exact class that shipped unvalidated in the d482a20 escape (the Candidate
+/// overlay silently retained base-HEAD bytes for an undeclared dirty tracked
+/// file, which then rode along in the landing commit). Untracked drift is
+/// presumed user-owned — it cannot enter a commit without an explicit
+/// `git add` — and only prints a bounded advisory note, never refuses.
+/// Deliberately advisory-refusal UX, not an integrity authority: the
+/// Candidate binding, the D5b pre-commit guard, and commit coherence remain
+/// independently sufficient (security-plan.md's D5 audit).
+fn enforce_scope_drift(
+    root: &Path,
+    manifest: &closure::ChangeManifest,
+    change: &str,
+) -> Result<(), String> {
+    let drift = closure::scope_drift(root, manifest, change)?;
+    if !drift.untracked.is_empty() {
+        let shown: Vec<String> = drift
+            .untracked
+            .iter()
+            .take(5)
+            .map(|p| harness::terminal_safe(p))
+            .collect();
+        let more = drift.untracked.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "  note: {} untracked path(s) outside {change:?}'s declared scope: {}{suffix}",
+            drift.untracked.len(),
+            shown.join(", ")
+        );
+    }
+    if drift.tracked.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<String> = drift
+        .tracked
+        .iter()
+        .take(12)
+        .map(|p| harness::terminal_safe(p))
+        .collect();
+    let more = drift.tracked.len().saturating_sub(shown.len());
+    let suffix = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    Err(format!(
+        "tracked path(s) outside {change:?}'s declared scope are dirty: {}{suffix}; add the \
+         path(s) to openspec/changes/{change}/manifest.json \"paths\" if they belong to this \
+         change, or `git stash push -- <path>` if they don't",
+        shown.join(", ")
+    ))
+}
+
+/// D4 (design.md): the dedicated prose secret-scan lane over `change`'s own
+/// eleven canonical process artifacts (security-plan.md Conditions 1-4/9).
+/// Runs at every strict Build/Security(code)/Test execute and Build/Test
+/// `--reuse` gate, before any candidate capture/reopen/receipt evaluation.
+/// Enumerated by PATH (`checks::scan_change_prose`), so untracked and
+/// uncommitted prose is covered — not just what a `git ls-files`/staged scan
+/// would see. Fail-closed: a scan error, a finding surviving the allowlist,
+/// an in-tree gitleaks config the change directory must never own, or (when
+/// this repo's local-validation policy marks gitleaks `required`) an
+/// unavailable gitleaks tool are all gate refusals.
+fn enforce_prose_secret_scan(root: &Path, change: &str, config: &Config) -> Result<(), String> {
+    if checks::change_owns_gitleaks_config(root, change)? {
+        return Err(
+            "the change directory carries its own .gitleaks.toml/.gitleaksignore, which could \
+             blind the prose secret-scan lane; remove it before this gate can run"
+                .into(),
+        );
+    }
+    let report = checks::scan_change_prose(root, change)?;
+    let (findings, suppressed) =
+        crate::allowlist::Allowlist::load(root).filter(report.findings, root);
+    if suppressed > 0 {
+        println!("  {suppressed} prose secret finding(s) suppressed by allowlist.");
+    }
+    if !findings.is_empty() {
+        for f in &findings {
+            eprintln!("  secret: {}:{} [{}]", f.path, f.line, f.rule);
+        }
+        return Err(format!(
+            "{} prose secret finding(s) via {}",
+            findings.len(),
+            report.scanner
+        ));
+    }
+    let gitleaks_required = config
+        .local_validation
+        .as_ref()
+        .and_then(|local| local.tools.get("gitleaks"))
+        .is_some_and(|tool| matches!(tool.requirement, crate::config::ToolRequirement::Required));
+    let change_dir = format!("openspec/changes/{change}");
+    gitleaks_lane_verdict(checks::run_gitleaks(root, &change_dir), gitleaks_required)
+}
+
+/// security-plan.md Condition 2: a repo declaring gitleaks `required` (as
+/// this one does) must never let an unavailable gitleaks silently downgrade
+/// prose coverage — an absent tool here is a gate refusal, matching the
+/// sandbox lane's own requiredness. A repo without that declaration keeps
+/// `run_external_scanners`'s skipped-not-clean semantic. Pure and
+/// deterministic (never calls the real `gitleaks` binary itself) so the
+/// requiredness-parity decision is testable independent of whether gitleaks
+/// happens to be installed on the machine running the tests.
+fn gitleaks_lane_verdict(result: Option<bool>, gitleaks_required: bool) -> Result<(), String> {
+    match result {
+        Some(true) => Ok(()),
+        Some(false) => Err("gitleaks reported findings in the change's process artifacts".into()),
+        None if gitleaks_required => Err(
+            "gitleaks is required by local-validation policy but is unavailable for the prose \
+             secret-scan lane"
+                .into(),
+        ),
+        None => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_gate(
     phase_slug: String,
@@ -3341,7 +3463,7 @@ fn cmd_gate(
     // therefore bound to the same authored artifact that declared it.
     if ledger.strict && phase.judgment_artifact().is_some() {
         if let Some(message) =
-            strict_artifact_issues(&root, &change, phase, effective_risk, verdict, &actor)
+            strict_artifact_blocking_message(&root, &change, phase, effective_risk, verdict, &actor)
         {
             return Ok(gate_blocked(&message));
         }
@@ -3395,13 +3517,21 @@ fn cmd_gate(
         // guarantee at gate time. Run it first so an incomplete artifact refuses
         // deterministically, ahead of receipt evaluation. A waiver cannot reach
         // this path (waive + reuse is rejected at the top).
-        if ledger.strict {
-            if let Some(msg) =
-                strict_artifact_issues(&root, &change, phase, effective_risk, Verdict::Pass, &actor)
-            {
-                return Ok(gate_blocked(&msg));
+        let reused_judgment_artifact_bytes = if ledger.strict {
+            match strict_artifact_issues(
+                &root,
+                &change,
+                phase,
+                effective_risk,
+                Verdict::Pass,
+                &actor,
+            ) {
+                Ok(bytes) => bytes,
+                Err(msg) => return Ok(gate_blocked(&msg)),
             }
-        }
+        } else {
+            None
+        };
         let requested = crate::digest::Digest::from_hex(&receipt_hex)?;
         let origin = ledger
             .history
@@ -3433,6 +3563,27 @@ fn cmd_gate(
         // the judgment phases (which carry no candidate at all and keep the
         // plain reused record they always have).
         let strict_objective = if ledger.strict && matches!(phase, Phase::Build | Phase::Test) {
+            // D5/D4 (Build/Test `--reuse`): the same tracked-drift refusal and
+            // prose secret-scan lane the execute path runs, before
+            // `evaluate_strict_objective_reuse`'s internal Build recapture /
+            // Test reopen (design.md D4/D5; security-plan.md Condition 4 —
+            // the secret-smuggling e2e must cover this reuse site too).
+            let live_manifest =
+                closure::load_manifest(&root, &change).map_err(|e| e.to_string())?;
+            if let Err(message) = enforce_scope_drift(&root, &live_manifest, &change) {
+                return Ok(gate_blocked(&format!(
+                    "{} gate refused: {message}",
+                    phase.label()
+                )));
+            }
+            if let Err(message) =
+                enforce_prose_secret_scan(&root, &change, &Config::load_strict(&root)?)
+            {
+                return Ok(gate_blocked(&format!(
+                    "{} gate refused: {message}",
+                    phase.label()
+                )));
+            }
             Some(evaluate_strict_objective_reuse(
                 &root,
                 &change,
@@ -3470,6 +3621,9 @@ fn cmd_gate(
                 validation_receipt: strict_objective
                     .as_ref()
                     .map(|s| s.validation_receipt.clone()),
+                judgment_artifact_sha256: reused_judgment_artifact_bytes
+                    .as_ref()
+                    .map(|bytes| crate::digest::Digest::of_bytes(bytes).to_hex()),
             },
         )?;
         // L1 (Security-code): the same exact compare-and-swap the execute
@@ -3494,6 +3648,11 @@ fn cmd_gate(
         return Ok(0);
     }
 
+    // D6: the validated judgment-artifact bytes for the execute path's
+    // `GateRecord` (below), captured at whichever `strict_artifact_issues`
+    // call below actually runs for this verdict/phase — never a second read
+    // (security-plan.md Condition 5).
+    let mut executed_judgment_artifact_bytes: Option<Vec<u8>> = None;
     // Enforcement: a PASS/CONDITIONAL on a test/secret phase must be backed by
     // a real run — the gate cannot accept the caller's word.
     if verdict.advances() {
@@ -3528,9 +3687,14 @@ fn cmd_gate(
         // only after the judgment artifact has already been checked, so an
         // artifact/CLI mismatch cannot launch tools or publish a receipt.
         if ledger.strict && matches!(phase, Phase::Build | Phase::SecurityCode | Phase::Test) {
-            if let Some(message) =
-                strict_artifact_issues(&root, &change, phase, effective_risk, Verdict::Pass, &actor)
-            {
+            if let Some(message) = strict_artifact_blocking_message(
+                &root,
+                &change,
+                phase,
+                effective_risk,
+                Verdict::Pass,
+                &actor,
+            ) {
                 return Ok(gate_blocked(&message));
             }
             let cfg = Config::load_strict(&root)?;
@@ -3573,12 +3737,38 @@ fn cmd_gate(
                             scope_gaps.join(", ")
                         )));
                     }
+                    // D5: tracked drift outside this change's own scope
+                    // refuses before the Candidate is even captured (the
+                    // d482a20 escape class).
+                    if let Err(message) = enforce_scope_drift(&root, &live_manifest, &change) {
+                        return Ok(gate_blocked(&format!("Build gate refused: {message}")));
+                    }
+                    // D4: the dedicated prose secret-scan lane, before any
+                    // candidate capture/reopen/receipt evaluation.
+                    if let Err(message) = enforce_prose_secret_scan(&root, &change, &cfg) {
+                        return Ok(gate_blocked(&format!("Build gate refused: {message}")));
+                    }
                     let (pending, report) =
                         execute_strict_candidate_build(&root, &change, local, profile)?;
                     gate_candidate = Some(pending.capture().clone());
                     pending_candidate_build = Some(pending);
                     report
                 } else {
+                    // D5/D4 (Security(code)/Test execute): the same tracked-
+                    // drift refusal and prose secret-scan lane, before the
+                    // retained Candidate is even reopened.
+                    if let Err(message) = enforce_scope_drift(&root, &live_manifest, &change) {
+                        return Ok(gate_blocked(&format!(
+                            "{} gate refused: {message}",
+                            phase.label()
+                        )));
+                    }
+                    if let Err(message) = enforce_prose_secret_scan(&root, &change, &cfg) {
+                        return Ok(gate_blocked(&format!(
+                            "{} gate refused: {message}",
+                            phase.label()
+                        )));
+                    }
                     let capture = retained_candidate_for_objective_gate(&ledger, &change, phase)?;
                     // Reopen and rehash the immutable projection immediately
                     // before and after execution. This is deliberately not a
@@ -3879,10 +4069,16 @@ fn cmd_gate(
             // omitted. Validation is metadata-only; it never reads content into
             // output (Cond 2).
             evidence = validate_evidence(&root, &change, phase, evidence)?;
-            if let Some(msg) =
-                strict_artifact_issues(&root, &change, phase, effective_risk, Verdict::Pass, &actor)
-            {
-                return Ok(gate_blocked(&msg));
+            match strict_artifact_issues(
+                &root,
+                &change,
+                phase,
+                effective_risk,
+                Verdict::Pass,
+                &actor,
+            ) {
+                Ok(bytes) => executed_judgment_artifact_bytes = bytes,
+                Err(msg) => return Ok(gate_blocked(&msg)),
             }
         }
     }
@@ -3940,6 +4136,9 @@ fn cmd_gate(
             build_output,
             deploy_result,
             validation_receipt: structured_validation_receipt,
+            judgment_artifact_sha256: executed_judgment_artifact_bytes
+                .as_ref()
+                .map(|bytes| crate::digest::Digest::of_bytes(bytes).to_hex()),
         },
     )?;
     if verdict == Verdict::ConditionalPass {
@@ -4414,15 +4613,20 @@ fn contained_evidence(root: &Path, change: &str, raw: &str) -> Result<(String, S
 }
 
 /// The strict-tier structural check of `phase`'s judgment artifact. Returns
-/// `None` when the artifact is complete (or the phase has none), or the
-/// escape-bearing refusal message when it is missing/incomplete (Cond 15). The
-/// read goes through [`read_contained`] (containment-checked, symlink-refusing,
-/// size-capped): a symlinked change dir / artifact or an oversized file reads as
-/// `""` and fails the structural check — never followed, never read through
-/// (an intermediate-directory symlink escape is refused too). Artifact content is
-/// never surfaced (only the structural issue list). High-risk Security (code)
-/// additionally requires the `Independent review` + `Refutation` sections
-/// (design.md D6, layered on here rather than in `judgment_artifact`).
+/// `Ok(None)` when the phase has no judgment artifact; `Ok(Some(bytes))` when
+/// it does and is complete — the EXACT bytes just read and validated, so a
+/// caller computing D6's `judgment_artifact_sha256` never performs a second
+/// read of the same file (security-plan.md Condition 5 — a second read races
+/// a concurrent edit). `Err(message)` is the escape-bearing refusal when the
+/// artifact is missing/incomplete (Cond 15). The read goes through
+/// [`read_contained`] (containment-checked, symlink-refusing, size-capped): a
+/// symlinked change dir / artifact or an oversized file reads as `""` and
+/// fails the structural check — never followed, never read through (an
+/// intermediate-directory symlink escape is refused too). Artifact content is
+/// never surfaced in the error path (only the structural issue list).
+/// High-risk Security (code) additionally requires the `Independent review` +
+/// `Refutation` sections (design.md D6, layered on here rather than in
+/// `judgment_artifact`).
 fn strict_artifact_issues(
     root: &Path,
     change: &str,
@@ -4430,8 +4634,10 @@ fn strict_artifact_issues(
     risk: RiskLevel,
     expected_verdict: Verdict,
     expected_actor: &str,
-) -> Option<String> {
-    let (filename, sections) = phase.judgment_artifact()?;
+) -> Result<Option<Vec<u8>>, String> {
+    let Some((filename, sections)) = phase.judgment_artifact() else {
+        return Ok(None);
+    };
     let path = Project::new(root).change_dir(change).join(filename);
     let text = read_contained(root, &path);
     let mut required: Vec<&str> = sections.to_vec();
@@ -4466,18 +4672,35 @@ fn strict_artifact_issues(
         Err(error) => issues.push(format!("tasks.md stable-ID contract is invalid: {error}")),
     }
     if issues.is_empty() {
-        return None;
+        return Ok(Some(text.into_bytes()));
     }
     for issue in &issues {
         eprintln!("  artifact: {issue}");
     }
-    Some(format!(
+    Err(format!(
         "{} gate refused: {filename} incomplete ({} issue(s)). \
          Author it with `mpd brief {slug}`; Commando does not permit artifact waivers.",
         phase.label(),
         issues.len(),
         slug = phase.slug(),
     ))
+}
+
+/// Thin wrapper over [`strict_artifact_issues`] for call sites that need only
+/// the blocking message, not the validated bytes — D6's
+/// `judgment_artifact_sha256` is threaded exclusively from the two
+/// record-construction call sites that DO need the bytes (the reuse branch
+/// and the execute path immediately before their respective `GateRecord`s),
+/// never from an extra read here.
+fn strict_artifact_blocking_message(
+    root: &Path,
+    change: &str,
+    phase: Phase,
+    risk: RiskLevel,
+    expected_verdict: Verdict,
+    expected_actor: &str,
+) -> Option<String> {
+    strict_artifact_issues(root, change, phase, risk, expected_verdict, expected_actor).err()
 }
 
 /// Read the single bounded actor identity recorded by a canonical judgment
@@ -4737,7 +4960,7 @@ fn strict_archive_recheck(root: &Path, change: &str, ledger: &ledger::Ledger) ->
             refusals.push(format!("{} has no recorded gate actor", phase.label()));
             continue;
         };
-        if let Some(msg) = strict_artifact_issues(
+        if let Some(msg) = strict_artifact_blocking_message(
             root,
             change,
             phase,
@@ -5592,6 +5815,104 @@ fn cmd_identity(path: Option<String>, json: bool) -> CmdResult {
     Ok(0)
 }
 
+/// Derive `<change>` from an archived directory name shaped exactly
+/// `<YYYY-MM-DD>-<change>` — the reverse of [`dated_archive_matches`], used
+/// when the change name isn't already known (D5b: the pre-commit hook only
+/// ever has the staged PATH, never a caller-supplied name). `None` on
+/// anything that doesn't decompose exactly this way, including a candidate
+/// name that itself fails [`openspec_core::validate_change_name`] — never a
+/// partial/best-effort split.
+fn change_name_from_dated_archive_dir(dir_name: &str) -> Option<String> {
+    if dir_name.len() < 12 {
+        return None;
+    }
+    let (date, rest) = dir_name.split_at(10);
+    if !is_valid_date_prefix(date) {
+        return None;
+    }
+    let name = rest.strip_prefix('-')?;
+    openspec_core::validate_change_name(name).ok()?;
+    Some(name.to_string())
+}
+
+/// D5b (design.md): a mixed-landing pre-commit guard, independent of whether
+/// `.mpd/pending-closure` exists (that transient-pointer window is already
+/// covered by `staged_precommit_governance`'s own pending-scope check; this
+/// guard also covers a landing commit staged AFTER the pointer is gone, or a
+/// closure staged manually without ever passing through `mpd archive`). Any
+/// staged path (either side of a rename/copy) under
+/// `openspec/changes/archive/<dated>/…` names an archived change; every
+/// staged path in the SAME commit must then satisfy `closure::allowed`
+/// against THAT change's recorded `archive_closure.allowed_paths` — closing
+/// the d482a20-class mixed-landing escape (security-plan.md Condition 7).
+/// Fails closed on an unreadable ledger, a missing `archive_closure`, or a
+/// malformed archive directory name; only commits staging an
+/// `openspec/changes/archive/**` path are affected — pure non-landing
+/// commits and pure out-of-scope commits are untouched. `--no-verify`
+/// bypasses this hook (policy-prohibited but not enforceable here);
+/// `publish --verify`'s coherence check remains the actual authority.
+fn enforce_landing_commit_scope(root: &Path) -> Result<(), String> {
+    let entries = git::diff_cached_name_status(root)
+        .map_err(|error| format!("pre-commit blocked: cannot parse staged changes: {error}"))?;
+    let mut staged_paths: Vec<String> = Vec::new();
+    let mut archived_changes: Vec<String> = Vec::new();
+    for entry in &entries {
+        for path in entry.orig_path.iter().chain(std::iter::once(&entry.path)) {
+            staged_paths.push(path.clone());
+            if let Some(rest) = path.strip_prefix("openspec/changes/archive/") {
+                let dated_dir = rest.split('/').next().unwrap_or(rest);
+                let change = change_name_from_dated_archive_dir(dated_dir).ok_or_else(|| {
+                    format!(
+                        "pre-commit blocked: malformed archive directory name {:?}",
+                        harness::terminal_safe(dated_dir)
+                    )
+                })?;
+                archived_changes.push(change);
+            }
+        }
+    }
+    staged_paths.sort();
+    staged_paths.dedup();
+    archived_changes.sort();
+    archived_changes.dedup();
+    for change in &archived_changes {
+        let ledger_doc = ledger::load(root, change).map_err(|error| {
+            format!(
+                "pre-commit blocked: cannot read ledger for archived change {change:?}: {error}"
+            )
+        })?;
+        let record = ledger_doc.archive_closure.ok_or_else(|| {
+            format!("pre-commit blocked: change {change:?} has no recorded archive closure")
+        })?;
+        // design.md D5b's contract is literal: EVERY staged path in a
+        // landing commit must satisfy `closure::allowed` against the
+        // change's recorded `allowed_paths` — no undeclared policy-path
+        // exemption. A change that legitimately touches a policy file (e.g.
+        // `.mpd/config.json`, `.mpd/directives/**`, a `.githooks/*` hook)
+        // declares it in its manifest so it lands in `allowed_paths` and
+        // passes on that basis, not on an implicit carve-out here.
+        let mut offenders: Vec<String> = staged_paths
+            .iter()
+            .filter(|path| !closure::allowed(&record.allowed_paths, path))
+            .cloned()
+            .collect();
+        if offenders.is_empty() {
+            continue;
+        }
+        offenders.truncate(12);
+        return Err(format!(
+            "pre-commit blocked: landing commit for {change:?} stages out-of-scope path(s): {}; \
+             commit them separately or declare them in the manifest before Build",
+            offenders
+                .iter()
+                .map(|p| harness::terminal_safe(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
 fn cmd_hook(command: HookCommand) -> CmdResult {
     match command {
         HookCommand::PreCommit { json } => {
@@ -5600,6 +5921,7 @@ fn cmd_hook(command: HookCommand) -> CmdResult {
             // any configured command; governance is read from exact index blobs.
             let root = find_root()?;
             staged_precommit_governance(&root)?;
+            enforce_landing_commit_scope(&root)?;
             let code = cmd_check(true, true)?;
             if json {
                 println!(
@@ -6336,8 +6658,14 @@ fn cmd_publish(verify: bool, json: bool) -> CmdResult {
         });
         let next = if coherence.coherent {
             "mpd publish --verify"
-        } else if coherence.ready_to_commit {
+        } else if coherence.ready_to_commit && coherence.blockers.is_empty() {
             "commit the exact archived result"
+        } else if coherence.ready_to_commit {
+            // D7: the ready-arm now also carries diagnostics when commits
+            // exist but none matches the archived closure (previously an
+            // empty-blockers silent failure) — the genuine awaiting-first-
+            // commit case (empty blockers) keeps the plain hint above.
+            "review the blockers — commits exist but none matches the archived closure"
         } else {
             "resolve the blockers below before publishing"
         };
@@ -6530,6 +6858,63 @@ fn closure_postimage_from_file(
         mode,
         bytes,
     })
+}
+
+/// Whether `filename` is the ONE file `phase.judgment_artifact()` names —
+/// the only postimage whose gate-recorded digest (design.md D6) must be
+/// re-verified at archive time. Architecture is the sole multi-file
+/// canonical phase (`proposal.md`/`design.md`/`tasks.md`); only `design.md`
+/// is its judgment artifact and carries a `judgment_artifact_sha256` pin —
+/// `proposal.md`/`tasks.md` are covered by the `ArchitecturePlan` freshness
+/// key instead and must never trip this check. A phase with no judgment
+/// artifact at all (e.g. Documentation) never carries a digest to verify
+/// and must never provoke `verify_judgment_artifact_digest`'s legacy-record
+/// warning either.
+fn is_phase_judgment_artifact(phase: Phase, filename: &str) -> bool {
+    phase
+        .judgment_artifact()
+        .is_some_and(|(name, _)| name == filename)
+}
+
+/// D6 (design.md): verify `phase`'s gate-time byte-pin against the archive-
+/// time postimage bytes just read for `filename`. A PRESENT digest that no
+/// longer matches is always fatal — never downgraded to a warning; an
+/// ABSENT digest (a legacy record predating this field) is accepted with a
+/// printed warning naming the phase and file (security-plan.md Condition
+/// 5). Restores — and extends to the post-Build judgment artifacts that
+/// were never protected before — the byte-pin the Candidate previously
+/// provided for pre-Build prose. Call ONLY when [`is_phase_judgment_artifact`]
+/// confirms `filename` is this phase's ONE judgment artifact — a sibling
+/// canonical file (e.g. Architecture's `proposal.md`/`tasks.md`) never has a
+/// pin recorded against it and must not be routed through this check.
+fn verify_judgment_artifact_digest(
+    phase: Phase,
+    filename: &str,
+    record: &GateRecord,
+    file: &closure::ClosureFilePostimage,
+) -> Result<(), String> {
+    match &record.judgment_artifact_sha256 {
+        Some(expected) => {
+            let observed = digest::Digest::of_bytes(&file.bytes).to_hex();
+            if &observed != expected {
+                return Err(format!(
+                    "cannot archive: {} artifact {filename:?} has changed since its gate \
+                     recorded a digest; rewind and rerun {}",
+                    phase.label(),
+                    phase.label()
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "warning: {} gate record has no judgment_artifact_sha256 (legacy record); \
+                 archiving {filename:?} without a byte-pin verification",
+                phase.label()
+            );
+            Ok(())
+        }
+    }
 }
 
 /// A stable, lowercase-kebab label for a transaction stage — matches its
@@ -6880,7 +7265,18 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
         let candidate = crate::candidate::reopen_candidate(&root, build_capture)?;
         let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
         let mut phase_postimages = Vec::new();
+        // design.md D6: since D1/D2 exclude ALL eleven canonical process
+        // artifacts from the Candidate, every judgment phase — including the
+        // pre-Build DesignMock/Architecture/DesignReview/SecurityPlan, which
+        // used to still be physically present in the Candidate tree — now
+        // needs a postimage lane to re-enter the archived closure.
+        // Architecture is the one multi-file phase: its
+        // proposal/design/tasks.md all share its ONE receipt id.
         for phase in [
+            Phase::DesignMock,
+            Phase::Architecture,
+            Phase::DesignReview,
+            Phase::SecurityPlan,
             Phase::SecurityCode,
             Phase::DesignSignoff,
             Phase::Test,
@@ -6899,20 +7295,25 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
                 .ok_or_else(|| format!("cannot archive: {} receipt is missing", phase.label()))?
                 .id
                 .to_hex();
-            let filename = match phase {
-                Phase::SecurityCode => "security-code.md",
-                Phase::DesignSignoff => "design-signoff.md",
-                Phase::Test => "test.md",
-                Phase::Documentation => "documentation.md",
-                Phase::DocValidation => "doc-validation.md",
-                _ => unreachable!(),
-            };
-            let relative = format!("openspec/changes/{change}/{filename}");
-            phase_postimages.push(closure::PhaseArtifactPostimage {
-                phase,
-                receipt_id,
-                file: closure_postimage_from_file(&root, &relative)?,
-            });
+            for filename in closure::canonical_phase_artifact_names(phase) {
+                let relative = format!("openspec/changes/{change}/{filename}");
+                let file = closure_postimage_from_file(&root, &relative)?;
+                // D6 pins ONLY the phase's judgment artifact (e.g.
+                // Architecture's `design.md`); a multi-file phase's sibling
+                // canonical files (`proposal.md`/`tasks.md`) carry no
+                // recorded digest and are covered by the `ArchitecturePlan`
+                // freshness key instead, and a phase with no judgment
+                // artifact at all (Documentation) must never provoke the
+                // legacy-record warning.
+                if is_phase_judgment_artifact(phase, filename) {
+                    verify_judgment_artifact_digest(phase, filename, record, &file)?;
+                }
+                phase_postimages.push(closure::PhaseArtifactPostimage {
+                    phase,
+                    receipt_id: receipt_id.clone(),
+                    file,
+                });
+            }
         }
         Some((candidate, candidate_root, phase_postimages))
     } else {
@@ -8498,17 +8899,19 @@ fn cmd_doctor(json: bool, fix: bool, scope: Option<String>, enforce: bool) -> Cm
 mod tests {
     use super::{
         archived_closure_fallback_scope, bounded_record_hint, canonical_artifact_actor,
-        canonical_artifact_verdict, check_documentation, check_sections, closure_recovery_hint,
-        current_validation_status, dated_archive_matches, doctor_expected_pending_remote,
-        doctor_installed_deploy_health, evaluate_strict_objective_reuse, extract_section,
-        has_unfilled_placeholder, is_valid_date_prefix, parse_exploit, receipt_failure_fact,
-        removed_manifest_change_name, require_closure_plan, resolve_runtime_head,
-        resolve_runtime_ledger, retained_candidate_for_objective_gate,
+        canonical_artifact_verdict, change_name_from_dated_archive_dir, check_documentation,
+        check_sections, closure_recovery_hint, current_validation_status, dated_archive_matches,
+        doctor_expected_pending_remote, doctor_installed_deploy_health,
+        enforce_landing_commit_scope, enforce_prose_secret_scan, enforce_scope_drift,
+        evaluate_strict_objective_reuse, extract_section, gitleaks_lane_verdict,
+        has_unfilled_placeholder, is_phase_judgment_artifact, is_valid_date_prefix, parse_exploit,
+        receipt_failure_fact, removed_manifest_change_name, require_closure_plan,
+        resolve_runtime_head, resolve_runtime_ledger, retained_candidate_for_objective_gate,
         revalidate_recorded_build_output, runtime_doctor_findings_with_receipt, sandbox_blocker,
         stages_removal_of, strict_actor_separation_issue, strict_gate_command, union_closure_scope,
         upstream_artifact_pointers, validate_candidate_report_binding, validate_evidence,
-        validate_introduced_by, validate_origin_receipt_candidate_binding, WorkflowOutcome,
-        REQUIRED_DOC_SECTIONS,
+        validate_introduced_by, validate_origin_receipt_candidate_binding,
+        verify_judgment_artifact_digest, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
     };
     use crate::closure;
     use crate::ledger::{self, ChangeKind, CheckSummary, GateRecord, RiskLevel, Verdict};
@@ -9019,6 +9422,485 @@ mod tests {
             build_output: None,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
+        }
+    }
+
+    /// security-plan.md Condition 5 / design.md D6: a present digest that no
+    /// longer matches the archive-time postimage bytes is ALWAYS fatal —
+    /// never downgraded to a warning; an absent digest (a legacy record
+    /// predating this field) is accepted; a present, matching digest is
+    /// accepted too.
+    #[test]
+    fn verify_judgment_artifact_digest_never_downgrades_a_mismatch_and_accepts_legacy_absence() {
+        let bytes = b"# security-plan.md\nreviewed content\n".to_vec();
+        let file = crate::closure::ClosureFilePostimage::regular(
+            "openspec/changes/x/security-plan.md",
+            bytes.clone(),
+        );
+        let matching_digest = crate::digest::Digest::of_bytes(&bytes).to_hex();
+
+        // Legacy record: no digest recorded at all — accepted.
+        let legacy = doctor_gate_record();
+        assert!(legacy.judgment_artifact_sha256.is_none());
+        verify_judgment_artifact_digest(Phase::SecurityPlan, "security-plan.md", &legacy, &file)
+            .expect("an absent digest (legacy record) must be accepted");
+
+        // A present digest that matches the reviewed bytes — accepted.
+        let mut matching = doctor_gate_record();
+        matching.judgment_artifact_sha256 = Some(matching_digest);
+        verify_judgment_artifact_digest(Phase::SecurityPlan, "security-plan.md", &matching, &file)
+            .expect("a matching digest must be accepted");
+
+        // A present digest that no longer matches (tampered post-gate edit)
+        // — ALWAYS fatal, never downgraded.
+        let mut tampered = doctor_gate_record();
+        tampered.judgment_artifact_sha256 = Some("f".repeat(64));
+        let error = verify_judgment_artifact_digest(
+            Phase::SecurityPlan,
+            "security-plan.md",
+            &tampered,
+            &file,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("has changed since its gate recorded a digest"),
+            "{error}"
+        );
+        assert!(error.contains("security-plan.md"), "{error}");
+    }
+
+    /// Security(code) Finding 1: `is_phase_judgment_artifact` selects EXACTLY
+    /// the one file `Phase::judgment_artifact` names for each phase — never a
+    /// sibling canonical file, and never anything for a phase with no
+    /// judgment artifact at all (Documentation).
+    #[test]
+    fn is_phase_judgment_artifact_selects_only_the_judgment_artifact_file() {
+        // Architecture is the sole multi-file phase: only design.md is its
+        // judgment artifact; proposal.md/tasks.md are siblings covered by
+        // the ArchitecturePlan freshness key, not this pin.
+        assert!(is_phase_judgment_artifact(Phase::Architecture, "design.md"));
+        assert!(!is_phase_judgment_artifact(
+            Phase::Architecture,
+            "proposal.md"
+        ));
+        assert!(!is_phase_judgment_artifact(Phase::Architecture, "tasks.md"));
+        // Single-file judgment phases match their own file.
+        assert!(is_phase_judgment_artifact(
+            Phase::SecurityPlan,
+            "security-plan.md"
+        ));
+        assert!(is_phase_judgment_artifact(Phase::Test, "test.md"));
+        // Documentation has no judgment artifact at all — never selected, so
+        // the loop never routes it through verify_judgment_artifact_digest
+        // (and therefore never prints its legacy-record warning).
+        assert!(!is_phase_judgment_artifact(
+            Phase::Documentation,
+            "documentation.md"
+        ));
+    }
+
+    /// Security(code) Finding 1 / design.md D6: replicates the archive
+    /// digest loop's per-file gating for Architecture's three canonical
+    /// files. All three present with design.md's digest matching → every
+    /// file passes; a mutated design.md → the check fails, naming
+    /// design.md; a mutated proposal.md with design.md's digest still
+    /// matching → the D6 check is never even reached for proposal.md,
+    /// so the loop must NOT fail.
+    #[test]
+    fn archive_digest_loop_pins_design_md_only_not_its_architecture_siblings() {
+        let design_bytes = b"# design.md\nReviewed architecture content.\n".to_vec();
+        let design_digest = crate::digest::Digest::of_bytes(&design_bytes).to_hex();
+        let mut record = doctor_gate_record();
+        record.judgment_artifact_sha256 = Some(design_digest);
+
+        let run_loop = |files: &[(&str, Vec<u8>)]| -> Result<(), String> {
+            for (filename, bytes) in files {
+                let file = crate::closure::ClosureFilePostimage::regular(
+                    format!("openspec/changes/x/{filename}"),
+                    bytes.clone(),
+                );
+                if is_phase_judgment_artifact(Phase::Architecture, filename) {
+                    verify_judgment_artifact_digest(Phase::Architecture, filename, &record, &file)?;
+                }
+            }
+            Ok(())
+        };
+
+        // All three canonical files present, design.md byte-identical to the
+        // gate-time review — every file passes.
+        run_loop(&[
+            (
+                "proposal.md",
+                b"# proposal.md\noriginal proposal.\n".to_vec(),
+            ),
+            ("design.md", design_bytes.clone()),
+            ("tasks.md", b"# tasks.md\noriginal tasks.\n".to_vec()),
+        ])
+        .expect("byte-identical design.md alongside untouched siblings must pass");
+
+        // design.md mutated after its gate recorded a digest — MUST fail,
+        // and the error must name design.md.
+        let mutated_design = run_loop(&[
+            (
+                "proposal.md",
+                b"# proposal.md\noriginal proposal.\n".to_vec(),
+            ),
+            ("design.md", b"# design.md\nTAMPERED content.\n".to_vec()),
+            ("tasks.md", b"# tasks.md\noriginal tasks.\n".to_vec()),
+        ])
+        .unwrap_err();
+        assert!(mutated_design.contains("design.md"), "{mutated_design}");
+        assert!(
+            mutated_design.contains("has changed since its gate recorded a digest"),
+            "{mutated_design}"
+        );
+
+        // proposal.md mutated, design.md untouched — the D6 pin is scoped to
+        // design.md only, so this must NOT trip the digest check.
+        run_loop(&[
+            ("proposal.md", b"# proposal.md\nEDITED proposal.\n".to_vec()),
+            ("design.md", design_bytes),
+            ("tasks.md", b"# tasks.md\noriginal tasks.\n".to_vec()),
+        ])
+        .expect("a mutated proposal.md must never trip the design.md-scoped D6 check");
+    }
+
+    /// security-plan.md Condition 1: `enforce_prose_secret_scan` refuses the
+    /// moment the change directory carries its own `.gitleaks.toml` or
+    /// `.gitleaksignore` — even with NO secret finding at all — because
+    /// either file COULD blind the additive gitleaks layer; a change
+    /// directory with neither, and clean prose, passes.
+    #[test]
+    fn enforce_prose_secret_scan_refuses_on_an_in_tree_gitleaks_config_even_without_a_finding() {
+        let root = doctor_test_dir("prose-lane-gitleaks-config");
+        let change = "prose-lane-change";
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/design.md")),
+            "# clean design\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::default();
+
+        // Clean baseline: no in-tree gitleaks config, no secret — passes.
+        enforce_prose_secret_scan(&root, change, &config)
+            .expect("clean prose with no in-tree gitleaks config must pass");
+
+        // A rule-disabling config planted alongside the prose — refused
+        // regardless of whether a secret is present.
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/.gitleaks.toml")),
+            "[extend]\nuseDefault = false\n",
+        )
+        .unwrap();
+        let error = enforce_prose_secret_scan(&root, change, &config).unwrap_err();
+        assert!(
+            error.contains(".gitleaks.toml") || error.contains(".gitleaksignore"),
+            "{error}"
+        );
+    }
+
+    /// security-plan.md Condition 2: an unavailable gitleaks (`None`) is a
+    /// gate refusal when local-validation policy marks it `required`, and
+    /// the pre-existing `run_external_scanners` skipped-not-clean semantic
+    /// otherwise — pure and deterministic, independent of whether gitleaks
+    /// happens to be installed on the machine running this test.
+    #[test]
+    fn gitleaks_lane_verdict_matches_requiredness_policy() {
+        assert!(
+            gitleaks_lane_verdict(None, false).is_ok(),
+            "optional + absent: skipped-not-clean"
+        );
+        let error = gitleaks_lane_verdict(None, true).unwrap_err();
+        assert!(
+            error.contains("required") && error.contains("unavailable"),
+            "{error}"
+        );
+        assert!(gitleaks_lane_verdict(Some(true), true).is_ok());
+        assert!(gitleaks_lane_verdict(Some(true), false).is_ok());
+        assert!(gitleaks_lane_verdict(Some(false), true).is_err());
+        assert!(gitleaks_lane_verdict(Some(false), false).is_err());
+    }
+
+    /// A real one-commit git repo for D5b's pre-commit-guard tests.
+    fn landing_repo(tag: &str) -> std::path::PathBuf {
+        let root = doctor_test_dir(tag);
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed in {}",
+                root.display()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "landing@example.invalid"]);
+        git(&["config", "user.name", "Landing Test"]);
+        std::fs::write(root.join("README.md"), b"base\n").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "base"]);
+        root
+    }
+
+    /// Write `.mpd/state/<change>.json` with a real `archive_closure`
+    /// carrying `allowed_paths` — the D5b fixture ledger.
+    fn write_archive_closure_ledger(root: &std::path::Path, change: &str, allowed_paths: &[&str]) {
+        let mut ledger = ledger::Ledger::new(change, "mpd", false, ChangeKind::Feature);
+        ledger.archive_closure = Some(crate::closure::ArchiveClosure {
+            base_commit: "a".repeat(40),
+            archive_path: format!("openspec/changes/archive/2026-01-01-{change}"),
+            transaction_id: crate::digest::Digest::of_bytes(b"txn"),
+            candidate_id: None,
+            allowed_paths: allowed_paths.iter().map(|s| s.to_string()).collect(),
+            system_paths: Vec::new(),
+            post_archive_digest: crate::digest::Digest::of_bytes(b"post"),
+            archived_at: 0,
+        });
+        std::fs::create_dir_all(root.join(".mpd/state")).unwrap();
+        std::fs::write(
+            root.join(format!(".mpd/state/{change}.json")),
+            serde_json::to_vec(&ledger).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// design.md D5b (reverse of `dated_archive_matches`): exact
+    /// `<YYYY-MM-DD>-<change>` decomposition, including rejecting a
+    /// syntactically-dated-looking prefix whose remainder fails
+    /// `validate_change_name`.
+    #[test]
+    fn change_name_from_dated_archive_dir_decomposes_exactly_and_rejects_malformed_names() {
+        assert_eq!(
+            change_name_from_dated_archive_dir("2026-07-19-my-change").as_deref(),
+            Some("my-change")
+        );
+        assert!(change_name_from_dated_archive_dir("my-change").is_none());
+        assert!(change_name_from_dated_archive_dir("2026-7-19-my-change").is_none());
+        assert!(change_name_from_dated_archive_dir("2026-07-19my-change").is_none());
+        assert!(change_name_from_dated_archive_dir("2026-07-19-Not_Valid!").is_none());
+    }
+
+    /// security-plan.md Condition 7: a pure, ordinary commit that stages
+    /// nothing under `openspec/changes/archive/**` is untouched — even with
+    /// no ledger present at all for any change.
+    #[test]
+    fn enforce_landing_commit_scope_ignores_a_pure_non_landing_commit() {
+        let root = landing_repo("d5b-untouched");
+        std::fs::write(root.join("src.rs"), b"fn f() {}\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "src.rs"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        enforce_landing_commit_scope(&root).expect("a non-landing commit must be untouched");
+    }
+
+    /// design.md D5b / security-plan.md Condition 7: a pure landing commit
+    /// (every staged path under the archived directory, matching
+    /// `allowed_paths`) passes; a MIXED landing commit (an out-of-scope path
+    /// staged alongside the archived directory in the SAME commit) is
+    /// blocked, naming the change and the offending path — the d482a20-class
+    /// mixed-landing escape.
+    #[test]
+    fn enforce_landing_commit_scope_blocks_a_mixed_landing_commit_and_passes_a_pure_one() {
+        let change = "d5b-change";
+        let archive_dir = format!("openspec/changes/archive/2026-01-01-{change}");
+
+        let root = landing_repo("d5b-pure");
+        write_archive_closure_ledger(&root, change, &[&archive_dir]);
+        std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+        std::fs::write(root.join(&archive_dir).join("design.md"), b"# design\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", &archive_dir])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        enforce_landing_commit_scope(&root).expect("a pure landing commit must pass");
+
+        let root = landing_repo("d5b-mixed");
+        write_archive_closure_ledger(&root, change, &[&archive_dir]);
+        std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+        std::fs::write(root.join(&archive_dir).join("design.md"), b"# design\n").unwrap();
+        std::fs::write(root.join("smuggled.txt"), b"out of scope\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let error = enforce_landing_commit_scope(&root).unwrap_err();
+        assert!(error.contains(change), "{error}");
+        assert!(error.contains("smuggled.txt"), "{error}");
+        assert!(error.contains("out-of-scope"), "{error}");
+    }
+
+    /// security-plan.md Condition 7: BOTH sides of a rename/copy staged
+    /// entry are checked against `closure::allowed` — an out-of-scope
+    /// ORIGIN path must not escape detection by riding along behind an
+    /// in-scope destination name.
+    #[test]
+    fn enforce_landing_commit_scope_checks_both_sides_of_a_staged_rename() {
+        let change = "d5b-rename";
+        let archive_dir = format!("openspec/changes/archive/2026-01-01-{change}");
+        let root = landing_repo("d5b-rename");
+        write_archive_closure_ledger(&root, change, &[&archive_dir]);
+
+        // An out-of-scope tracked file, committed as part of the repo's
+        // ordinary baseline.
+        std::fs::write(
+            root.join("outside.txt"),
+            b"content long enough for rename detection\n",
+        )
+        .unwrap();
+        assert!(Command::new("git")
+            .args(["add", "outside.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "-m", "baseline outside file"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        // Rename it INTO the archived directory — the destination now looks
+        // in-scope, but the ORIGIN side must still be checked.
+        std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+        assert!(Command::new("git")
+            .args([
+                "mv",
+                "outside.txt",
+                &format!("{archive_dir}/renamed-in.txt"),
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let error = enforce_landing_commit_scope(&root).unwrap_err();
+        assert!(error.contains("outside.txt"), "{error}");
+    }
+
+    /// Security(code) Finding 2: the undeclared policy-path exemption is
+    /// removed — design.md D5b's contract is literal, so a landing commit
+    /// that stages a policy file (`.mpd/config.json`) NOT present in the
+    /// change's recorded `allowed_paths` is refused exactly like any other
+    /// out-of-scope path; declaring it in the manifest (so it lands in
+    /// `allowed_paths`) is what lets it pass — never an implicit carve-out.
+    #[test]
+    fn enforce_landing_commit_scope_refuses_an_undeclared_policy_path_but_allows_a_declared_one() {
+        let change = "d5b-policy-path";
+        let archive_dir = format!("openspec/changes/archive/2026-01-01-{change}");
+
+        // Undeclared: `.mpd/config.json` is staged alongside the landing
+        // commit but is NOT in `allowed_paths` — must be refused.
+        let root = landing_repo("d5b-policy-undeclared");
+        write_archive_closure_ledger(&root, change, &[&archive_dir]);
+        std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+        std::fs::write(root.join(&archive_dir).join("design.md"), b"# design\n").unwrap();
+        std::fs::create_dir_all(root.join(".mpd")).unwrap();
+        std::fs::write(root.join(".mpd/config.json"), b"{}\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", &archive_dir, ".mpd/config.json"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let error = enforce_landing_commit_scope(&root).unwrap_err();
+        assert!(error.contains(change), "{error}");
+        assert!(error.contains(".mpd/config.json"), "{error}");
+        assert!(error.contains("out-of-scope"), "{error}");
+
+        // Declared: the SAME policy path, but this change's manifest
+        // declared it, so `allowed_paths` names it explicitly — passes.
+        let root = landing_repo("d5b-policy-declared");
+        write_archive_closure_ledger(&root, change, &[&archive_dir, ".mpd/config.json"]);
+        std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+        std::fs::write(root.join(&archive_dir).join("design.md"), b"# design\n").unwrap();
+        std::fs::create_dir_all(root.join(".mpd")).unwrap();
+        std::fs::write(root.join(".mpd/config.json"), b"{}\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", &archive_dir, ".mpd/config.json"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        enforce_landing_commit_scope(&root)
+            .expect("a declared policy path in allowed_paths must pass");
+    }
+
+    /// security-plan.md Condition 7: a malformed archive directory name, an
+    /// unreadable/missing ledger, and a ledger with no recorded
+    /// `archive_closure` each fail closed (block the commit) rather than
+    /// silently passing.
+    #[test]
+    fn enforce_landing_commit_scope_fails_closed_on_malformed_name_missing_ledger_and_missing_closure(
+    ) {
+        {
+            let root = landing_repo("d5b-malformed-name");
+            std::fs::create_dir_all(root.join("openspec/changes/archive/not-a-date")).unwrap();
+            std::fs::write(
+                root.join("openspec/changes/archive/not-a-date/design.md"),
+                b"# design\n",
+            )
+            .unwrap();
+            assert!(Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+            let error = enforce_landing_commit_scope(&root).unwrap_err();
+            assert!(
+                error.contains("malformed archive directory name"),
+                "{error}"
+            );
+        }
+        {
+            let root = landing_repo("d5b-missing-ledger");
+            let change = "no-such-ledger";
+            let archive_dir = format!("openspec/changes/archive/2026-01-01-{change}");
+            std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+            std::fs::write(root.join(&archive_dir).join("design.md"), b"# design\n").unwrap();
+            assert!(Command::new("git")
+                .args(["add", &archive_dir])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+            let error = enforce_landing_commit_scope(&root).unwrap_err();
+            assert!(error.contains("cannot read ledger"), "{error}");
+        }
+        {
+            let root = landing_repo("d5b-missing-closure");
+            let change = "no-closure";
+            let archive_dir = format!("openspec/changes/archive/2026-01-01-{change}");
+            let ledger = ledger::Ledger::new(change, "mpd", false, ChangeKind::Feature);
+            std::fs::create_dir_all(root.join(".mpd/state")).unwrap();
+            std::fs::write(
+                root.join(format!(".mpd/state/{change}.json")),
+                serde_json::to_vec(&ledger).unwrap(),
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join(&archive_dir)).unwrap();
+            std::fs::write(root.join(&archive_dir).join("design.md"), b"# design\n").unwrap();
+            assert!(Command::new("git")
+                .args(["add", &archive_dir, ".mpd/state"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+            let error = enforce_landing_commit_scope(&root).unwrap_err();
+            assert!(error.contains("no recorded archive closure"), "{error}");
         }
     }
 
@@ -9456,11 +10338,14 @@ mod tests {
         }
     }
 
-    /// A real git repository with a committed change manifest, a source
-    /// tree, `security/tool-lock.json` (the A0 hermetic input), and a
-    /// structurally valid strict `.mpd/config.json` — optionally opted into
-    /// the A0 `closure.hermetic_reuse` policy. Returns the repo root and the
-    /// exact `Config` value committed to disk.
+    /// A real git repository with a committed change manifest, a committed
+    /// `design.md` (design.md D1/D8: exercising the fixture with a real
+    /// process artifact present, not merely absent, is what makes the
+    /// prose-exclusion/reuse-synergy tests below meaningful), a source tree,
+    /// `security/tool-lock.json` (the A0 hermetic input), and a structurally
+    /// valid strict `.mpd/config.json` — optionally opted into the A0
+    /// `closure.hermetic_reuse` policy. Returns the repo root and the exact
+    /// `Config` value committed to disk.
     fn strict_reuse_repo(
         label: &str,
         change: &str,
@@ -9475,6 +10360,11 @@ mod tests {
         std::fs::write(
             root.join(format!("openspec/changes/{change}/manifest.json")),
             "{\n  \"version\": 1,\n  \"paths\": [\"**\"],\n  \"shared_paths\": []\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/design.md")),
+            "# Design v1\n",
         )
         .unwrap();
         let config = strict_reuse_config(hermetic);
@@ -9620,9 +10510,11 @@ mod tests {
 
     /// Reproduces `cmd_gate`'s `--reuse` decision sequence exactly: the
     /// shared `evidence_validity`/`evaluate_reuse` gate (byte-unchanged,
-    /// design.md Condition 8), then — for strict Build/Test — the new A2
-    /// `evaluate_strict_objective_reuse` equality set. Returns the
-    /// `GateRecord` `cmd_gate` would append.
+    /// design.md Condition 8), then — for strict Build/Test — the D4/D5
+    /// tracked-drift and prose-secret-scan guards (security-plan.md
+    /// Condition 4: the secret-smuggling e2e must cover this reuse site
+    /// too), and finally the A2 `evaluate_strict_objective_reuse` equality
+    /// set. Returns the `GateRecord` `cmd_gate` would append.
     #[allow(clippy::too_many_arguments)]
     fn attempt_strict_reuse(
         root: &std::path::Path,
@@ -9651,6 +10543,13 @@ mod tests {
         let validity = closure::evidence_validity(Some(origin_receipt), &current);
         closure::evaluate_reuse(phase, origin.record.verdict, origin_receipt, &validity)
             .map_err(|e| format!("cannot reuse {receipt_hex}: {e}"))?;
+        if matches!(phase, Phase::Build | Phase::Test) {
+            let live_manifest = closure::load_manifest(root, change).map_err(|e| e.to_string())?;
+            enforce_scope_drift(root, &live_manifest, change)
+                .map_err(|message| format!("{} gate refused: {message}", phase.label()))?;
+            enforce_prose_secret_scan(root, change, config)
+                .map_err(|message| format!("{} gate refused: {message}", phase.label()))?;
+        }
         let strict = evaluate_strict_objective_reuse(
             root,
             change,
@@ -9677,6 +10576,7 @@ mod tests {
             build_output: strict.build_output,
             deploy_result: None,
             validation_receipt: Some(strict.validation_receipt),
+            judgment_artifact_sha256: None,
         })
     }
 
@@ -9768,9 +10668,12 @@ mod tests {
     fn strict_build_and_test_reuse_succeed_on_a_byte_identical_candidate() {
         // Condition 2 (corrected firing set): simulates a rewind that leaves
         // the Candidate BYTE-IDENTICAL — an off-Candidate cause (persona/
-        // governance/risk re-derivation, repair-state, or a reverted edit),
-        // NOT a prose edit (the change's prose is in the Candidate via process
-        // scope, so editing it changes the id and correctly refuses reuse).
+        // governance/risk re-derivation, repair-state, or a reverted edit).
+        // A prose edit ALSO now leaves the Candidate byte-identical — since
+        // D1/D2 exclude the change's own eleven canonical process artifacts
+        // from the Candidate — see
+        // `strict_build_test_reuse_fires_after_an_uncommitted_prose_edit_
+        // rewind_synergy` below for that dedicated scenario (design.md D8).
         // `invalidate_for_freshness` (untouched) clears every gate record at
         // phase >= Architecture while `history` — and every still-valid Build/
         // Test receipt — survives; fresh judgment gates re-run, and Build/Test
@@ -9848,6 +10751,157 @@ mod tests {
         );
         assert!(test_record.build_output.is_none());
         assert!(test_record.validation_receipt.is_some());
+    }
+
+    /// design.md D8 / task 7.1 (the reuse-synergy scenario the corrected
+    /// firing set exists for): an UNCOMMITTED edit to `design.md` — the
+    /// change's own mandatory process artifact — leaves `base_tree`,
+    /// `manifest_digest`, `entries_digest`, `policy_digest`, and
+    /// `source_digest` all unchanged (D1/D2 exclude the eleven canonical
+    /// process artifacts from the Candidate), so the SAME candidate id
+    /// survives a rewind whose only Candidate-relevant delta is that prose
+    /// edit — Build/Test `--reuse` fire on it, Security(code) still always
+    /// re-executes fresh. A COMMITTED prose edit moves `base_tree` and
+    /// correctly forces fresh execution instead (design.md D8's "still
+    /// re-executes, correctly" list).
+    #[test]
+    fn strict_build_test_reuse_fires_after_an_uncommitted_prose_edit_rewind_synergy() {
+        let fixture = strict_reuse_fixture("prose-synergy", true);
+        let design_path = fixture
+            .root
+            .join(format!("openspec/changes/{}/design.md", fixture.change));
+
+        // (1) An uncommitted, in-scope prose edit does not move the id.
+        std::fs::write(&design_path, "# Design v2 — uncommitted edit\n").unwrap();
+        let (recaptured, _) = strict_reuse_candidate(&fixture.root, &fixture.change);
+        assert_eq!(
+            recaptured.subject.id, fixture.candidate.subject.id,
+            "an uncommitted prose edit must leave the Candidate id unchanged"
+        );
+
+        // (2) Simulate the rewind a prose-edit-driven Architecture/
+        // SecurityPlan re-drive performs: clear every gate at Architecture
+        // and beyond, then re-pass the judgment phases fresh.
+        let mut ledger = fixture.ledger.clone();
+        for phase in [
+            Phase::Architecture,
+            Phase::SecurityPlan,
+            Phase::Build,
+            Phase::SecurityCode,
+            Phase::Test,
+        ] {
+            ledger.gates.remove(&phase);
+        }
+        ledger.phase = Phase::Architecture;
+        ledger
+            .record(Phase::Architecture, doctor_gate_record())
+            .unwrap();
+        ledger
+            .record(Phase::SecurityPlan, doctor_gate_record())
+            .unwrap();
+
+        // (3) Build `--reuse` fires on the still byte-identical Candidate.
+        let build_record = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Build,
+            RiskLevel::Medium,
+            &ledger,
+            &fixture.config,
+            &fixture.build_receipt_hex,
+        )
+        .expect("Build reuse must fire after an uncommitted prose-only edit");
+        assert_eq!(
+            build_record.candidate.as_ref().unwrap().subject.id,
+            fixture.candidate.subject.id
+        );
+        let fresh_build_candidate = build_record.candidate.clone().unwrap();
+        ledger.record(Phase::Build, build_record).unwrap();
+
+        // (4) Security(code) always re-executes fresh — never reused — even
+        // though the Candidate is byte-identical.
+        let mut security_record = doctor_gate_record();
+        security_record.candidate = Some(fresh_build_candidate);
+        ledger.record(Phase::SecurityCode, security_record).unwrap();
+
+        // (5) Test `--reuse` fires on the same retained Candidate.
+        let test_record = attempt_strict_reuse(
+            &fixture.root,
+            &fixture.change,
+            Phase::Test,
+            RiskLevel::Medium,
+            &ledger,
+            &fixture.config,
+            &fixture.test_receipt_hex,
+        )
+        .expect("Test reuse must fire after an uncommitted prose-only edit");
+        assert_eq!(
+            test_record.candidate.as_ref().unwrap().subject.id,
+            fixture.candidate.subject.id
+        );
+
+        // (6) The COMMITTED variant moves `base_tree` and must NOT collapse
+        // to the same id — a committed edit always re-executes.
+        strict_reuse_commit(&fixture.root, "commit the prose edit");
+        let (committed_recapture, _) = strict_reuse_candidate(&fixture.root, &fixture.change);
+        assert_ne!(
+            committed_recapture.subject.id, fixture.candidate.subject.id,
+            "a COMMITTED prose edit moves base_tree and must force fresh execution"
+        );
+    }
+
+    /// security-plan.md Condition 4: the secret-smuggling e2e must cover
+    /// BOTH Build `--reuse` and Test `--reuse` — a secret planted in
+    /// `design.md` (uncommitted; D1/D2 exclude it from the Candidate, so
+    /// this would otherwise be a byte-identical-candidate reuse per D8) is
+    /// caught by the D4 prose lane, wired inside `attempt_strict_reuse`'s
+    /// strict-objective arm, BEFORE `evaluate_strict_objective_reuse` ever
+    /// runs — for both phases, never a silent reuse.
+    #[test]
+    fn strict_build_and_test_reuse_refuse_a_secret_planted_in_uncommitted_prose() {
+        for phase in [Phase::Build, Phase::Test] {
+            let fixture = strict_reuse_fixture(
+                if phase == Phase::Build {
+                    "secret-reuse-build"
+                } else {
+                    "secret-reuse-test"
+                },
+                true,
+            );
+            let design_path = fixture
+                .root
+                .join(format!("openspec/changes/{}/design.md", fixture.change));
+            // Split from the literal so this source file itself stays
+            // scanner-clean (mirrors checks/secrets.rs's own fixture
+            // convention) while the runtime value still exercises the
+            // built-in AWS-key rule at full strength.
+            let secret_line = format!("key = AKIA{}", "IOSFODNN7EXAMPLE");
+            std::fs::write(&design_path, format!("# design\n{secret_line}\n")).unwrap();
+
+            let receipt_hex = if phase == Phase::Build {
+                fixture.build_receipt_hex.clone()
+            } else {
+                fixture.test_receipt_hex.clone()
+            };
+            let error = attempt_strict_reuse(
+                &fixture.root,
+                &fixture.change,
+                phase,
+                RiskLevel::Medium,
+                &fixture.ledger,
+                &fixture.config,
+                &receipt_hex,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("gate refused"),
+                "phase={phase:?} error={error}"
+            );
+            assert!(
+                error.contains("secret finding"),
+                "phase={phase:?} error={error}"
+            );
+        }
     }
 
     #[test]
@@ -10055,6 +11109,85 @@ mod tests {
             .unwrap_err();
             assert!(
                 error.contains("differs from its own retained Candidate"),
+                "phase={phase:?} error={error}"
+            );
+        }
+    }
+
+    /// Security-plan.md Condition 8 / design.md D3: `CANDIDATE_SCHEMA` bumped
+    /// 1 -> 2 makes v1/v2 candidate ids disjoint namespaces. An origin whose
+    /// retained Candidate claims schema v1 (`candidate_capture` already
+    /// happens to, unchanged since before the bump) must never satisfy
+    /// `--reuse` under the current v2 binary — the final identity comparison
+    /// must observe a mismatch and force fresh execution, for BOTH Build and
+    /// Test, never a silent reuse. Every OTHER internal binding
+    /// (`validation_receipt.subject.requested`, `build_output.candidate_id`)
+    /// is kept self-consistent with the fake v1 candidate, so
+    /// `validate_origin_receipt_candidate_binding` passes and the schema/id
+    /// mismatch is the ONLY thing that can refuse.
+    #[test]
+    fn strict_build_and_test_reuse_refuse_a_v1_origin_candidate_under_the_v2_schema() {
+        for phase in [Phase::Build, Phase::Test] {
+            let fixture = strict_reuse_fixture(
+                if phase == Phase::Build {
+                    "v1-origin-build"
+                } else {
+                    "v1-origin-test"
+                },
+                true,
+            );
+            let mut ledger = fixture.ledger.clone();
+            let mut v1_candidate = candidate_capture('9');
+            assert_eq!(
+                v1_candidate.subject.version, 1,
+                "the fixture must actually simulate a pre-bump v1 subject"
+            );
+            // Keep the LIVE policy digest real (a policy mismatch would
+            // refuse earlier, for an unrelated reason) — only the schema/id
+            // must differ.
+            v1_candidate.subject.policy_digest = fixture.candidate.subject.policy_digest.clone();
+            {
+                let record = ledger.gates.get_mut(&phase).unwrap();
+                record.candidate = Some(v1_candidate.clone());
+                if let Some(validation_receipt) = record.validation_receipt.as_mut() {
+                    validation_receipt.subject.requested =
+                        format!("candidate:{}", v1_candidate.subject.id);
+                    validation_receipt.subject.commit = v1_candidate.subject.base_commit.clone();
+                    validation_receipt.subject.tree = v1_candidate.subject.base_tree.clone();
+                    validation_receipt.subject.pushed_oid =
+                        v1_candidate.subject.base_commit.clone();
+                    validation_receipt.candidate_policy_digest =
+                        v1_candidate.subject.policy_digest.clone();
+                    if let Some(output) = validation_receipt.build_output.as_mut() {
+                        output.candidate_id = Some(v1_candidate.subject.id.clone());
+                    }
+                }
+                if let Some(output) = record.build_output.as_mut() {
+                    output.candidate_id = Some(v1_candidate.subject.id.clone());
+                }
+            }
+            let receipt_hex = if phase == Phase::Build {
+                fixture.build_receipt_hex.clone()
+            } else {
+                fixture.test_receipt_hex.clone()
+            };
+            for event in ledger.history.iter_mut() {
+                if event.phase == phase {
+                    event.record = ledger.gates[&phase].clone();
+                }
+            }
+            let error = attempt_strict_reuse(
+                &fixture.root,
+                &fixture.change,
+                phase,
+                RiskLevel::Medium,
+                &ledger,
+                &fixture.config,
+                &receipt_hex,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("candidate identity has changed"),
                 "phase={phase:?} error={error}"
             );
         }

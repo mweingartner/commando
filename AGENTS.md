@@ -44,16 +44,17 @@ classifier can only raise it, never lower it.
 
 Keep the adversarial review; cut the mechanical re-work:
 
-- **Freeze prose artifacts before gating** — this is the real mitigation for the
-  rewind tax. Editing `design.md`/`proposal.md`/`tasks.md` *after* its gate rewinds to
-  Architecture AND changes the Candidate (the change's prose is folded into the
-  Candidate via mandatory process scope so the secret scanner covers it), so Build and
-  Test must re-execute. Author the plan fully, then gate once. Receipt **reuse** (`mpd
-  gate <phase> --pass --reuse <receipt>`, offered by `mpd next`) does NOT rescue a
-  prose-edit rewind — it fires only when a rewind leaves the Candidate byte-identical
-  (an off-Candidate cause: a persona/governance/risk re-derivation touching no in-scope
-  file, a `repair-state` rewind, or a reverted edit). SecurityCode always re-executes.
-  See README "Exact candidate and freshness".
+- **Editing prose after its gate still rewinds — but no longer re-executes the
+  sandbox.** The change's own process prose (`design.md`/`proposal.md`/`tasks.md` and
+  the judgment artifacts) is excluded from the Candidate and covered by a dedicated
+  secret-scan lane, so an *uncommitted* prose edit leaves the Candidate byte-identical:
+  the rewound judgment gates re-run (cheap), and Build/Test **reuse** their prior
+  receipts (`mpd gate <phase> --pass --reuse <receipt>`, offered by `mpd next`) instead
+  of re-executing. Freezing prose before gating is still the tidiest path (fewer
+  rewinds), but a late wording fix or a closed review condition is now cheap. Reuse
+  still re-executes for any in-scope source/config/spec/manifest edit, a *committed*
+  prose edit (base HEAD moves), and Security(code) always. See README "Exact candidate
+  and freshness".
 - **Tier-match the review to blast radius.** Spawn deep-tier persona subagents for
   real threat surface or novel logic; for a genuinely low-surface change (a config
   narrow, a back-compatible rename, a docs edit) author the Security/Doc artifacts
@@ -129,7 +130,11 @@ passed. A narrower compiler process-tree probe is feasibility evidence only.
 
 ## Git and files
 
-- Check `git status` first and treat unrelated changes as user-owned.
+- Check `git status` first and treat unrelated changes as user-owned. The line is
+  tracked vs untracked: a *tracked* file you modify that is part of the change MUST be
+  declared in the manifest (the strict Build/Security(code)/Test gates refuse otherwise
+  — that is how a change silently shipped unvalidated `.rs` files before); a genuinely
+  unrelated tracked edit must be stashed; *untracked* files stay user-owned.
 - Use `apply_patch` for edits. Stage explicit files only; never `git add -A`.
 - Never use `--no-verify`, force push, destructive reset, or source-tree secrets.
 - Do not commit `.git/mpd`, `.mpd/current`, `.mpd/tmp`, `.mpd/build-output`,

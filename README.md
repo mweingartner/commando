@@ -76,30 +76,36 @@ Build, Security(code), and Test reopen and rehash that same Candidate before and
 execution. Candidate receipts and Commit/HEAD receipts are different subjects.
 
 The manifest is the change boundary. Any causal input change projects the earliest
-affected rewind before the next brief or effect. `mpd repair-state --to <phase>
---reason <text>` previews a legacy repair; add `--yes` to append the rewind. It never
-creates a PASS or erases history. Effective risk is the maximum of requested and derived
-risk; configuration cannot lower it.
+affected rewind before the next brief or effect. A *tracked* file edited outside that
+boundary refuses the strict Build/Security(code)/Test gates — declare it in the
+manifest or stash it — so a change can no longer silently ship a source file the
+sandbox never validated; an *untracked* out-of-scope file stays user-owned (a note,
+not a refusal). If a landing commit still drifts, `mpd publish --verify` names the
+offending paths. `mpd repair-state --to <phase> --reason <text>` previews a legacy
+repair; add `--yes` to append the rewind. It never creates a PASS or erases history.
+Effective risk is the maximum of requested and derived risk; configuration cannot
+lower it.
 
 When a rewind leaves the Candidate **byte-identical**, a strict Build/Test gate may
 **reuse** the prior validation receipt instead of re-executing the sandbox: `mpd gate
-<phase> --pass --reuse <receipt>`, offered by `mpd next`. The Candidate binds every
-manifest-scoped file — source, config, *and* the change's own prose artifacts
-(design/proposal/tasks are folded in via the mandatory `openspec/changes/<change>/**`
-process scope, so the secret scanner covers them) — so editing any in-scope file,
-prose included, changes the Candidate id and correctly forces fresh execution. Reuse
-therefore applies only to rewinds whose cause lies *outside* the Candidate: a
-persona-directive or governance/risk re-derivation that touches no in-scope file, a
-`repair-state` rewind, or an edit reverted to byte-identical. Reuse is fail-closed —
-it requires the same Candidate id, gate profile, policy digest, revalidated build
-output, and a hermetic-complete receipt bound to the coordinator's own executable
-digest; any drift re-executes, and Security(code) never reuses. It is enabled by
-`.mpd/config.json`'s `closure.hermetic_reuse`, whose
-`external_state: "none"` attests that no *unpinned* external mutable state feeds
-validation — the ambient reads that remain (cargo config under `$CARGO_HOME`, the SDK
-via `DEVELOPER_DIR`, the cargo/rustc binaries, OS beyond os-arch) are pinned by
-offline+locked builds, `Cargo.lock` checksums, and execution-time tool-digest
-verification against `security/tool-lock.json`.
+<phase> --pass --reuse <receipt>`, offered by `mpd next`. The Candidate binds the
+change's source, config, specs, and manifest — but **not** its own process prose
+(`design.md`/`proposal.md`/`tasks.md` and the judgment artifacts): those are excluded
+from the Candidate id (schema v2) and instead covered by a dedicated fail-closed
+secret-scan lane at every strict Build/Security(code)/Test gate. So an **uncommitted**
+edit to the change's prose leaves the Candidate byte-identical and **is** reusable —
+the common "fixed a wording or closed a review condition after its gate" rewind no
+longer re-runs the sandbox. Anything that changes the validated bytes still
+re-executes: any in-scope source/config/spec/manifest edit, a *committed* prose edit
+(base `HEAD` moves), a `history/**` shuffle, and Security(code) always. Reuse is
+fail-closed — it requires the same Candidate id, gate profile, policy digest,
+revalidated build output, and a hermetic-complete receipt bound to the coordinator's
+own executable digest; any drift re-executes. It is enabled by `.mpd/config.json`'s
+`closure.hermetic_reuse`, whose `external_state: "none"` attests that no *unpinned*
+external mutable state feeds validation — the ambient reads that remain (cargo config
+under `$CARGO_HOME`, the SDK via `DEVELOPER_DIR`, the cargo/rustc binaries, OS beyond
+os-arch) are pinned by offline+locked builds, `Cargo.lock` checksums, and
+execution-time tool-digest verification against `security/tool-lock.json`.
 
 Effective risk drives *depth*, not attempt pressure: at High, Security and Tester
 resolve to the deep model with a raised effort floor and Test runs the heavier

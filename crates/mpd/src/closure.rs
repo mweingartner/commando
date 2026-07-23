@@ -513,6 +513,35 @@ pub struct CandidateClosureEquivalence {
     pub blockers: Vec<String>,
 }
 
+/// The canonical postimage filename(s) `phase` may contribute to an archive
+/// closure plan, repo-relative to the active change directory. Architecture
+/// is the sole multi-file phase — its `proposal.md`/`design.md`/`tasks.md`
+/// are all admitted under Architecture's ONE shared receipt id; every other
+/// judgment-artifact phase contributes exactly its own file; a phase with no
+/// judgment artifact (Build, Documentation's own gate aside — see below —
+/// Deploy, Done) contributes none. `build_candidate_closure_plan`'s artifact
+/// match is a membership check against this table (design.md D6), so the
+/// archive lane and [`Phase::judgment_artifact`] cannot silently drift apart.
+/// Since D1/D2 exclude ALL eleven canonical process artifacts from the
+/// Candidate (not just the post-Build ones), every judgment phase — including
+/// the pre-Build DesignMock/Architecture/DesignReview/SecurityPlan, which
+/// used to still be physically present in the Candidate tree — now needs a
+/// postimage lane to re-enter the archived closure.
+pub fn canonical_phase_artifact_names(phase: Phase) -> &'static [&'static str] {
+    match phase {
+        Phase::Architecture => &["proposal.md", "design.md", "tasks.md"],
+        Phase::DesignMock => &["design-mock.md"],
+        Phase::DesignReview => &["design-review.md"],
+        Phase::SecurityPlan => &["security-plan.md"],
+        Phase::SecurityCode => &["security-code.md"],
+        Phase::DesignSignoff => &["design-signoff.md"],
+        Phase::Test => &["test.md"],
+        Phase::Documentation => &["documentation.md"],
+        Phase::DocValidation => &["doc-validation.md"],
+        _ => &[],
+    }
+}
+
 /// Build the only allowed Candidate-to-archive projection:
 ///
 /// 1. the complete retained Candidate tree;
@@ -566,23 +595,19 @@ pub fn build_candidate_closure_plan(
     for artifact in phase_artifacts {
         Digest::from_hex(&artifact.receipt_id)
             .map_err(|_| "phase artifact receipt ID is not a canonical SHA-256 digest")?;
-        let expected_name = match artifact.phase {
-            Phase::SecurityCode => "security-code.md",
-            Phase::DesignSignoff => "design-signoff.md",
-            Phase::Test => "test.md",
-            Phase::Documentation => "documentation.md",
-            Phase::DocValidation => "doc-validation.md",
-            _ => {
-                return Err(format!(
-                    "{} is not a post-Candidate canonical artifact phase",
-                    artifact.phase.label()
-                ))
-            }
-        };
-        let expected_path = format!("{active_prefix}/{expected_name}");
-        if artifact.file.path != expected_path {
+        let names = canonical_phase_artifact_names(artifact.phase);
+        if names.is_empty() {
             return Err(format!(
-                "canonical {} artifact must be exactly {expected_path:?}",
+                "{} is not a canonical archive-postimage phase",
+                artifact.phase.label()
+            ));
+        }
+        if !names
+            .iter()
+            .any(|name| artifact.file.path == format!("{active_prefix}/{name}"))
+        {
+            return Err(format!(
+                "canonical {} artifact must be exactly one of {names:?} under {active_prefix:?}",
                 artifact.phase.label()
             ));
         }
@@ -592,8 +617,18 @@ pub fn build_candidate_closure_plan(
             &format!("phase:{}", artifact.phase.slug()),
         )?;
         apply_postimage(&mut expected, &artifact.file)?;
+        // D6: the overlay-digest label is per FILE, not merely per
+        // phase+receipt — Architecture shares one receipt id across three
+        // files, so the label must disambiguate them or the canonical
+        // digest's own duplicate-path check refuses a legitimate multi-file
+        // phase.
         overlay_entries.push(postimage_digest_entry(
-            &format!("phase/{}/{}", artifact.phase.slug(), artifact.receipt_id),
+            &format!(
+                "phase/{}/{}/{}",
+                artifact.phase.slug(),
+                artifact.receipt_id,
+                artifact.file.path
+            ),
             &artifact.file,
         )?);
     }
@@ -2854,9 +2889,45 @@ fn persona_tuning_digest(
     )
 }
 
+/// The eleven canonical process artifacts of `change`, repo-relative —
+/// judgment artifacts plus the core proposal/design/tasks/documentation set
+/// (design.md D1). This is the SINGLE canonical definition of the exclusion
+/// set: [`source_digest`] (below), `crate::candidate`'s prune/overlay/
+/// inventory, and `crate::checks::scan_change_prose` all consume it, so the
+/// three subsystems cannot silently drift apart (security-plan.md Condition
+/// 9). Trusts `change` is already a validated change name — every caller
+/// reaches this only after `resolve_change`/`validate_change_name`, the same
+/// trust boundary [`active_system_scope`] already relies on.
+pub fn change_process_artifact_paths(change: &str) -> [String; 11] {
+    let dir = format!("openspec/changes/{change}");
+    [
+        format!("{dir}/proposal.md"),
+        format!("{dir}/design.md"),
+        format!("{dir}/tasks.md"),
+        format!("{dir}/documentation.md"),
+        format!("{dir}/design-mock.md"),
+        format!("{dir}/design-review.md"),
+        format!("{dir}/security-plan.md"),
+        format!("{dir}/security-code.md"),
+        format!("{dir}/design-signoff.md"),
+        format!("{dir}/test.md"),
+        format!("{dir}/doc-validation.md"),
+    ]
+}
+
+/// Whether repo-relative `path` is exactly one of `change`'s own eleven
+/// canonical process artifacts (never a sibling change's — inclusion binds
+/// more, never less, the fail-safe direction: design.md D1 Condition 3).
+pub fn is_change_process_artifact(change: &str, path: &str) -> bool {
+    change_process_artifact_paths(change)
+        .iter()
+        .any(|candidate| candidate == path)
+}
+
 fn source_digest(
     root: &Path,
     manifest: &ChangeManifest,
+    change: &str,
     system: &SystemScope,
 ) -> Result<Digest, String> {
     let mut paths = git::ls_files(root).map_err(|e| e.to_string())?;
@@ -2879,27 +2950,19 @@ fn source_digest(
     // later-phase output retroactively stale an earlier receipt — the
     // phase-causality violation design.md:398-401 forbids (Security-code
     // finding source-includes-later-phase-output). Spec deltas under the
-    // change dir have no dedicated key and stay bound by Source.
-    let change_process_artifacts: [String; 11] = [
-        format!("{}/proposal.md", system.change_dir),
-        format!("{}/design.md", system.change_dir),
-        format!("{}/tasks.md", system.change_dir),
-        format!("{}/documentation.md", system.change_dir),
-        format!("{}/design-mock.md", system.change_dir),
-        format!("{}/design-review.md", system.change_dir),
-        format!("{}/security-plan.md", system.change_dir),
-        format!("{}/security-code.md", system.change_dir),
-        format!("{}/design-signoff.md", system.change_dir),
-        format!("{}/test.md", system.change_dir),
-        format!("{}/doc-validation.md", system.change_dir),
-    ];
+    // change dir have no dedicated key and stay bound by Source. The
+    // exclusion set is the single canonical `change_process_artifact_paths`
+    // (design.md D1) — candidate pruning/overlay/inventory and the D4 prose
+    // scan lane consume the exact same function, so this digest's behavior is
+    // byte-identical to before the refactor while the three subsystems can
+    // never drift apart (security-plan.md Condition 9).
     let mut entries = Vec::new();
     for path in paths {
         // Receipt-bearing ledgers and local caches are deliberately excluded:
         // otherwise recording a receipt would immediately mutate its own
         // Source dependency and make it stale by self-reference.
         if path.starts_with(".mpd/")
-            || change_process_artifacts.contains(&path)
+            || is_change_process_artifact(change, &path)
             || !manifest.covers(&path, system)
         {
             continue;
@@ -2994,7 +3057,7 @@ pub fn capture_dependency_values(
             ),
         ],
     )?;
-    let source = source_digest(root, &manifest, &system)?;
+    let source = source_digest(root, &manifest, change, &system)?;
     let design_mock = digest_named_bytes(
         "design-mock-artifact",
         &[(
@@ -3125,7 +3188,63 @@ pub fn capture_dependency_values(
     Ok(values)
 }
 
-fn allowed(patterns: &[String], path: &str) -> bool {
+/// Uncommitted worktree drift outside a change's own scope, classified for
+/// the D5 strict-gate guard (design.md D5; security-plan.md D5 audit).
+/// `tracked` is every non-ignored, non-untracked `git status` entry (ordinary
+/// modified/deleted, renamed/copied — both sides — and unmerged) whose path
+/// is outside `manifest.covers(·, SystemScope) ∪ mutable_process_path`; it is
+/// exactly the class that shipped unvalidated in the d482a20 escape (swept
+/// into the landing commit while the Candidate silently pinned base-HEAD
+/// bytes) and refuses the strict Build/Security(code)/Test gates. `untracked`
+/// is the same exemption test applied to untracked paths — presumed
+/// user-owned (it cannot enter a commit without an explicit `git add`) and
+/// never a refusal, only a printed note.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeDrift {
+    pub tracked: Vec<String>,
+    pub untracked: Vec<String>,
+}
+
+/// Compute [`ScopeDrift`] for `change` against `manifest`'s declared scope,
+/// [`SystemScope`], and `crate::candidate::mutable_process_path` (reused, not
+/// re-listed — Condition 7). TOCTOU-racy relative to Candidate capture by
+/// design (security-plan.md's D5 audit): this is an advisory-refusal UX
+/// layer, not an integrity authority — the Candidate binding, the D5b
+/// pre-commit guard, and commit coherence remain independently sufficient.
+pub fn scope_drift(
+    root: &Path,
+    manifest: &ChangeManifest,
+    change: &str,
+) -> Result<ScopeDrift, String> {
+    let system = active_system_scope(root, change);
+    let mut drift = ScopeDrift::default();
+    let classify = |path: &str, out: &mut Vec<String>| {
+        if !manifest.covers(path, &system) && !crate::candidate::mutable_process_path(path) {
+            out.push(path.to_string());
+        }
+    };
+    for status in git::status_v2(root).map_err(|e| e.to_string())? {
+        match status {
+            git::StatusEntry::Ignored { .. } => {}
+            git::StatusEntry::Untracked { path } => classify(&path, &mut drift.untracked),
+            git::StatusEntry::Ordinary { path, .. } => classify(&path, &mut drift.tracked),
+            git::StatusEntry::Unmerged { path, .. } => classify(&path, &mut drift.tracked),
+            git::StatusEntry::RenamedOrCopied {
+                path, orig_path, ..
+            } => {
+                classify(&path, &mut drift.tracked);
+                classify(&orig_path, &mut drift.tracked);
+            }
+        }
+    }
+    drift.tracked.sort();
+    drift.tracked.dedup();
+    drift.untracked.sort();
+    drift.untracked.dedup();
+    Ok(drift)
+}
+
+pub(crate) fn allowed(patterns: &[String], path: &str) -> bool {
     patterns.iter().any(|pattern| {
         glob_match(pattern, path)
             || path_is_within(pattern.trim_end_matches("/**"), path)
@@ -3430,11 +3549,24 @@ pub fn verify_commit_coherence(
     }
     let (ready, readiness_blockers) = scope_readiness(root, closure)?;
     if ready {
+        // D7: this arm previously returned empty blockers alongside
+        // `coherent: false`, which is the exact silent-failure shape
+        // security-plan.md's endpoint-diff HIGH finding flagged
+        // (closure.rs:3431-3438 historically). `ready_to_commit: true`'s
+        // meaning ("worktree scoped content matches the archived postimage")
+        // is unchanged for its consumers — only the diagnostic is added.
+        let mut blockers = vec![format!(
+            "no commit in `{}..{head_oid}` matches this change's archived closure",
+            closure.base_commit
+        )];
+        blockers.extend(diagnostics);
+        blockers.sort();
+        blockers.dedup();
         return Ok(CommitCoherence {
             coherent: false,
             head: None,
             ready_to_commit: true,
-            blockers: Vec::new(),
+            blockers,
         });
     }
     let mut blockers = vec![format!(
@@ -3575,6 +3707,36 @@ fn resolve_closure_landing(
                 .all(|path| allowed(&closure.allowed_paths, path))
         });
         if !in_scope {
+            // D7: a bounded diagnostic instead of a silent `continue` — an
+            // out-of-scope commit is still "not a landing candidate" (keep
+            // scanning), but a coherence failure should be able to say WHY no
+            // commit matched (security-plan.md's endpoint-diff HIGH finding).
+            if diagnostics.len() < MAX_LANDING_DIAGNOSTIC_CANDIDATES {
+                let mut out_of_scope: Vec<&String> = diff
+                    .iter()
+                    .flat_map(|entry| entry.orig_path.iter().chain(std::iter::once(&entry.path)))
+                    .filter(|path| !allowed(&closure.allowed_paths, path))
+                    .collect();
+                out_of_scope.sort();
+                out_of_scope.dedup();
+                let total = out_of_scope.len();
+                let shown: Vec<String> = out_of_scope
+                    .into_iter()
+                    .take(MAX_LANDING_DIAGNOSTIC_PATHS)
+                    .cloned()
+                    .collect();
+                let more = total.saturating_sub(shown.len());
+                let suffix = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
+                diagnostics.push(format!(
+                    "commit {}: parent-diff touches out-of-scope path(s): {}{suffix}",
+                    &commit[..12.min(commit.len())],
+                    shown.join(", ")
+                ));
+            }
             continue;
         }
         if examined >= MAX_LANDING_CANDIDATES {
@@ -4242,6 +4404,139 @@ mod tests {
             error.contains("durable-doc path"),
             "must name the reproduced defect: {error}"
         );
+        #[cfg(unix)]
+        make_tree_removable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A minimal, valid `GateRecord` binding `capture` — just enough for
+    /// `validate_archive_ledger_postimage` to accept the fixture ledger.
+    fn minimal_build_gate_record(
+        capture: crate::candidate::CandidateCapture,
+    ) -> crate::ledger::GateRecord {
+        crate::ledger::GateRecord {
+            verdict: Verdict::Pass,
+            by: "fixture".into(),
+            evidence: None,
+            checks: None,
+            at: "2026-01-01".into(),
+            failure_class: None,
+            exploitability: None,
+            attempt: 1,
+            started_at_epoch_secs: 0,
+            completed_at_epoch_secs: 0,
+            receipt: None,
+            persona_tuning: None,
+            candidate: Some(capture),
+            build_output: None,
+            deploy_result: None,
+            validation_receipt: None,
+            judgment_artifact_sha256: None,
+        }
+    }
+
+    /// design.md D6: `canonical_phase_artifact_names` reworks the artifact
+    /// match into a membership model — Architecture is the one multi-file
+    /// phase, and its `proposal.md`/`design.md`/`tasks.md` are all admitted
+    /// under its ONE shared receipt id (previously unnecessary, since these
+    /// pre-Build artifacts were still physically present in the Candidate
+    /// tree before D1/D2 excluded them). A postimage naming a file outside
+    /// the phase's canonical set is still refused.
+    #[test]
+    fn build_candidate_closure_plan_admits_architectures_three_files_under_one_shared_receipt_id() {
+        let change = "archmulti";
+        let (root, candidate) = candidate_closure_fixture(
+            "architecture-multi-file",
+            change,
+            &[&format!("openspec/changes/{change}/**")],
+        );
+        let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
+        let archive_closure = ArchiveClosure {
+            base_commit: candidate.capture.subject.base_commit.clone(),
+            archive_path: format!("openspec/changes/archive/2026-01-01-{change}"),
+            transaction_id: Digest::of_bytes(b"txn"),
+            candidate_id: Some(candidate.capture.subject.id.clone()),
+            allowed_paths: vec![format!("openspec/changes/{change}/**")],
+            system_paths: vec![format!("openspec/changes/archive/2026-01-01-{change}")],
+            post_archive_digest: Digest::of_bytes(b"post"),
+            archived_at: 1_752_000_000,
+        };
+        let mut ledger_doc =
+            crate::ledger::Ledger::new(change, "mpd", false, crate::ledger::ChangeKind::Feature);
+        ledger_doc.archive_closure = Some(archive_closure.clone());
+        ledger_doc.gates.insert(
+            Phase::Build,
+            minimal_build_gate_record(candidate.capture.clone()),
+        );
+        let ledger_bytes = serde_json::to_vec(&ledger_doc).unwrap();
+        let receipt_id = "e".repeat(64);
+        let names = canonical_phase_artifact_names(Phase::Architecture);
+        assert_eq!(
+            names,
+            &["proposal.md", "design.md", "tasks.md"],
+            "Architecture must remain the one three-file phase"
+        );
+        let phase_artifacts: Vec<PhaseArtifactPostimage> = names
+            .iter()
+            .map(|filename| PhaseArtifactPostimage {
+                phase: Phase::Architecture,
+                receipt_id: receipt_id.clone(),
+                file: ClosureFilePostimage::regular(
+                    format!("openspec/changes/{change}/{filename}"),
+                    format!("# {filename}\n").into_bytes(),
+                ),
+            })
+            .collect();
+        let documentation = ReviewedDocumentationPostimages {
+            doc_validation_receipt_id: "d".repeat(64),
+            files: Vec::new(),
+        };
+        let archive = DeterministicArchivePostimages {
+            spec_writes: Vec::new(),
+            ledger: ClosureFilePostimage::regular(
+                format!(".mpd/state/{change}.json"),
+                ledger_bytes,
+            ),
+        };
+        let plan = build_candidate_closure_plan(
+            &candidate_root,
+            &candidate,
+            &archive_closure,
+            &phase_artifacts,
+            &documentation,
+            &archive,
+        )
+        .expect("Architecture's three files under one shared receipt id must be admitted");
+        for filename in names {
+            let expected_path = format!("openspec/changes/archive/2026-01-01-{change}/{filename}");
+            assert!(
+                plan.entries.iter().any(|e| e.path == expected_path),
+                "missing {expected_path} in plan entries: {:?}",
+                plan.entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+            );
+        }
+
+        // A postimage naming a file outside the phase's canonical set is
+        // still refused.
+        let bad_artifacts = vec![PhaseArtifactPostimage {
+            phase: Phase::Architecture,
+            receipt_id: receipt_id.clone(),
+            file: ClosureFilePostimage::regular(
+                format!("openspec/changes/{change}/not-a-canonical-name.md"),
+                b"# bad\n".to_vec(),
+            ),
+        }];
+        let error = build_candidate_closure_plan(
+            &candidate_root,
+            &candidate,
+            &archive_closure,
+            &bad_artifacts,
+            &documentation,
+            &archive,
+        )
+        .unwrap_err();
+        assert!(error.contains("must be exactly one of"), "{error}");
+
         #[cfg(unix)]
         make_tree_removable(&root);
         let _ = std::fs::remove_dir_all(&root);
@@ -7217,6 +7512,211 @@ mod candidate_closure_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// security-plan.md Condition 9 / design.md D7 Condition 9: sweep every
+    /// `verify_commit_coherence` arm and pin `coherent == false ⟹
+    /// !blockers.is_empty()`, with EXACTLY one documented exception — the
+    /// genuine awaiting-first-commit ready arm (no commit exists since base
+    /// at all, and the worktree already matches the archived postimage) —
+    /// which keeps `ready_to_commit: true` and empty blockers by design. The
+    /// NEW D7 arm (commits exist, none matches, but the worktree still
+    /// happens to match the archived postimage) previously returned empty
+    /// blockers too — this sweep pins that it no longer does.
+    #[test]
+    fn commit_coherence_never_returns_false_with_empty_blockers_except_the_awaiting_first_commit_arm(
+    ) {
+        // Arm: no commit at all (unborn branch).
+        {
+            let root = unique_landing_root("sweep-no-commit-yet");
+            let closure = ArchiveClosure {
+                base_commit: "0".repeat(40),
+                archive_path: "openspec/changes/archive/2026-01-01-x".into(),
+                transaction_id: Digest::of_bytes(b"txn"),
+                candidate_id: None,
+                allowed_paths: vec!["**".into()],
+                system_paths: Vec::new(),
+                post_archive_digest: Digest::of_bytes(b"unused"),
+                archived_at: 0,
+            };
+            let c = verify_commit_coherence(&root, &closure).unwrap();
+            assert!(!c.coherent);
+            assert!(
+                !c.blockers.is_empty(),
+                "unborn-branch arm: {:?}",
+                c.blockers
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // Arm: HEAD is not a readable descendant of a bogus base.
+        {
+            let root = unique_landing_root("sweep-bad-base");
+            fs::write(root.join("README.md"), b"base\n").unwrap();
+            run_git(&root, &["add", "README.md"]);
+            run_git(&root, &["commit", "--quiet", "-m", "base"]);
+            let closure = ArchiveClosure {
+                base_commit: "f".repeat(40),
+                archive_path: "openspec/changes/archive/2026-01-01-x".into(),
+                transaction_id: Digest::of_bytes(b"txn"),
+                candidate_id: Some("a".repeat(64)),
+                allowed_paths: vec!["**".into()],
+                system_paths: Vec::new(),
+                post_archive_digest: Digest::of_bytes(b"unused"),
+                archived_at: 0,
+            };
+            let c = verify_commit_coherence(&root, &closure).unwrap();
+            assert!(!c.coherent);
+            assert!(!c.blockers.is_empty(), "bad-base arm: {:?}", c.blockers);
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // Arm: modern closure, saved plan unavailable.
+        {
+            let root = unique_landing_root("sweep-plan-missing");
+            fs::write(root.join("README.md"), b"base\n").unwrap();
+            run_git(&root, &["add", "README.md"]);
+            run_git(&root, &["commit", "--quiet", "-m", "base"]);
+            let base = git::head_commit(&root).unwrap().unwrap();
+            let closure = ArchiveClosure {
+                base_commit: base,
+                archive_path: "openspec/changes/archive/2026-01-01-x".into(),
+                transaction_id: Digest::of_bytes(b"txn-never-saved"),
+                candidate_id: Some("a".repeat(64)),
+                allowed_paths: vec!["**".into()],
+                system_paths: Vec::new(),
+                post_archive_digest: Digest::of_bytes(b"unused"),
+                archived_at: 0,
+            };
+            let c = verify_commit_coherence(&root, &closure).unwrap();
+            assert!(!c.coherent);
+            assert!(
+                !c.blockers.is_empty(),
+                "plan-unavailable arm: {:?}",
+                c.blockers
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // Arm: genuine awaiting-first-commit (ready) — the ONE exempt arm.
+        {
+            let root = unique_landing_root("sweep-awaiting-first-commit");
+            fs::write(root.join("README.md"), b"base\n").unwrap();
+            run_git(&root, &["add", "README.md"]);
+            run_git(&root, &["commit", "--quiet", "-m", "base"]);
+            let base = git::head_commit(&root).unwrap().unwrap();
+            let allowed = vec!["README.md".to_string()];
+            let digest = scoped_digest_for_patterns(&root, &allowed).unwrap();
+            let entries = vec![tree_entry("README.md", 0o100644, b"base\n")];
+            let candidate_plan = plan(entries, &base);
+            save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+            let closure = ArchiveClosure {
+                base_commit: base,
+                archive_path: candidate_plan.archive_path.clone(),
+                transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+                candidate_id: Some(candidate_plan.candidate_id.clone()),
+                allowed_paths: allowed,
+                system_paths: Vec::new(),
+                post_archive_digest: digest,
+                archived_at: 0,
+            };
+            let c = verify_commit_coherence(&root, &closure).unwrap();
+            assert!(!c.coherent);
+            assert!(c.ready_to_commit, "{c:?}");
+            assert!(
+                c.blockers.is_empty(),
+                "the genuine awaiting-first-commit arm keeps empty blockers by design: {:?}",
+                c.blockers
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // Arm (NEW, D7): commits exist, none matches, but the worktree still
+        // happens to match the archived postimage (ready=true) — must now
+        // carry non-empty diagnostics, never the historical silent empty
+        // blockers.
+        {
+            let root = unique_landing_root("sweep-ready-with-diagnostics");
+            fs::write(root.join("README.md"), b"base\n").unwrap();
+            run_git(&root, &["add", "README.md"]);
+            run_git(&root, &["commit", "--quiet", "-m", "base"]);
+            let base = git::head_commit(&root).unwrap().unwrap();
+            fs::write(root.join("unrelated.txt"), b"noise\n").unwrap();
+            run_git(&root, &["add", "unrelated.txt"]);
+            run_git(
+                &root,
+                &["commit", "--quiet", "-m", "unrelated out-of-scope commit"],
+            );
+
+            let allowed = vec!["README.md".to_string()];
+            let digest = scoped_digest_for_patterns(&root, &allowed).unwrap();
+            let entries = vec![tree_entry("README.md", 0o100644, b"base\n")];
+            let candidate_plan = plan(entries, &base);
+            save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+            let closure = ArchiveClosure {
+                base_commit: base,
+                archive_path: candidate_plan.archive_path.clone(),
+                transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+                candidate_id: Some(candidate_plan.candidate_id.clone()),
+                allowed_paths: allowed,
+                system_paths: Vec::new(),
+                post_archive_digest: digest,
+                archived_at: 0,
+            };
+            let c = verify_commit_coherence(&root, &closure).unwrap();
+            assert!(!c.coherent);
+            assert!(
+                c.ready_to_commit,
+                "the worktree still matches the archived postimage: {c:?}"
+            );
+            assert!(
+                !c.blockers.is_empty(),
+                "D7: this arm must no longer silently return empty blockers: {:?}",
+                c.blockers
+            );
+            assert!(
+                c.blockers.iter().any(|b| b.contains("no commit")),
+                "{:?}",
+                c.blockers
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // Arm: commits exist, none matches, and the worktree does NOT match
+        // either (ready=false) — pre-existing arm, unchanged.
+        {
+            let root = unique_landing_root("sweep-not-ready-with-diagnostics");
+            fs::write(root.join("README.md"), b"base\n").unwrap();
+            run_git(&root, &["add", "README.md"]);
+            run_git(&root, &["commit", "--quiet", "-m", "base"]);
+            let base = git::head_commit(&root).unwrap().unwrap();
+            fs::write(root.join("unrelated.txt"), b"noise\n").unwrap();
+            run_git(&root, &["add", "unrelated.txt"]);
+            run_git(
+                &root,
+                &["commit", "--quiet", "-m", "unrelated out-of-scope commit"],
+            );
+
+            let allowed = vec!["README.md".to_string()];
+            let entries = vec![tree_entry("README.md", 0o100644, b"base\n")];
+            let candidate_plan = plan(entries, &base);
+            save_candidate_closure_plan(&root, &candidate_plan).unwrap();
+            let closure = ArchiveClosure {
+                base_commit: base,
+                archive_path: candidate_plan.archive_path.clone(),
+                transaction_id: Digest::from_hex(&candidate_plan.archive_transaction_id).unwrap(),
+                candidate_id: Some(candidate_plan.candidate_id.clone()),
+                allowed_paths: allowed,
+                system_paths: Vec::new(),
+                post_archive_digest: Digest::of_bytes(b"deliberately-wrong"),
+                archived_at: 0,
+            };
+            let c = verify_commit_coherence(&root, &closure).unwrap();
+            assert!(!c.coherent);
+            assert!(!c.ready_to_commit, "{c:?}");
+            assert!(!c.blockers.is_empty(), "{:?}", c.blockers);
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
     // =====================================================================
     // D3 — landing-commit resolution
     // =====================================================================
@@ -8621,7 +9121,7 @@ mod remote_parity_tests {
             publish: None,
         };
         let system = active_system_scope(&dir, change);
-        let before = source_digest(&dir, &manifest, &system).unwrap();
+        let before = source_digest(&dir, &manifest, change, &system).unwrap();
 
         // Editing the later-phase documentation artifact must NOT move Source.
         write_file(
@@ -8631,7 +9131,7 @@ mod remote_parity_tests {
         );
         commit_all(&dir, "documentation phase output");
         assert_eq!(
-            source_digest(&dir, &manifest, &system).unwrap(),
+            source_digest(&dir, &manifest, change, &system).unwrap(),
             before,
             "editing documentation.md must not change the Source digest"
         );
@@ -8640,7 +9140,7 @@ mod remote_parity_tests {
         write_file(&dir, &format!("{change_dir}/design.md"), "# Design v2\n");
         commit_all(&dir, "design edit");
         assert_eq!(
-            source_digest(&dir, &manifest, &system).unwrap(),
+            source_digest(&dir, &manifest, change, &system).unwrap(),
             before,
             "editing design.md must not change the Source digest"
         );
@@ -8649,9 +9149,161 @@ mod remote_parity_tests {
         write_file(&dir, "crates/x/src/lib.rs", "pub fn f() { let _ = 1; }\n");
         commit_all(&dir, "real source change");
         assert_ne!(
-            source_digest(&dir, &manifest, &system).unwrap(),
+            source_digest(&dir, &manifest, change, &system).unwrap(),
             before,
             "editing real in-scope source must change the Source digest"
+        );
+    }
+
+    /// security-plan.md Condition 9 / design.md D1 Condition 1: the exact
+    /// eleven canonical filenames, no more and no fewer — [`source_digest`],
+    /// candidate pruning/overlay/inventory, and `checks::scan_change_prose`
+    /// all consume this ONE function, so the three subsystems cannot drift
+    /// apart. Only the ACTIVE change's own artifacts match; a sibling
+    /// change's identically-named files never do (inclusion binds more,
+    /// never less — the fail-safe direction).
+    #[test]
+    fn change_process_artifact_paths_pins_the_exact_eleven_canonical_names_scoped_to_the_active_change(
+    ) {
+        let paths = change_process_artifact_paths("my-change");
+        let expected = [
+            "openspec/changes/my-change/proposal.md",
+            "openspec/changes/my-change/design.md",
+            "openspec/changes/my-change/tasks.md",
+            "openspec/changes/my-change/documentation.md",
+            "openspec/changes/my-change/design-mock.md",
+            "openspec/changes/my-change/design-review.md",
+            "openspec/changes/my-change/security-plan.md",
+            "openspec/changes/my-change/security-code.md",
+            "openspec/changes/my-change/design-signoff.md",
+            "openspec/changes/my-change/test.md",
+            "openspec/changes/my-change/doc-validation.md",
+        ];
+        assert_eq!(paths.len(), 11);
+        assert_eq!(paths, expected.map(str::to_string));
+
+        for path in &expected {
+            assert!(is_change_process_artifact("my-change", path), "{path}");
+            // A sibling change's identically-named file must NOT match —
+            // inclusion binds more, never less.
+            assert!(
+                !is_change_process_artifact("sibling-change", path),
+                "{path} must not be claimed by a different change"
+            );
+        }
+        // A path that merely resembles one of the eleven (wrong extension or
+        // nested elsewhere) must never match.
+        assert!(!is_change_process_artifact(
+            "my-change",
+            "openspec/changes/my-change/design.md.bak"
+        ));
+        assert!(!is_change_process_artifact(
+            "my-change",
+            "openspec/changes/my-change/specs/design.md"
+        ));
+    }
+
+    /// design.md D5 / security-plan.md Condition 7: tracked (non-ignored,
+    /// non-untracked) status entries outside the manifest's declared scope
+    /// refuse; untracked ones are only ever reported; and `.mpd/state/
+    /// <change>.json` — dirty and TRACKED, the realistic shape (the ledger
+    /// stays tracked; see `scaffold.rs`) — must never trip either bucket
+    /// (Condition 7: reuse `mutable_process_path`, never re-list it).
+    #[test]
+    fn scope_drift_classifies_tracked_and_untracked_and_exempts_mutable_process_state() {
+        let dir = init_repo();
+        let change = "drift-classify";
+        write_file(&dir, "src/in-scope.rs", "fn f() {}\n");
+        write_file(&dir, "out-of-scope.txt", "unrelated\n");
+        write_file(&dir, &format!(".mpd/state/{change}.json"), "{}");
+        commit_all(&dir, "base");
+
+        let manifest = ChangeManifest {
+            version: 1,
+            paths: vec!["src/**".to_string()],
+            shared_paths: Vec::new(),
+            publish: None,
+        };
+
+        // Tracked, out-of-scope, modified — the exact d482a20 escape class.
+        write_file(&dir, "out-of-scope.txt", "dirty and tracked\n");
+        // Untracked, out-of-scope.
+        write_file(&dir, "stray.txt", "never added\n");
+        // The ledger: mutable process state, dirty and TRACKED — must be
+        // exempt from both buckets.
+        write_file(
+            &dir,
+            &format!(".mpd/state/{change}.json"),
+            "{\"dirty\":true}",
+        );
+
+        let drift = scope_drift(&dir, &manifest, change).unwrap();
+        assert!(
+            drift.tracked.iter().any(|p| p == "out-of-scope.txt"),
+            "{:?}",
+            drift.tracked
+        );
+        assert!(
+            !drift.tracked.iter().any(|p| p.contains(".mpd/state")),
+            "the ledger must never trip tracked drift: {:?}",
+            drift.tracked
+        );
+        assert!(
+            drift.untracked.iter().any(|p| p == "stray.txt"),
+            "{:?}",
+            drift.untracked
+        );
+        assert!(
+            !drift.untracked.iter().any(|p| p.contains(".mpd/state")),
+            "{:?}",
+            drift.untracked
+        );
+    }
+
+    /// design.md D5: a rename/copy status entry is classified on BOTH the
+    /// current path and `orig_path` — an out-of-scope rename must not escape
+    /// detection by hiding behind its destination name alone.
+    #[test]
+    fn scope_drift_checks_both_sides_of_a_rename() {
+        let dir = init_repo();
+        let change = "drift-rename";
+        write_file(
+            &dir,
+            "out-of-scope/original.txt",
+            "content long enough for rename detection heuristics to fire reliably\n",
+        );
+        commit_all(&dir, "base");
+        run_git(
+            &dir,
+            &[
+                "mv",
+                "out-of-scope/original.txt",
+                "out-of-scope/renamed.txt",
+            ],
+        );
+
+        let manifest = ChangeManifest {
+            version: 1,
+            paths: vec!["src/**".to_string()],
+            shared_paths: Vec::new(),
+            publish: None,
+        };
+        let drift = scope_drift(&dir, &manifest, change).unwrap();
+        assert!(
+            drift
+                .tracked
+                .iter()
+                .any(|p| p == "out-of-scope/renamed.txt"),
+            "{:?}",
+            drift.tracked
+        );
+        assert!(
+            drift
+                .tracked
+                .iter()
+                .any(|p| p == "out-of-scope/original.txt"),
+            "the rename's ORIGINAL side must also be checked: {:?}",
+            drift.tracked
         );
     }
 

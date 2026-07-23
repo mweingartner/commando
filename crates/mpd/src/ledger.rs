@@ -528,6 +528,20 @@ pub struct GateRecord {
     /// It carries result metadata and digests, never raw child output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_receipt: Option<crate::local_validation::ValidationReceiptV1>,
+    /// SHA-256 (hex) of this phase's judgment artifact bytes, recorded at
+    /// gate time for every strict phase carrying a
+    /// [`crate::phase::Phase::judgment_artifact`] — on BOTH the execute and
+    /// reuse record sites, from the SAME byte buffer `strict_artifact_issues`
+    /// just validated (design.md D6; security-plan.md Condition 5). Restores
+    /// (and extends to post-Build judgment artifacts) the byte-pin the
+    /// Candidate previously provided for pre-Build prose, now that D1/D2
+    /// exclude all eleven canonical process artifacts from the Candidate.
+    /// Absent on every legacy record (recorded before this field existed) and
+    /// on every non-judgment-artifact phase — `mpd archive` accepts an absent
+    /// digest with a printed warning but treats a present mismatch as always
+    /// fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judgment_artifact_sha256: Option<String>,
 }
 
 /// Versioned identity of one release file observed through an opened,
@@ -2061,6 +2075,7 @@ mod tests {
             build_output: None,
             deploy_result: None,
             validation_receipt: None,
+            judgment_artifact_sha256: None,
         }
     }
 

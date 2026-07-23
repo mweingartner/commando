@@ -47,7 +47,7 @@ pub struct ExternalScan {
 /// skipped (their absence is surfaced by `mpd doctor`, never as a clean pass).
 pub fn run_external_scanners(root: &Path) -> ExternalScan {
     let mut scan = ExternalScan::default();
-    if let Some(clean) = run_gitleaks(root) {
+    if let Some(clean) = run_gitleaks(root, ".") {
         scan.ran.push("gitleaks".to_string());
         if !clean {
             scan.failures.push("gitleaks reported findings".to_string());
@@ -66,8 +66,6 @@ pub fn run_external_scanners(root: &Path) -> ExternalScan {
     scan
 }
 
-const GITLEAKS_DEFAULT_ARGS: &[&str] = &["detect", "--no-banner", "--no-git", "-s", "."];
-
 /// The minimal ephemeral exclusion (D4): extend gitleaks' default ruleset —
 /// never replace it — and allowlist only the Rust build-artifact directory,
 /// whose bytes gitleaks' own `.gitleaks.toml` resolution otherwise has no way
@@ -75,38 +73,65 @@ const GITLEAKS_DEFAULT_ARGS: &[&str] = &["detect", "--no-banner", "--no-git", "-
 const EPHEMERAL_GITLEAKS_CONFIG: &str =
     "[extend]\nuseDefault = true\n\n[allowlist]\npaths = ['''^target/''', '''/target/''']\n";
 
-/// Run gitleaks, scoping out `target/` UNLESS the repo owns its own
-/// `.gitleaks.toml` — gitleaks resolves `(target dir)/.gitleaks.toml`
-/// natively, so a repo-owned config is honored byte-identically to before
-/// this exclusion existed, no trust change. Otherwise write an ephemeral
-/// extend-default config and pass it via `-c`; ANY failure producing that
-/// config (temp-file create/write/sync) falls back to the unexcluded scan —
-/// degraded exclusion must never become a skipped scan, only a louder one.
-fn run_gitleaks(root: &Path) -> Option<bool> {
+/// Run gitleaks over `source_dir` (repo-relative to `root`; `"."` for the
+/// whole worktree, or `openspec/changes/<change>` for the D4 prose lane),
+/// ALWAYS passing an explicit `-c` so gitleaks can never resolve
+/// `.gitleaks.toml`/`.gitleaksignore` from the scanned SOURCE directory
+/// itself (security-plan.md Condition 1) — this matters once `source_dir` is
+/// no longer the repo root, where a change author could otherwise plant a
+/// rule-disabling config alongside the very prose being scanned. A repo-owned
+/// root config is passed as an explicit path (byte-identical governance to
+/// gitleaks' own auto-resolution when scanning the repo root, since `-c`
+/// names that exact file); otherwise the ephemeral extend-default config is
+/// written and passed explicitly. If NEITHER a repo-owned config exists NOR
+/// the ephemeral config can be written (temp-file create/write/sync
+/// failure), gitleaks is treated as unavailable for this call (`None`)
+/// rather than ever being invoked without an explicit `-c` — degraded
+/// exclusion must never become a scan that resolves configuration from an
+/// arbitrary scanned directory.
+pub(crate) fn run_gitleaks(root: &Path, source_dir: &str) -> Option<bool> {
     if !tool_available("gitleaks") {
         return None;
     }
-    if root.join(".gitleaks.toml").exists() {
-        return run_tool(root, "gitleaks", GITLEAKS_DEFAULT_ARGS);
-    }
-    match write_ephemeral_gitleaks_config() {
-        Some(config_path) => {
-            let config_arg = config_path.to_string_lossy().into_owned();
-            let args = [
+    let repo_config = root.join(".gitleaks.toml");
+    // Trust the repo-root config only when it is a genuine regular file:
+    // `symlink_metadata` (never `exists()`, which follows symlinks) plus an
+    // explicit non-symlink + `is_file()` check, so a symlinked or non-regular
+    // `.gitleaks.toml` cannot substitute an attacker-controlled config for the
+    // ephemeral extend-default one this function would otherwise write.
+    let repo_config_is_trusted = std::fs::symlink_metadata(&repo_config)
+        .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+        .unwrap_or(false);
+    if repo_config_is_trusted {
+        let config_arg = repo_config.to_str()?.to_string();
+        return run_tool(
+            root,
+            "gitleaks",
+            &[
                 "detect",
                 "--no-banner",
                 "--no-git",
                 "-c",
                 config_arg.as_str(),
                 "-s",
-                ".",
-            ];
-            let result = run_tool(root, "gitleaks", &args);
-            let _ = std::fs::remove_file(&config_path);
-            result
-        }
-        None => run_tool(root, "gitleaks", GITLEAKS_DEFAULT_ARGS),
+                source_dir,
+            ],
+        );
     }
+    let config_path = write_ephemeral_gitleaks_config()?;
+    let config_arg = config_path.to_string_lossy().into_owned();
+    let args = [
+        "detect",
+        "--no-banner",
+        "--no-git",
+        "-c",
+        config_arg.as_str(),
+        "-s",
+        source_dir,
+    ];
+    let result = run_tool(root, "gitleaks", &args);
+    let _ = std::fs::remove_file(&config_path);
+    result
 }
 
 /// Write the ephemeral gitleaks config to an unpredictable pid+nonce-named
@@ -182,6 +207,124 @@ pub fn scan_secrets(paths: &[PathBuf]) -> Result<SecretReport, String> {
         scanner: "builtin",
         findings,
     })
+}
+
+/// Mirrors `secrets::scan_paths`'s own per-file size cap (that constant is
+/// private to the `secrets` module). Kept in sync manually; a divergence
+/// only ever makes this lane MORE conservative than `scan_paths`, never
+/// less, since both values are `16 * 1024 * 1024`.
+const PROSE_ARTIFACT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Scan an already-read, already-validated byte buffer for secrets, without
+/// touching disk again. `scan_change_prose` reads and UTF-8-validates each
+/// process artifact exactly once; scanning THAT buffer directly (rather than
+/// handing `secrets::scan_paths` the path to `fs::read` a second time) closes
+/// the TOCTOU where a co-writer with access to the same working tree could
+/// swap the file's content between the validating read and a second
+/// scanning read (Finding 5; security-plan.md Condition 3/9). Built from
+/// `secrets`'s own already-public primitives (`suspicious_filename`,
+/// `scan_text`) rather than a new `secrets` API, so filename and content
+/// rules stay byte-for-byte identical to `scan_paths`.
+fn scan_validated_bytes(path_label: &str, bytes: &[u8]) -> Result<Vec<secrets::Finding>, String> {
+    let mut findings = Vec::new();
+    if let Some(rule) = secrets::suspicious_filename(Path::new(path_label)) {
+        findings.push(secrets::Finding {
+            path: path_label.to_string(),
+            line: 0,
+            rule,
+        });
+    }
+    if bytes.len() as u64 > PROSE_ARTIFACT_MAX_BYTES {
+        return Err(format!(
+            "secret scanner file exceeds {PROSE_ARTIFACT_MAX_BYTES} byte cap: {path_label}"
+        ));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    findings.extend(secrets::scan_text(path_label, &text));
+    Ok(findings)
+}
+
+/// Scan `change`'s own eleven canonical process artifacts for secrets,
+/// enumerated by PATH via [`crate::closure::change_process_artifact_paths`]
+/// — never by `git ls-files` — so untracked and uncommitted prose is
+/// covered (design.md D4; security-plan.md Conditions 3/6/9). For each
+/// artifact: `symlink_metadata`'s `NotFound` is the only stat error that is
+/// legitimately skipped (the artifact simply hasn't been authored for this
+/// attempt yet); every other stat error blocks. A symlinked artifact is
+/// deliberately RETAINED (never skipped) so [`secrets::scan_paths`] fails
+/// the scan closed on it below, rather than silently omitting it. Non-UTF-8
+/// bytes in a regular-file artifact are a hard refusal here — never a
+/// silent content-rules skip the way a lossy conversion would be.
+///
+/// A regular-file artifact's bytes are read and UTF-8-validated exactly
+/// ONCE, then scanned via [`scan_validated_bytes`] against that SAME
+/// buffer — never re-read from disk — so a co-writer cannot race a content
+/// swap between the validating read and the scan (Finding 5 / TOCTOU).
+/// Symlinked artifacts still flow through [`secrets::scan_paths`] (via
+/// [`scan_secrets`]) for its own fail-closed non-regular-path refusal,
+/// unchanged.
+pub fn scan_change_prose(root: &Path, change: &str) -> Result<SecretReport, String> {
+    let mut symlinked_paths = Vec::new();
+    let mut findings = Vec::new();
+    for relative in crate::closure::change_process_artifact_paths(change) {
+        let full = root.join(&relative);
+        match std::fs::symlink_metadata(&full) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlinked_paths.push(full);
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let bytes = std::fs::read(&full).map_err(|e| {
+                    format!("cannot read change process artifact {relative:?}: {e}")
+                })?;
+                std::str::from_utf8(&bytes).map_err(|_| {
+                    format!("change process artifact is not valid UTF-8: {relative:?}")
+                })?;
+                let file_findings = scan_validated_bytes(&full.display().to_string(), &bytes)
+                    .map_err(|e| format!("built-in secret scan failed closed: {e}"))?;
+                findings.extend(file_findings);
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "change process artifact is not a regular file: {relative:?}"
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot inspect change process artifact {relative:?}: {e}"
+                ))
+            }
+        }
+    }
+    if !symlinked_paths.is_empty() {
+        // Never reached with a clean result: `scan_secrets`/`scan_paths`
+        // always fails closed on a symlinked path. Kept as a call (not an
+        // inline refusal) so this lane matches `scan_secrets`'s own
+        // non-regular-path error text exactly.
+        scan_secrets(&symlinked_paths)?;
+    }
+    Ok(SecretReport {
+        scanner: "builtin",
+        findings,
+    })
+}
+
+/// Whether `change`'s own directory carries its own `.gitleaks.toml` or
+/// `.gitleaksignore`. Presence of either is itself treated as a gate refusal
+/// by `cli::enforce_prose_secret_scan` (security-plan.md Condition 1): a
+/// change author must never be able to plant a rule-disabling config
+/// alongside the prose the D4 lane reviews, even though `run_gitleaks` can no
+/// longer be tricked into resolving it via `-s`.
+pub fn change_owns_gitleaks_config(root: &Path, change: &str) -> Result<bool, String> {
+    let dir = root.join("openspec/changes").join(change);
+    for name in [".gitleaks.toml", ".gitleaksignore"] {
+        match std::fs::symlink_metadata(dir.join(name)) {
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect change directory for {name}: {e}")),
+        }
+    }
+    Ok(false)
 }
 
 /// Scan exactly the staged index postimages, never the possibly-different
@@ -289,7 +432,7 @@ mod tests {
         // this a clean scan (Cond 9's "louder, never quieter" cuts only one
         // direction — the exclusion itself is intentionally narrow).
         assert_eq!(
-            run_gitleaks(&root),
+            run_gitleaks(&root, "."),
             Some(true),
             "a secret confined to target/ must be excluded, not scanned"
         );
@@ -299,7 +442,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/leak.rs"), fixture_secret_line()).unwrap();
         assert_eq!(
-            run_gitleaks(&root),
+            run_gitleaks(&root, "."),
             Some(false),
             "a real secret outside target/ must still be reported"
         );
@@ -317,8 +460,9 @@ mod tests {
         // of its own: if the ephemeral extend-default config were used
         // instead, this same fixture secret would be caught (as the sibling
         // test proves). Passing clean here proves gitleaks resolved the
-        // repo's OWN `.gitleaks.toml` — the invocation was byte-identical to
-        // before this exclusion existed, no `-c` override applied.
+        // repo's OWN `.gitleaks.toml` — an explicit `-c` now always names it,
+        // but that is the SAME file gitleaks would have auto-resolved before
+        // this generalization, so governance is unchanged.
         std::fs::write(
             root.join(".gitleaks.toml"),
             "[extend]\nuseDefault = false\n",
@@ -327,9 +471,72 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/leak.rs"), fixture_secret_line()).unwrap();
         assert_eq!(
-            run_gitleaks(&root),
+            run_gitleaks(&root, "."),
             Some(true),
             "a repo-owned .gitleaks.toml must govern the scan unmodified"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Security(code) Finding 4: a symlinked repo-root `.gitleaks.toml` must
+    /// NEVER be trusted — `run_gitleaks` used to decide via `Path::exists`,
+    /// which follows symlinks, so a symlink pointing at an attacker-planted
+    /// rule-disabling config would be handed to gitleaks as the repo's own
+    /// governance. With `symlink_metadata`-based detection the symlink is
+    /// refused and the scan falls back to the ephemeral extend-default
+    /// config, so the SAME fixture secret that a followed symlink would hide
+    /// is still caught.
+    #[cfg(unix)]
+    #[test]
+    fn run_gitleaks_refuses_a_symlinked_repo_root_config_and_falls_back_to_ephemeral() {
+        if !tool_available("gitleaks") {
+            eprintln!("skipped: gitleaks is not installed in this environment");
+            return;
+        }
+        let root = gitleaks_fixture_dir("symlinked-root-config");
+        // A real, rule-disabling config living OUTSIDE the trusted position.
+        std::fs::write(root.join("evil.toml"), "[extend]\nuseDefault = false\n").unwrap();
+        // `.gitleaks.toml` at the repo root is a SYMLINK to it, not a regular
+        // file planted there directly.
+        std::os::unix::fs::symlink(root.join("evil.toml"), root.join(".gitleaks.toml")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/leak.rs"), fixture_secret_line()).unwrap();
+        assert_eq!(
+            run_gitleaks(&root, "."),
+            Some(false),
+            "a symlinked .gitleaks.toml must be refused, falling back to the \
+             ephemeral extend-default config that still catches the fixture secret"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Security-plan.md Condition 1's mechanism-level pin: a `.gitleaks.toml`
+    /// planted INSIDE the scanned source directory (not the repo root) must
+    /// never blind the scan — `run_gitleaks` must always pass an explicit
+    /// `-c`, so gitleaks cannot auto-resolve a config from `source_dir`. This
+    /// is the exact shape `checks::scan_change_prose`'s change-directory scan
+    /// exposes that a root-only scan (`source_dir = "."`) never could.
+    #[test]
+    fn run_gitleaks_over_a_subdirectory_ignores_that_subdirectorys_own_config() {
+        if !tool_available("gitleaks") {
+            eprintln!("skipped: gitleaks is not installed in this environment");
+            return;
+        }
+        let root = gitleaks_fixture_dir("subdir-config-evasion");
+        let change_dir = root.join("openspec/changes/example-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        // A rule-disabling config planted alongside the scanned prose, not at
+        // the repo root.
+        std::fs::write(
+            change_dir.join(".gitleaks.toml"),
+            "[extend]\nuseDefault = false\n",
+        )
+        .unwrap();
+        std::fs::write(change_dir.join("design.md"), fixture_secret_line()).unwrap();
+        assert_eq!(
+            run_gitleaks(&root, "openspec/changes/example-change"),
+            Some(false),
+            "a .gitleaks.toml inside the scanned source directory must not blind the scan"
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -720,6 +927,167 @@ mod tests {
             err.starts_with("built-in secret scan failed closed:") && err.contains("byte cap"),
             "an oversize file must fail closed on the size cap: {err}"
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn prose_fixture_dir(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mpd-prose-lane-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// security-plan.md Condition 3: only `NotFound` is skipped by
+    /// `scan_change_prose`; every other `symlink_metadata` error blocks, and
+    /// non-UTF-8 bytes in a regular-file artifact are a hard refusal — never
+    /// a silent lossy-conversion content-rules skip.
+    #[test]
+    fn scan_change_prose_skips_absent_artifacts_but_fails_closed_on_other_errors() {
+        let root = prose_fixture_dir("stat-and-encoding");
+        let change = "example-change";
+
+        // No artifacts exist at all: clean, not an error.
+        let report = scan_change_prose(&root, change).expect("absent artifacts must be skipped");
+        assert!(report.findings.is_empty());
+
+        // A change directory that is itself a PLAIN FILE (not a directory)
+        // makes every artifact path under it fail `symlink_metadata` with a
+        // non-`NotFound` error (ENOTDIR) — must block, not skip.
+        std::fs::create_dir_all(root.join("openspec/changes")).unwrap();
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}")),
+            b"not a dir",
+        )
+        .unwrap();
+        let error = scan_change_prose(&root, change).unwrap_err();
+        assert!(
+            error.contains("cannot inspect change process artifact"),
+            "{error}"
+        );
+        std::fs::remove_file(root.join(format!("openspec/changes/{change}"))).unwrap();
+
+        // Non-UTF-8 bytes in a regular-file artifact are a hard refusal.
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/design.md")),
+            [0x66, 0x6f, 0x6f, 0xff, 0xfe, 0x0a],
+        )
+        .unwrap();
+        let error = scan_change_prose(&root, change).unwrap_err();
+        assert!(
+            error.contains("not valid UTF-8") && error.contains("design.md"),
+            "{error}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// security-plan.md Condition 3/9: a symlinked process artifact is
+    /// RETAINED (never skipped as absent) so the downstream `scan_paths`
+    /// call fails the scan closed on it — mirroring the tracked-symlink
+    /// fail-closed guarantee `scan_secrets` already provides.
+    #[cfg(unix)]
+    #[test]
+    fn scan_change_prose_retains_a_symlinked_artifact_so_the_scan_fails_closed() {
+        let root = prose_fixture_dir("symlinked-artifact");
+        let change = "symlink-change";
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        std::fs::write(root.join("elsewhere.md"), b"# elsewhere\n").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("elsewhere.md"),
+            root.join(format!("openspec/changes/{change}/design.md")),
+        )
+        .unwrap();
+        let error = scan_change_prose(&root, change).unwrap_err();
+        assert!(
+            error.contains("non-regular"),
+            "a symlinked artifact must fail the scan closed: {error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Security(code) Finding 5: `scan_validated_bytes` scans EXACTLY the
+    /// bytes handed to it — it must never reopen/re-read `path_label` from
+    /// disk. A label naming a path that has never existed anywhere on disk
+    /// proves this: if the implementation re-read from disk (the TOCTOU
+    /// `scan_paths` would otherwise create by reopening between the prose
+    /// lane's validating read and its scan), this call would fail on the
+    /// missing path; instead it succeeds and finds the secret embedded only
+    /// in the in-memory buffer.
+    #[test]
+    fn scan_validated_bytes_scans_the_given_buffer_never_touching_disk() {
+        let never_on_disk = "/this/path/has/never/existed-on-disk/design.md";
+        let bytes = fixture_secret_line().into_bytes();
+        let findings = scan_validated_bytes(never_on_disk, &bytes)
+            .expect("scan_validated_bytes must operate purely on the given buffer, never disk");
+        assert!(
+            findings.iter().any(|f| f.rule == "private-key-block"),
+            "{findings:?}"
+        );
+        assert!(findings.iter().all(|f| f.path == never_on_disk));
+    }
+
+    /// Security(code) Finding 5 (positive path): a real secret embedded in a
+    /// regular-file process artifact is still detected end-to-end through
+    /// the rewritten byte-threading lane — the TOCTOU fix must never
+    /// silently swallow a genuine finding.
+    #[test]
+    fn scan_change_prose_detects_a_real_secret_in_a_regular_artifact() {
+        let root = prose_fixture_dir("real-secret-detected");
+        let change = "secret-change";
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/design.md")),
+            fixture_secret_line(),
+        )
+        .unwrap();
+        let report = scan_change_prose(&root, change)
+            .expect("a readable UTF-8 artifact must scan, not fail closed");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == "private-key-block"),
+            "{:?}",
+            report.findings
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// security-plan.md Condition 1: `change_owns_gitleaks_config` detects
+    /// either `.gitleaks.toml` or `.gitleaksignore` inside the change
+    /// directory, and reports `false` when neither exists.
+    #[test]
+    fn change_owns_gitleaks_config_detects_either_file_and_is_false_when_absent() {
+        let root = prose_fixture_dir("owns-gitleaks-config");
+        let change = "config-change";
+        std::fs::create_dir_all(root.join(format!("openspec/changes/{change}"))).unwrap();
+
+        assert!(!change_owns_gitleaks_config(&root, change).unwrap());
+
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/.gitleaks.toml")),
+            b"[extend]\nuseDefault = false\n",
+        )
+        .unwrap();
+        assert!(change_owns_gitleaks_config(&root, change).unwrap());
+        std::fs::remove_file(root.join(format!("openspec/changes/{change}/.gitleaks.toml")))
+            .unwrap();
+        assert!(!change_owns_gitleaks_config(&root, change).unwrap());
+
+        std::fs::write(
+            root.join(format!("openspec/changes/{change}/.gitleaksignore")),
+            b"",
+        )
+        .unwrap();
+        assert!(change_owns_gitleaks_config(&root, change).unwrap());
 
         let _ = std::fs::remove_dir_all(root);
     }
