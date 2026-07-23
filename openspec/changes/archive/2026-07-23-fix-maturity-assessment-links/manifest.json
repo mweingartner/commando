@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "paths": [
+    "docs/complete-maturity-assessment.md",
+    "docs/fix-maturity-assessment-links.md",
+    "openspec/changes/fix-maturity-assessment-links",
+    "openspec/changes/fix-maturity-assessment-links/**",
+    "openspec/changes/archive/2026-07-23-fix-maturity-assessment-links"
+  ],
+  "shared_paths": []
+}
