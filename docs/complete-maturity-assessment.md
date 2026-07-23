@@ -31,9 +31,9 @@ states. It closes with a prioritized measurement and controlled-experiment roadm
 
 ## Usage
 
-Read the canonical `docs/optimize-quality-cost-time-maturity.md` assessment and its
-`openspec/changes/archive/2026-07-23-complete-maturity-assessment/` evidence. Inspect the
-live coverage and routing evidence without mutation:
+Read [the canonical assessment](../../../docs/optimize-quality-cost-time-maturity.md) and
+its [correction record](../../../docs/complete-maturity-assessment.md). Inspect the live
+coverage and routing evidence without mutation:
 
 ```sh
 mpd status --json
