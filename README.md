@@ -305,17 +305,28 @@ bash scripts/bootstrap-local-ci.sh
 ```
 
 The sole activation route binds an immutable reviewed commit, canonical policy digest,
-absolute coordinator bytes, tracked wrappers, and `.githooks`:
+absolute coordinator bytes, tracked wrappers, and `.githooks`. Read the digest for the
+commit you reviewed first — it is SHA-256 over the *serialized* `local_validation`
+policy, not a hash of `.mpd/config.json`, so it cannot be reproduced with `shasum` or
+`jq`:
 
 ```sh
+mpd policy digest --commit <full-commit-oid>     # or --json | jq -r .policy_digest
+
 mpd policy activate \
   --commit <full-commit-oid> \
-  --confirm-policy-digest <sha256> \
+  --confirm-policy-digest <digest from the previous command> \
   --coordinator <canonical-absolute-mpd-path> \
-  --confirm-executable-digest <sha256> \
+  --confirm-executable-digest <sha256 of that binary> \
   --hooks .githooks \
   --yes
 ```
+
+`policy digest` is read-only: it activates nothing and changes no trust state. It does
+not weaken the confirmation — `activate` still refuses a mismatch without revealing the
+expected value, so naming the digest remains the operator's statement of which reviewed
+policy they are binding. Any `.mpd/config.json` change produces a new digest, so re-read
+it before reactivating.
 
 Activation is a clone-local owner trust decision, not independent proof. It installs
 owner-only clone-private launchers and configures `core.hooksPath` to that directory.

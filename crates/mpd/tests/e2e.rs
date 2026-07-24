@@ -934,6 +934,31 @@ fn begin_and_stage_hook_governance(sb: &Sandbox, change: &str) {
 }
 
 #[test]
+fn policy_digest_errors_without_a_reviewed_policy_and_mutates_nothing() {
+    // `mpd init` scaffolds the lightweight config with no structured local_validation,
+    // so there is no reviewed policy to confirm. The command must say so rather than
+    // print a digest derived from defaults -- a digest of a policy that could never be
+    // activated would be misleading evidence -- and it must remain read-only.
+    let sb = Sandbox::new("policy-digest-absent");
+    assert!(sb
+        .mpd(&["init", "--test", PASSING_TEST_CMD])
+        .status
+        .success());
+    let before = staged_snapshot(&sb);
+    let out = sb.mpd(&["policy", "digest"]);
+    assert!(
+        !out.status.success(),
+        "absent local_validation must error, not print a default-derived digest"
+    );
+    let combined = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(
+        combined.contains("local_validation"),
+        "the error must name the missing policy: {combined}"
+    );
+    assert_hook_read_only(&sb, &before);
+}
+
+#[test]
 fn pre_commit_allows_an_unmanaged_commit_but_still_secret_scans_it() {
     // With no active change coordinator and an ordinary staged diff, change
     // governance has nothing to say: an UNMANAGED commit (a typo fix, a hotfix,

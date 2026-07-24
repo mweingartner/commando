@@ -682,13 +682,28 @@ impl LocalValidationConfig {
         // the machine, it runs once, and it verifies the COMMIT rather than the
         // Candidate — so it is a genuine independent re-verification, not a repeat.
         let requirements: [(&str, &str, &[CheckKind]); 5] = [
-            ("build", &self.gates.build, &[Format, Lint, Test]),
+            // Build must keep ReleaseBuild: it is the lane that PRODUCES the typed
+            // build artifact the Build gate records (and Deploy and the reuse
+            // equality set later revalidate). Dropping it made every strict Build
+            // fail with "release build produced no typed artifact" — a failure no
+            // test can reach, because a real strict Build gate sits behind the
+            // host trusted-policy wall.
+            (
+                "build",
+                &self.gates.build,
+                &[Format, Lint, Test, ReleaseBuild],
+            ),
             (
                 "security-code",
                 &self.gates.security_code,
                 &[SelfCheck, DependencyAudit, SecretScan, Sast],
             ),
-            ("test", &self.gates.test, &[ReleaseBuild]),
+            // Test mandates no specific lane of its own: Build and Security(code) have
+            // already covered the required set against this exact Candidate, and the
+            // DRIVE_COVERAGE union below is what guarantees nothing is dropped. In this
+            // repository Test carries the non-functional lane, but a repository whose
+            // Test profile adds nothing new is correctly configured, not under-gated.
+            ("test", &self.gates.test, &[]),
             (
                 "pre-push",
                 &self.gates.pre_push,
@@ -703,11 +718,7 @@ impl LocalValidationConfig {
                     SelfCheck,
                 ],
             ),
-            (
-                "high-risk-test",
-                &self.gates.high_risk_test,
-                &[ReleaseBuild, Nonfunctional],
-            ),
+            ("high-risk-test", &self.gates.high_risk_test, &[]),
         ];
         for (gate, profile_name, required) in requirements {
             let effective = self.effective_checks(profile_name)?;

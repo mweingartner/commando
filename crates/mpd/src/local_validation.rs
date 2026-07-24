@@ -5883,6 +5883,23 @@ fn subject_local_validation(
     })
 }
 
+/// The canonical policy digest that `mpd policy activate --confirm-policy-digest`
+/// expects for `subject`: SHA-256 over the exact serialized `local_validation` policy
+/// read from that immutable commit.
+///
+/// This deliberately shares `subject_local_validation` + `canonical_policy_bytes` with
+/// the activation path, so the value an operator can print and the value activation
+/// accepts cannot disagree. The policy is validated before digesting — matching
+/// activation's own ordering — so a malformed policy reports the validation error
+/// rather than the digest of something that could never be activated.
+///
+/// Read-only: no ledger write, receipt, candidate capture, or trust-state change.
+pub fn subject_policy_digest(root: &Path, subject: &Subject) -> Result<String, String> {
+    let exact = subject_local_validation(root, subject)?;
+    exact.validate()?;
+    Ok(Digest::of_bytes(&canonical_policy_bytes(&exact)?).to_hex())
+}
+
 fn subject_file_bytes(
     root: &Path,
     subject: &Subject,
@@ -13083,6 +13100,103 @@ mod tests {
                 .unwrap_err()
                 .contains("digest mismatch")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subject_policy_digest_is_the_serialized_policy_not_the_config_file_bytes() {
+        // Anti-drift pin (design + security-plan Condition 6). `policy digest` exists so
+        // an operator can obtain the value `policy activate --confirm-policy-digest`
+        // demands without patching private internals. This asserts the three properties
+        // that make it usable: it equals the activation path's own computation, it is
+        // NOT a hash of the config file (the obvious wrong guess, which is why the value
+        // was previously unobtainable outside the crate), and it binds the COMMIT rather
+        // than the worktree.
+        let root = std::env::temp_dir().join(format!(
+            "mpd-policy-digest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join(".mpd")).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        for (key, value) in [
+            ("user.email", "test@example.invalid"),
+            ("user.name", "test"),
+        ] {
+            assert!(Command::new("git")
+                .args(["config", key, value])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let committed = test_policy();
+        let config = crate::config::Config {
+            local_validation: Some(committed.clone()),
+            ..Default::default()
+        };
+        fs::write(
+            root.join(".mpd/config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        assert!(Command::new("git")
+            .args(["add", ".mpd/config.json"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-qm", "policy"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let subject = capture_subject(&root, None).unwrap();
+
+        let printed = subject_policy_digest(&root, &subject).unwrap();
+        let activation_path = Digest::of_bytes(
+            &canonical_policy_bytes(&subject_local_validation(&root, &subject).unwrap()).unwrap(),
+        )
+        .to_hex();
+        assert_eq!(
+            printed, activation_path,
+            "printed digest must equal the value activation computes"
+        );
+
+        let file_bytes_digest =
+            Digest::of_bytes(&fs::read(root.join(".mpd/config.json")).unwrap()).to_hex();
+        assert_ne!(
+            printed, file_bytes_digest,
+            "the digest is over the serialized policy, not the config file bytes"
+        );
+
+        // Binding is to the immutable commit: a dirty worktree policy cannot move it.
+        let mut dirty = committed.clone();
+        dirty.schema = 99;
+        let dirty_config = crate::config::Config {
+            local_validation: Some(dirty),
+            ..Default::default()
+        };
+        fs::write(
+            root.join(".mpd/config.json"),
+            serde_json::to_vec_pretty(&dirty_config).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            subject_policy_digest(&root, &subject).unwrap(),
+            printed,
+            "a dirty worktree must not change the subject's digest"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

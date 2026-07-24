@@ -46,8 +46,10 @@ Keep the adversarial review; cut the mechanical re-work:
 
 - **Each lane runs once per Candidate; documentation never compiles.** Build, Security(code),
   and Test validate the SAME immutable Candidate, so the profiles are disjoint by design:
-  Build owns `format`/`clippy`/`workspace-tests`, Security(code) owns the four scans, Test
-  owns `release-build` (+ non-functional at high risk). A lane that already passed against
+  Build owns `format`/`clippy`/`workspace-tests`/`release-build` — the last one must stay
+  in Build because it PRODUCES the typed build artifact the gate records and Deploy later
+  revalidates — Security(code) owns the four scans, and Test owns the non-functional lane
+  (the heavy throughput check runs only at high risk). A lane that already passed against
   this Candidate is covered — re-running it at a later gate is duplication, not rigor, and
   `LocalValidationConfig::validate` refuses any config that drops a lane from the drive's
   union or re-adds one twice. `pre-push` deliberately keeps the full set: it verifies the

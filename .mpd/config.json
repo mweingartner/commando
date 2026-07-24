@@ -186,13 +186,13 @@
     },
     "profiles": {
       "build": {
-        "checks": ["format", "clippy", "workspace-tests"]
+        "checks": ["format", "clippy", "workspace-tests", "release-build"]
       },
       "security-code": {
         "checks": ["policy-static", "dependency-audit", "gitleaks", "semgrep"]
       },
       "test": {
-        "checks": ["release-build"]
+        "checks": ["phase-model-tests"]
       },
       "pre-push": {
         "checks": ["format", "clippy", "workspace-tests", "release-build", "dependency-audit", "gitleaks", "semgrep", "policy-static"]

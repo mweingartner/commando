@@ -424,6 +424,16 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum PolicyCommand {
+    /// Print the canonical policy digest `activate --confirm-policy-digest` expects.
+    /// Read-only: activates nothing and changes no trust state.
+    Digest {
+        /// Immutable commit whose `.mpd/config.json` to read. Defaults to the current
+        /// preflight subject.
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the non-executing exact-subject policy preflight.
     #[cfg(test)]
     Status {
@@ -6544,6 +6554,36 @@ fn cmd_hook(command: HookCommand) -> CmdResult {
 
 fn cmd_policy(command: PolicyCommand) -> CmdResult {
     match command {
+        PolicyCommand::Digest { commit, json } => {
+            let root = find_root()?;
+            let cfg = Config::load(&root);
+            let local = cfg.local_validation.ok_or_else(|| {
+                "structured local_validation is absent; there is no reviewed policy to confirm"
+                    .to_string()
+            })?;
+            let report = crate::local_validation::preflight(&root, commit.as_deref(), &local)?;
+            let digest = crate::local_validation::subject_policy_digest(&root, &report.subject)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema": 1,
+                        "commit": report.subject.commit,
+                        "tree": report.subject.tree,
+                        "policy_digest": digest,
+                    })
+                );
+            } else {
+                println!(
+                    "Policy subject: {} ({})",
+                    harness::terminal_safe(&report.subject.commit),
+                    harness::terminal_safe(&report.subject.tree)
+                );
+                println!("Canonical policy digest: {digest}");
+                println!("\n→ pass this to: mpd policy activate --confirm-policy-digest {digest}");
+            }
+            Ok(0)
+        }
         #[cfg(test)]
         PolicyCommand::Status { commit, json } => {
             let root = find_root()?;
