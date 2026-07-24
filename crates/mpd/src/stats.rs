@@ -223,7 +223,25 @@ fn phase_measures(ledger: &Ledger) -> PhaseMeasures {
     let mut attempts = BTreeMap::new();
     let mut wallclock_secs = BTreeMap::new();
     let history_empty_for = |phase: Phase| !ledger.history.iter().any(|event| event.phase == phase);
-    for phase in Phase::applicable(ledger.applicability()) {
+    // Report every phase that is applicable NOW **or** that this ledger actually
+    // recorded work against. Iterating applicability alone would erase real
+    // history the moment an applicability rule changes: reconnecting the
+    // documentation axis instantly hid 17 documentation attempts that genuinely
+    // happened on archived Fix changes. A measurement surface must not lose
+    // evidence because policy moved — the whole point is to see the rework.
+    let mut reported: Vec<Phase> = Phase::applicable(ledger.applicability());
+    for event in &ledger.history {
+        if !reported.contains(&event.phase) {
+            reported.push(event.phase);
+        }
+    }
+    for phase in ledger.gates.keys().copied() {
+        if !reported.contains(&phase) {
+            reported.push(phase);
+        }
+    }
+    reported.sort();
+    for phase in reported {
         // COUNT the recorded attempts, do not take the highest attempt NUMBER.
         // A freshness rewind resets the attempt counter, so a phase driven 3
         // times, rewound, then driven twice more holds 5 history records whose
@@ -700,6 +718,38 @@ mod tests {
             judgment_artifact_sha256: None,
             delegation: None,
         }
+    }
+
+    /// Recorded history must survive a change in applicability policy.
+    ///
+    /// Reconnecting the documentation axis made Documentation/Doc Validation
+    /// inapplicable to a Fix. Reporting only currently-applicable phases would
+    /// have silently erased documentation attempts that genuinely happened on
+    /// archived Fix changes — a measurement surface losing evidence because
+    /// policy moved, which is precisely backwards.
+    #[test]
+    fn phases_with_recorded_history_are_reported_even_when_no_longer_applicable() {
+        let mut ledger = Ledger::new("legacy-fix", "mpd", false, ChangeKind::Fix);
+        assert!(
+            !Phase::applicable(ledger.applicability()).contains(&Phase::Documentation),
+            "a Fix must not be documenting any more, else this test proves nothing"
+        );
+        ledger.history.push(GateEvent {
+            phase: Phase::Documentation,
+            record: gate_record("Documenter", 1, 100, 160),
+        });
+        ledger.history.push(GateEvent {
+            phase: Phase::Documentation,
+            record: gate_record("Documenter", 2, 200, 230),
+        });
+
+        let measures = phase_measures(&ledger);
+        assert_eq!(
+            measures.attempts.get("documentation"),
+            Some(&2),
+            "both recorded attempts must still be reported"
+        );
+        assert_eq!(measures.wallclock_secs.get("documentation"), Some(&90));
     }
 
     /// Full byte-content + mtime snapshot of every entry under `.mpd`,
