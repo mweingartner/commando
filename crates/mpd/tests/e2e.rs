@@ -934,17 +934,42 @@ fn begin_and_stage_hook_governance(sb: &Sandbox, change: &str) {
 }
 
 #[test]
-fn pre_commit_fails_closed_on_missing_coordinator_without_mutation() {
-    let sb = Sandbox::new("hook-missing-coordinator");
+fn pre_commit_allows_an_unmanaged_commit_but_still_secret_scans_it() {
+    // With no active change coordinator and an ordinary staged diff, change
+    // governance has nothing to say: an UNMANAGED commit (a typo fix, a hotfix,
+    // or a fix to mpd's own tooling) must be allowed rather than refused.
+    // Refusing outright made it impossible to commit anything without first
+    // manufacturing a change — a bootstrapping trap, not a safety property.
+    // The safety-critical staged secret scan still applies, which is what this
+    // test pins on both sides.
+    let sb = Sandbox::new("hook-unmanaged-commit");
     assert!(sb
         .mpd(&["init", "--test", PASSING_TEST_CMD])
         .status
         .success());
+
+    sb.write("notes.txt", "an ordinary edit outside any tracked change\n");
+    run("git", &["add", "notes.txt"], &sb.dir);
     let before = staged_snapshot(&sb);
     let out = sb.mpd(&["hook", "pre-commit"]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("no active change coordinator"));
+    assert!(
+        out.status.success(),
+        "an unmanaged commit must be allowed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_hook_read_only(&sb, &before);
+
+    // The floor holds: the same unmanaged commit is blocked once it stages a
+    // secret. Assembled from split literals so this file carries no contiguous
+    // credential pattern.
+    let secret_line = format!("aws_key = AKIA{}\n", "IOSFODNN7EXAMPLE");
+    sb.write("notes.txt", &secret_line);
+    run("git", &["add", "notes.txt"], &sb.dir);
+    let out = sb.mpd(&["hook", "pre-commit"]);
+    assert!(
+        !out.status.success(),
+        "a staged secret must still block an unmanaged commit"
+    );
 }
 
 #[test]

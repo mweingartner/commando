@@ -5957,36 +5957,49 @@ fn staged_precommit_governance(root: &Path) -> Result<(), String> {
         }
         None => None,
     };
-    let change = pending
-        .as_ref()
-        .map(|view| view.change.clone())
-        .map(Ok)
-        .unwrap_or_else(|| {
-            resolve_change(root, None).map_err(|_| {
-                // D5: no active coordinator is the exact post-abandon state
-                // this fallback exists to recover from. If the staged diff
-                // is closure-shaped (removes some change X's own active
-                // manifest), name X and point at the recovery command
-                // instead of the bare generic message — never suggesting
-                // `mpd archive --recover` (recover needs the pointer
-                // `abandon` deleted) and never re-creating the manifest.
-                // Best-effort only: a failure reading the staged diff here
-                // just falls back to the generic message, which is what the
-                // main flow's own `diff_cached_name_status` call below would
-                // then also report.
+    let change = match pending.as_ref().map(|view| view.change.clone()) {
+        Some(change) => change,
+        None => match resolve_change(root, None) {
+            Ok(change) => change,
+            Err(_) => {
+                // No active change coordinator. Two genuinely different cases:
+                //
+                // 1. The staged diff is closure-shaped — it removes some change
+                //    X's own active manifest. That is the exact post-abandon
+                //    state this recovery path exists for, so name X and point at
+                //    the recovery command (never suggesting `mpd archive
+                //    --recover`, which needs the pointer `close` deleted, and
+                //    never re-creating the manifest).
+                //
+                // 2. Otherwise this is an UNMANAGED commit: an ordinary edit made
+                //    outside a tracked change — a typo fix, a hotfix, or a fix to
+                //    mpd's own tooling. Change/closure governance has nothing to
+                //    say about such a commit, so it is skipped rather than
+                //    refused. The caller still runs the staged secret scan, which
+                //    is the safety-critical gate and applies to EVERY commit;
+                //    only the process ceremony is skipped, never the scan.
+                //
+                //    Refusing outright made it impossible to commit anything
+                //    without first manufacturing a change — including a fix to
+                //    this very file — which is a bootstrapping trap, not a
+                //    safety property.
+                //
+                // Reading the staged diff is best-effort: a failure falls through
+                // to the unmanaged path, where the secret scan still applies.
                 let hint = git::diff_cached_name_status(root)
                     .ok()
                     .as_deref()
                     .and_then(removed_manifest_change_name);
-                match hint {
-                    Some(name) => format!(
+                return match hint {
+                    Some(name) => Err(format!(
                         "pre-commit blocked: no active change coordinator.{}",
                         closure_recovery_hint(&name)
-                    ),
-                    None => "pre-commit blocked: no active change coordinator".to_string(),
-                }
-            })
-        })?;
+                    )),
+                    None => Ok(()),
+                };
+            }
+        },
+    };
     let entries = git::diff_cached_name_status(root)
         .map_err(|error| format!("pre-commit blocked: cannot parse staged changes: {error}"))?;
     for entry in &entries {
