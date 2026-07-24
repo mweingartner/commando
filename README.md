@@ -18,11 +18,41 @@ not required and is not accepted as validation evidence.
 ```text
 Use MPD to deliver this outcome: [describe the outcome you want].
 
-You drive the workflow: start with `mpd conduct`, follow every
+You drive the workflow. Start with `mpd conduct`, follow every
 `mpd next --harness codex --context` brief, complete and gate each applicable phase,
-test the real result, and keep updates focused on outcomes, risks, and decisions.
-Do not ask me to run MPD commands. Stop only for a genuine product decision or
-external-release authorization you do not already have.
+test the real result, and report outcomes, risks, and decisions — not command logs.
+Do not ask me to run MPD commands.
+
+SIZE THE VERIFICATION TO WHAT ACTUALLY CHANGED. Read the diff before you gate:
+- A documentation or prose-only change never compiles and never runs the test suite.
+  Gate it on the docs lane (doc checks + secret scan) and nothing else.
+- A change confined to a bounded area gets the tests covering that area. Do not run a
+  full-workspace sweep or a release build to prove a localized edit, and never gate on
+  exercising a component the change does not touch.
+- Reserve the full profile for genuinely cross-cutting work: shared/config/policy or
+  security code, dependency manifests, or the toolchain.
+- Each check runs once per Candidate. Build, Security(code) and Test validate the same
+  immutable subject, so never re-run a lane an earlier gate already passed against it.
+- Re-run the full cycle only when you find a real defect, or a security issue with a
+  demonstrated path of access. Never re-drive because prose was reworded, a comment
+  moved, an artifact was reformatted, or a gate was re-recorded.
+
+KEEP THE ADVERSARIAL VALUE, CUT THE MECHANICAL REWORK:
+- Author the plan and its artifacts completely before gating, so you are not rewinding
+  to fix wording. Strip every `<!-- -->` placeholder before you archive.
+- Record non-blocking or comment-only findings as notes in the artifact, not as a FAIL.
+- Declare every file you touch in the manifest before Build. If you edit a tracked file
+  outside it the gate will refuse — declare it or stash it. Never let an undeclared file
+  ride along; it would ship unvalidated.
+- A trivial fix that is not really a change (a typo, a hotfix) can be committed directly
+  without manufacturing a change for it. The secret scan still applies to every commit.
+
+BUDGET: if this change has already cost more than one full re-drive, stop and tell me
+what the next gate would buy before spending it. Endless cycling is a process defect,
+not diligence.
+
+Stop only for a genuine product decision or an external-release authorization you do
+not already have.
 ```
 
 **Claude Code**
@@ -30,17 +60,48 @@ external-release authorization you do not already have.
 ```text
 Use MPD to deliver this outcome: [describe the outcome you want].
 
-You drive the workflow: start with `mpd conduct`, follow every
+You drive the workflow. Start with `mpd conduct`, follow every
 `mpd next --harness claude-code --context` brief, complete and gate each applicable
-phase, test the real result, and keep updates focused on outcomes, risks, and decisions.
-Do not ask me to run MPD commands. Stop only for a genuine product decision or
-external-release authorization you do not already have.
+phase, test the real result, and report outcomes, risks, and decisions — not command
+logs. Do not ask me to run MPD commands.
+
+SIZE THE VERIFICATION TO WHAT ACTUALLY CHANGED. Read the diff before you gate:
+- A documentation or prose-only change never compiles and never runs the test suite.
+  Gate it on the docs lane (doc checks + secret scan) and nothing else.
+- A change confined to a bounded area gets the tests covering that area. Do not run a
+  full-workspace sweep or a release build to prove a localized edit, and never gate on
+  exercising a component the change does not touch.
+- Reserve the full profile for genuinely cross-cutting work: shared/config/policy or
+  security code, dependency manifests, or the toolchain.
+- Each check runs once per Candidate. Build, Security(code) and Test validate the same
+  immutable subject, so never re-run a lane an earlier gate already passed against it.
+- Re-run the full cycle only when you find a real defect, or a security issue with a
+  demonstrated path of access. Never re-drive because prose was reworded, a comment
+  moved, an artifact was reformatted, or a gate was re-recorded.
+
+KEEP THE ADVERSARIAL VALUE, CUT THE MECHANICAL REWORK:
+- Author the plan and its artifacts completely before gating, so you are not rewinding
+  to fix wording. Strip every `<!-- -->` placeholder before you archive.
+- Record non-blocking or comment-only findings as notes in the artifact, not as a FAIL.
+- Declare every file you touch in the manifest before Build. If you edit a tracked file
+  outside it the gate will refuse — declare it or stash it. Never let an undeclared file
+  ride along; it would ship unvalidated.
+- A trivial fix that is not really a change (a typo, a hotfix) can be committed directly
+  without manufacturing a change for it. The secret scan still applies to every commit.
+
+BUDGET: if this change has already cost more than one full re-drive, stop and tell me
+what the next gate would buy before spending it. Endless cycling is a process defect,
+not diligence.
+
+Stop only for a genuine product decision or an external-release authorization you do
+not already have.
 ```
 
 That is the whole user workflow. The model creates the change, calls the stages in order,
-writes the required artifacts, builds and tests the result, fixes failures, and reports
-what actually shipped. If MPD is missing or the repository is not configured, the model
-should report the blocker and the exact setup step instead of pretending the workflow ran.
+writes the required artifacts, validates the result **in proportion to what changed**, fixes
+failures, and reports what actually shipped. If MPD is missing or the repository is not
+configured, the model should report the blocker and the exact setup step instead of
+pretending the workflow ran.
 
 MPD is deliberately not an oracle or an independent attestation service. Its trust
 boundary is a cooperative repository owner. An owner can replace the executable, edit
