@@ -143,8 +143,12 @@ authorization. A Build receipt does not fill the full Test-profile field.
 ## Quality, cost, and time maturity
 
 MPD's quality controls are **managed and evidence-gated**: written intent, separated
-roles, exact Candidate identity, adversarial Security review, structured local
-validation, and distinct Deploy/publication observations are enforced by the ledger.
+roles, adversarial Security review, and distinct Deploy/publication observations are
+enforced by the ledger. When `local_validation` is configured, objective gates also
+bind exact Candidate identity and structured validation receipts. Without it, strict
+Build/Test use the configured legacy test command and secret scan, and Deploy uses the
+legacy command or readiness path; those passes do not claim a Candidate, structured
+receipt, containment certification, typed Build output, or installed-byte identity.
 This is strong local process assurance, not proof that a model answer is correct and
 not protection from a repository owner who replaces or bypasses the coordinator.
 
@@ -366,11 +370,12 @@ transfer observation, and parity.
 
 ## Deployment and installation
 
-Build records one candidate-bound release file. Execute Deploy copies those already
-tested bytes through an exclusive temporary, syncs/atomically replaces the destination,
-then reopens and checks mode, length, and SHA-256. It does not rebuild or execute the
-installed candidate for identity. Readiness-only Deploy is reported separately and
-does not claim installation.
+With typed Build/Deploy output configured, Build records one candidate-bound release
+file. Execute Deploy copies those already tested bytes through an exclusive temporary,
+syncs/atomically replaces the destination, then reopens and checks mode, length, and
+SHA-256. It does not rebuild or execute the installed candidate for identity.
+Legacy-command and readiness-only Deploy are reported without claiming installed-byte
+identity or installation.
 
 ## Repository verification
 

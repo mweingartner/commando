@@ -4157,9 +4157,12 @@ fn cmd_gate(
             }
         }
         // Under the strict tier, objective Build/Security(code)/Test execution
-        // is delegated to the exact-subject structured validator. This happens
-        // only after the judgment artifact has already been checked, so an
-        // artifact/CLI mismatch cannot launch tools or publish a receipt.
+        // prefers the exact-subject structured validator when configured. This
+        // happens only after the judgment artifact has already been checked, so
+        // an artifact/CLI mismatch cannot launch tools or publish a receipt.
+        // Repositories without local_validation retain the strict governance
+        // checks above, then use the legacy objective checks below without
+        // publishing Candidate-bound or structured-validation evidence.
         if ledger.strict && matches!(phase, Phase::Build | Phase::SecurityCode | Phase::Test) {
             if let Some(message) = strict_artifact_blocking_message(
                 &root,
@@ -4313,13 +4316,8 @@ fn cmd_gate(
                 structured_validation_receipt = Some(receipt);
                 structured_gate_ran = true;
             } else {
-                if ledger.strict {
-                    return Ok(gate_blocked(
-                        "strict objective gate requires local_validation migration; legacy test/deploy strings are manual-only",
-                    ));
-                }
                 eprintln!(
-                    "warning: structured local_validation is absent; using deprecated legacy objective gate for manual compatibility. `mpd validate` and policy-aware hooks remain blocked until migration."
+                    "warning: structured local_validation is absent; using the legacy objective gate without exact-Candidate validation or a structured receipt. `mpd validate` and policy-aware hooks remain unavailable until local_validation is configured."
                 );
             }
         }
@@ -4437,9 +4435,9 @@ fn cmd_gate(
                 )));
             }
         }
-        // Deploy has a closed typed branch in the strict tier. A string command
-        // is deliberately retained only for manual/legacy changes: it has no
-        // named Build receipt, no no-follow revalidation, and no byte-identity proof.
+        // Deploy prefers the typed branch when configured. The legacy command
+        // remains available to both tiers, but it has no named Build receipt,
+        // no no-follow revalidation, and no byte-identity proof.
         if phase == Phase::Deploy {
             let cfg = if ledger.strict {
                 Config::load_strict(&root)?
@@ -4512,13 +4510,10 @@ fn cmd_gate(
                     }
                 } else {
                     if ledger.strict {
-                        return Ok(gate_blocked(
-                            "Deploy gate refused: strict changes require tagged deploy_output; legacy string/unset config is manual-only",
-                        ));
+                        eprintln!(
+                            "warning: typed deploy_output is absent; using legacy Deploy/readiness without installed-artifact identity."
+                        );
                     }
-                    // A typed validation graph without a typed Deploy is still
-                    // migration-incomplete in the manual tier; fall through to
-                    // the legacy string only below.
                     if let Some(cmd) = cfg.deploy {
                         println!("Deploying: {cmd}");
                         let outcome = tests_runner::run(&cmd, &root);
@@ -4533,22 +4528,25 @@ fn cmd_gate(
                             .command = Some(outcome.command);
                     }
                 }
-            } else if ledger.strict {
-                return Ok(gate_blocked(
-                    "Deploy gate refused: strict changes require tagged typed deploy_output; legacy string/unset config is manual-only",
-                ));
-            } else if let Some(cmd) = cfg.deploy {
-                println!("Deploying: {cmd}");
-                let outcome = tests_runner::run(&cmd, &root);
-                if !outcome.success {
-                    return Ok(gate_blocked(&format!(
-                        "Deploy gate refused: deploy command failed (command: {})",
-                        outcome.command
-                    )));
+            } else {
+                if ledger.strict {
+                    eprintln!(
+                        "warning: typed deploy_output is absent; using legacy Deploy/readiness without installed-artifact identity."
+                    );
                 }
-                checks_summary
-                    .get_or_insert_with(CheckSummary::default)
-                    .command = Some(outcome.command);
+                if let Some(cmd) = cfg.deploy {
+                    println!("Deploying: {cmd}");
+                    let outcome = tests_runner::run(&cmd, &root);
+                    if !outcome.success {
+                        return Ok(gate_blocked(&format!(
+                            "Deploy gate refused: deploy command failed (command: {})",
+                            outcome.command
+                        )));
+                    }
+                    checks_summary
+                        .get_or_insert_with(CheckSummary::default)
+                        .command = Some(outcome.command);
+                }
             }
         }
         // Strict tier (fires only when `ledger.strict`; the manual tier is inert

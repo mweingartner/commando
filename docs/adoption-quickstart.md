@@ -11,15 +11,15 @@ mpd has two tiers, and the choice determines how much setup you need:
 
 | | **Manual tier** (`mpd begin`) | **Strict tier** (`mpd conduct`) |
 |---|---|---|
-| Setup on a fresh repo | `mpd init` + set `test` in `.mpd/config.json` | the above **plus** a full `local_validation` policy + activated coordinator + platform sandbox |
-| Build/Test gate | runs your configured test command via the shell, checks a real non-zero pass count, secret-scans | materializes an exact **candidate** and runs the whole profile inside a **certified-host sandbox** |
-| Portability | any repo, any OS | currently certified on **one macOS/Apple-silicon host** via a deprecated Seatbelt path |
-| Gate enforcement | machine-checked secret scan + test count; persona verdicts cooperative | additionally machine-enforced sandbox validation against the exact candidate |
+| Setup on a fresh repo | `mpd init` + set `test` in `.mpd/config.json` | the same portable setup; `local_validation` is optional for exact-Candidate certification |
+| Build/Test gate | runs your configured test command via the shell, checks a real non-zero pass count, secret-scans | uses structured exact-Candidate validation when configured; otherwise uses the same legacy test/scan checks without a Candidate or structured receipt |
+| Portability | any repo, any OS | governance is portable; structured certification is currently limited to **one macOS/Apple-silicon host** via a deprecated Seatbelt path |
+| Gate enforcement | machine-checked secret scan + test count; persona verdicts cooperative | additionally enforces strict artifacts, actors, freshness, risk, and task closure; sandbox/exact-Candidate enforcement requires `local_validation` |
 
-**For adopting mpd on your other repos today, use the manual tier.** The strict
-tier is what Commando itself runs, and its heavyweight sandbox is single-host
-certified — not something a general repo can turn on without the full
-`local_validation` migration.
+The strict tier no longer requires a full `local_validation` migration. A fresh
+repository can adopt strict governance with its existing test command, then add
+structured validation later if exact-Candidate receipts and containment
+certification justify the additional setup.
 
 ## Manual-tier setup (the portable path) — verified end-to-end
 
@@ -67,24 +67,25 @@ certified — not something a general repo can turn on without the full
   upstream actor (and, per the review-subject rule, from the actor of the phase
   being reviewed). Reuse across non-adjacent phases (Designer at mock and
   sign-off) is fine.
-- **The strict tier will refuse your plain test command.** `mpd conduct` starts
-  the strict tier, whose objective Build gate reports
-  `strict objective gate requires local_validation migration; legacy
-  test/deploy strings are manual-only`. That is expected — the plain-shell test
-  path is a manual-tier feature. Use `mpd begin` unless you are prepared to
-  configure the full `local_validation` policy.
+- **Strict governance and structured validation are separate choices.**
+  `mpd conduct` accepts the configured plain-shell test command when
+  `local_validation` is absent. Build/Test still require a recognizable non-zero
+  pass count and Security(code) still scans secrets, but the resulting gates do
+  not carry a Candidate, structured validation receipt, containment
+  certification, or typed Build output. Deploy likewise uses the legacy deploy
+  command or records readiness without installed-artifact identity.
 - **`--chore` still ran the Documentation phases in the pilot.** Budget for
   Documentation + Doc Validation even on a chore in the manual tier (or confirm
   your config's skip behavior first).
 
 ## When to invest in the strict tier
 
-Reach for `mpd conduct` + `local_validation` only when you want the machine to
-validate an **exact, offline, sandboxed candidate** — i.e. you accept the
-single-certified-host constraint and want gate results that don't depend on the
-driving agent's honesty for the build/test step. For everything else, the
-manual tier gives you the same phase discipline, the secret-scan floor, and a
-real test-count check, on any repo and any OS.
+Reach for `local_validation` when you want the machine to validate an **exact,
+offline, sandboxed candidate** — i.e. you accept the single-certified-host
+constraint and want gate results that don't depend on the driving agent's
+honesty for the build/test step. Strict governance itself remains useful without
+that policy: it adds artifact, actor, freshness, risk, and task enforcement on
+top of the portable secret-scan and real-test-count floor.
 
 ## Known rough edges (tracked, not blockers)
 

@@ -15,7 +15,8 @@ authorization.
 ## Protected assets
 
 - written intent, canonical artifacts, task/condition closure, and append-only history;
-- exact Candidate path/state/mode/byte identity and closure equivalence;
+- exact Candidate path/state/mode/byte identity and closure equivalence when structured
+  local validation is configured;
 - policy, coordinator, hook, tool, advisory, Cargo, sandbox, and canary identities;
 - host credentials and file content outside accepted read roots;
 - writes outside the one private runtime root and `/dev/null`;
@@ -37,21 +38,26 @@ reusable authorization.
 
 ## Core security invariants
 
-1. Planning gates never masquerade as Candidate evidence. Build, Security(code), and
-   Test use one immutable exact Candidate and rehash it before and after execution.
+1. Planning gates never masquerade as Candidate evidence. With structured local
+   validation, Build, Security(code), and Test use one immutable exact Candidate and
+   rehash it before and after execution. Without it, legacy objective gates record no
+   Candidate or structured validation receipt.
 2. Freshness and effective-risk checks run under the ledger lock before a downstream
    brief or effect. Rewind retains all FAIL/CONDITIONAL history.
 3. Strict judgment gates require current canonical artifacts, exact Actor/verdict
    agreement, role difference, task closure, and no waiver.
-4. Authority-bearing execution accepts only reviewed typed program/argv and exact
-   pinned tool/input identities. Shell strings, ambient PATH, and candidate roots have
-   no authority.
-5. Validation is offline, network-denied, bounded, and isolated into private HOME,
-   Git, Cargo, XDG, temp, log, and process state.
+4. Structured authority-bearing execution accepts only reviewed typed program/argv and
+   exact pinned tool/input identities. Legacy test/deploy shell strings are cooperative
+   compatibility execution and cannot produce exact-subject, containment, or
+   installed-byte claims.
+5. Structured validation is offline, network-denied, bounded, and isolated into private
+   HOME, Git, Cargo, XDG, temp, log, and process state. The legacy fallback does not
+   claim those properties.
 6. Pre-push authorizes one exact invocation only; its audit copy is never consulted to
    authorize another push. Deletion-only input cannot bypass policy/ref checks.
-7. Deploy consumes only the Build output identity, copies atomically, verifies reopened
-   bytes, and never executes the candidate for identity.
+7. Typed Deploy consumes only the Build output identity, copies atomically, verifies
+   reopened bytes, and never executes the candidate for identity. Legacy Deploy records
+   only its command outcome or readiness and makes no installed-artifact identity claim.
 8. Human and JSON rendering derive from one typed result, remain meaningful without
    color, and cannot print terminal PASS before durable state exists.
 9. Usage and review attestations bind one exact brief/gate attempt. Required evidence

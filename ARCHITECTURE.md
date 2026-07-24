@@ -53,7 +53,8 @@ records that rewind atomically before returning a new brief.
 
 ## Exact Candidate
 
-Planning is against base `HEAD`; objective work is against an immutable Candidate.
+Planning is against base `HEAD`; when structured local validation is configured,
+objective work is against an immutable Candidate.
 Candidate capture reuses the bounded commit materializer, then overlays only
 manifest-scoped worktree postimages:
 
@@ -68,9 +69,12 @@ MPD state, Git-common receipts/logs/tools, build output, install output, and pro
 are excluded from the Candidate. Declared config/directive/hook/security policy changes
 do move its identity.
 
-Build captures the Candidate once. Security(code) and Test reopen and rehash that same
-projection before and after their profiles. Candidate receipts are never treated as
-Commit/HEAD receipts.
+Structured Build captures the Candidate once. Security(code) and Test reopen and rehash
+that same projection before and after their profiles. Candidate receipts are never
+treated as Commit/HEAD receipts. When `local_validation` is absent, strict governance
+still enforces artifacts, actors, freshness, risk, task closure, and objective gate
+order, but Build/Test use the configured legacy shell test and secret-scan path. Those
+records deliberately omit Candidate and structured-validation bindings.
 
 ## Structured local validation
 
@@ -224,11 +228,13 @@ pushing. It classifies exact parity, ahead, behind, diverged, rewritten, unavail
 offline, or unstable and caches only the observation. Push authorization, actual
 transfer, and parity remain separate.
 
-Build exports one parent-observed typed file descriptor identity. Final Deploy reopens
-that file, copies it through an exclusive target-directory temporary, syncs and
-atomically replaces, then reopens and verifies mode/length/SHA. It never rebuilds or
-executes the installed candidate for identity. Readiness-only and installed execution
-are different result modes.
+When typed outputs are configured, Build exports one parent-observed typed file
+descriptor identity. Final Deploy reopens that file, copies it through an exclusive
+target-directory temporary, syncs and atomically replaces, then reopens and verifies
+mode/length/SHA. It never rebuilds or executes the installed candidate for identity.
+Without typed Deploy output, both governance tiers may run the legacy deploy command or
+record readiness, but neither path claims installed-artifact identity. Readiness-only,
+legacy-command, and installed execution are different evidence strengths.
 
 ## Compatibility
 

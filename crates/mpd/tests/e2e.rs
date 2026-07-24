@@ -2908,19 +2908,36 @@ fn deploy_gate_records_readiness_when_no_deploy_configured() {
 }
 
 #[test]
-fn strict_build_refuses_legacy_test_config_until_local_validation_is_migrated() {
-    let sb = Sandbox::new("strict-local-validation-migration");
+fn strict_build_uses_legacy_test_without_claiming_structured_validation() {
+    let sb = Sandbox::new("strict-legacy-validation");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
-    sb.mpd(&["begin", "migration-required", "--strict", "--fix"]);
-    author_judgment(&sb, "migration-required", "architecture");
+    sb.mpd(&["begin", "legacy-compatible", "--strict", "--fix"]);
+    author_judgment(&sb, "legacy-compatible", "architecture");
     assert_gate_ok(&sb, "architecture");
-    author_judgment(&sb, "migration-required", "security-plan");
+    author_judgment(&sb, "legacy-compatible", "security-plan");
     assert_gate_ok(&sb, "security-plan");
 
-    let blocked = sb.mpd(&["gate", "build", "--pass"]);
-    assert!(!blocked.status.success());
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("local_validation migration"));
-    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "build");
+    let out = sb.mpd(&["gate", "build", "--pass"]);
+    assert!(
+        out.status.success(),
+        "strict Build should accept the configured legacy test: {}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("without exact-Candidate validation"));
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-code"
+    );
+
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/legacy-compatible.json")).unwrap(),
+    )
+    .unwrap();
+    let build = &state["gates"]["build"];
+    assert_eq!(build["checks"]["tests_passed"], 3, "{state}");
+    assert!(build["candidate"].is_null(), "{state}");
+    assert!(build["validation_receipt"].is_null(), "{state}");
 }
 
 #[test]
@@ -5503,7 +5520,13 @@ fn author_judgment(sb: &Sandbox, change: &str, phase: &str) {
         "security-code" => (
             "security-code.md",
             "Security-code reviewer",
-            &["Findings", "Conditions verified", "Verdict"],
+            &[
+                "Findings",
+                "Conditions verified",
+                "Independent review",
+                "Refutation",
+                "Verdict",
+            ],
         ),
         "test" => ("test.md", "Tester", &["Coverage", "Results", "Verdict"]),
         "doc-validation" => (
@@ -5987,14 +6010,29 @@ fn manual_tier_rejects_a_waiver_and_stays_inert() {
 /// via `author_judgment` rather than the placeholder-free-but-section-less
 /// `fill_artifacts`.
 fn strict_fix_to_archive_ready(sb: &Sandbox, change: &str) {
+    strict_fix_to_archive_ready_with_deploy(sb, change, None);
+}
+
+fn strict_fix_to_archive_ready_with_deploy(sb: &Sandbox, change: &str, deploy: Option<&str>) {
     assert!(sb
         .mpd(&["init", "--test", PASSING_TEST_CMD])
         .status
         .success());
-    // Drive the legacy objective gates manually, then promote only for the
-    // strict archive recheck. This preserves the archive invariant without
-    // weakening the strict Build/Test migration blocker.
-    assert!(sb.mpd(&["begin", change, "--fix"]).status.success());
+    if let Some(deploy) = deploy {
+        write_config_with_deploy(sb, deploy);
+    }
+    // A strict change without local_validation uses legacy objective checks,
+    // while retaining strict judgment, freshness, and archive enforcement.
+    assert!(sb
+        .mpd(&["begin", change, "--strict", "--fix"])
+        .status
+        .success());
+    if deploy.is_some() {
+        sb.write(
+            &format!("openspec/changes/{change}/manifest.json"),
+            "{\n  \"version\": 1,\n  \"paths\": [\"openspec/**\"],\n  \"shared_paths\": []\n}\n",
+        );
+    }
     for name in ["proposal.md", "tasks.md"] {
         sb.write(
             &format!("openspec/changes/{change}/{name}"),
@@ -6018,13 +6056,30 @@ fn strict_fix_to_archive_ready(sb: &Sandbox, change: &str) {
     author_judgment(sb, change, "doc-validation");
     assert_gate_ok(sb, "doc-validation");
     assert_gate_ok(sb, "deploy");
-    assert!(sb.mpd(&["strict", change]).status.success());
     let s = json(&sb.mpd(&["status", "--json"]));
     assert_eq!(
         s["phase"], "done",
         "a fix is done only after final Deploy: {s}"
     );
     assert_eq!(s["ready_to_archive"], true, "{s}");
+}
+
+#[test]
+fn strict_deploy_uses_legacy_command_without_claiming_installed_identity() {
+    let sb = Sandbox::new("strict-legacy-deploy");
+    strict_fix_to_archive_ready_with_deploy(&sb, "legacy-deploy", Some("touch deployed.marker"));
+
+    assert!(sb.dir.join("deployed.marker").exists());
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(sb.dir.join(".mpd/state/legacy-deploy.json")).unwrap(),
+    )
+    .unwrap();
+    let deploy = &state["gates"]["deploy"];
+    assert_eq!(
+        deploy["checks"]["command"], "touch deployed.marker",
+        "{state}"
+    );
+    assert!(deploy["deploy_result"].is_null(), "{state}");
 }
 
 #[test]
@@ -6096,7 +6151,7 @@ fn strict_archive_refuses_an_evaporated_judgment_artifact() {
 }
 
 #[test]
-fn removed_waiver_cannot_bypass_strict_local_validation() {
+fn removed_waiver_is_rejected_before_strict_legacy_validation() {
     let sb = Sandbox::new("archive-r12");
     strict_to_security_plan(&sb, "waive-archive", "low");
     let before = std::fs::read(sb.dir.join(".mpd/state/waive-archive.json")).unwrap();
@@ -6114,13 +6169,18 @@ fn removed_waiver_cannot_bypass_strict_local_validation() {
     );
     author_judgment(&sb, "waive-archive", "security-plan");
     assert_gate_ok(&sb, "security-plan");
-    let blocked = sb.mpd(&["gate", "build", "--pass"]);
+    let build = sb.mpd(&["gate", "build", "--pass"]);
     assert!(
-        !blocked.status.success(),
-        "strict Build must require structured local validation"
+        build.status.success(),
+        "strict Build should use the legacy validation fallback: {}\n{}",
+        stdout(&build),
+        String::from_utf8_lossy(&build.stderr)
     );
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("local_validation migration"));
-    assert_eq!(json(&sb.mpd(&["status", "--json"]))["phase"], "build");
+    assert!(String::from_utf8_lossy(&build.stderr).contains("without exact-Candidate validation"));
+    assert_eq!(
+        json(&sb.mpd(&["status", "--json"]))["phase"],
+        "security-code"
+    );
 }
 
 #[test]
