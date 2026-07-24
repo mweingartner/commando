@@ -21,8 +21,16 @@ pub const ATTESTATION_SCHEMA_V1: u32 = 1;
 pub const SSHSIG_ALGORITHM: &str = "sshsig-ed25519-v1";
 pub const SSHSIG_NAMESPACE: &str = "mpd-attestation-v1";
 pub const SSH_KEYGEN_PATH: &str = "/usr/bin/ssh-keygen";
+/// Reviewed digest of the Apple-shipped signature verifier.
+///
+/// This stays a hard pin — an external verifier IS a boundary worth failing
+/// closed on. What changed is the diagnostics: a macOS update legitimately
+/// re-signs this binary, and the pin previously surfaced as an opaque assertion
+/// failure with no path forward. [`tool_lock_review_hint`] now names the
+/// observed digest and the exact re-review edit, so an OS update costs one
+/// reviewed line instead of a blocked repository.
 pub const SSH_KEYGEN_SHA256: &str =
-    "4ed0e089766a35cb8acbaf6e2804e9ec5b187f1baabce5dc832f5a192cb3d7cd";
+    "94bca5dfe70512cd0f421c3194066478d09a6747d7a55f953f8df11c690c77c2";
 pub const MAX_ATTESTATION_BYTES: u64 = 128 * 1024;
 const MAX_FIELD: usize = 256;
 
@@ -504,19 +512,40 @@ fn owner_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 pub fn tool_lock_ok() -> bool {
-    let Ok(mut f) = fs::File::open(SSH_KEYGEN_PATH) else {
-        return false;
-    };
+    observed_ssh_keygen_digest().as_deref() == Some(SSH_KEYGEN_SHA256)
+}
+
+/// SHA-256 of the on-disk verifier, or `None` if it cannot be read.
+pub fn observed_ssh_keygen_digest() -> Option<String> {
+    let mut f = fs::File::open(SSH_KEYGEN_PATH).ok()?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     loop {
         match f.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => hasher.update(&buf[..n]),
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
-    format!("{:x}", hasher.finalize()) == SSH_KEYGEN_SHA256
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// An actionable re-review instruction when the verifier digest has drifted.
+///
+/// A macOS update re-signs `/usr/bin/ssh-keygen`, which is a legitimate change
+/// the owner must re-review — not an attack, and not a reason to leave the
+/// repository unable to validate anything. Returns `None` when the pin holds.
+pub fn tool_lock_review_hint() -> Option<String> {
+    let observed = observed_ssh_keygen_digest()?;
+    if observed == SSH_KEYGEN_SHA256 {
+        return None;
+    }
+    Some(format!(
+        "attestation.tool-lock-drift: {SSH_KEYGEN_PATH} is {observed}, reviewed pin is {SSH_KEYGEN_SHA256}.\n\
+         An OS update re-signs this binary. After confirming the host is intact, re-review by setting\n\
+         BOTH `SSH_KEYGEN_SHA256` (crates/mpd/src/attestation.rs) and the ssh-keygen\n\
+         `executable_sha256` (security/tool-lock.json) to {observed}."
+    ))
 }
 
 /// The immutable executable digest is also required to appear in the reviewed

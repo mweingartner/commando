@@ -187,6 +187,16 @@ fn nested_in_validation_sandbox() -> bool {
     std::env::var_os("MPD_SANDBOXED").is_some() && std::fs::read("/private/etc/hosts").is_err()
 }
 
+/// The running host's OS build, read the same way the adapter reads it.
+#[cfg(target_os = "macos")]
+fn observed_os_build() -> String {
+    let text = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist").unwrap();
+    let tail = text.split_once("<key>ProductBuildVersion</key>").unwrap().1;
+    let start = tail.find("<string>").unwrap() + "<string>".len();
+    let end = start + tail[start..].find("</string>").unwrap();
+    tail[start..end].to_string()
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn exact_host_sandbox_entry_completes_canaries_and_ready_go() {
@@ -248,7 +258,10 @@ fn exact_host_sandbox_entry_completes_canaries_and_ready_go() {
     ready_preimage.extend_from_slice(b"mpd:macos-sandbox-ready:v1\0");
     ready_preimage.extend_from_slice(&request_line);
     ready_preimage.extend_from_slice(&profile);
-    ready_preimage.extend_from_slice(b"26A5378n");
+    // The ready digest binds the OBSERVED OS build, not a literal, so a macOS
+    // point update re-executes validation instead of bricking it. Derive it the
+    // same way the adapter does rather than pinning a build string here.
+    ready_preimage.extend_from_slice(observed_os_build().as_bytes());
     ready_preimage.extend_from_slice(b"aarch64");
     let ready_digest = format!("{:x}", Sha256::digest(&ready_preimage));
 
@@ -1956,9 +1969,40 @@ fn author_mandatory_documentation(sb: &Sandbox, change: &str) {
     author_doc_validation(sb, change);
 }
 
+/// Gate an ordered list of phases, skipping any documentation phase this
+/// change's kind does not have.
+///
+/// The documentation axis is Feature-only, so a `--fix`/`--chore` fixture
+/// legitimately walks Test -> Deploy. Driving the full eleven-phase list
+/// unconditionally would assert on a gate that is correctly refusing.
+fn gate_phases(sb: &Sandbox, phases: &[&str]) {
+    for phase in phases {
+        if matches!(*phase, "documentation" | "doc-validation")
+            && json(&sb.mpd(&["status", "--json"]))["phase"] != *phase
+        {
+            continue;
+        }
+        let out = sb.mpd(&["gate", phase, "--pass"]);
+        assert!(
+            out.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Drive the documentation phases when this change actually has them.
+///
+/// The documentation axis is kind-selective: only a Feature runs Documentation
+/// and Doc Validation. A Fix or Chore walks Test -> Deploy, so this helper must
+/// drive whichever phases the change's applicability really includes rather
+/// than assuming all eleven.
 fn gate_mandatory_documentation(sb: &Sandbox, change: &str) {
     author_mandatory_documentation(sb, change);
     for phase in ["documentation", "doc-validation"] {
+        if json(&sb.mpd(&["status", "--json"]))["phase"] != phase {
+            continue;
+        }
         let out = sb.mpd(&["gate", phase, "--pass"]);
         assert!(
             out.status.success(),
@@ -3206,23 +3250,19 @@ fn doctor_fix_heals_dirty_gitignore_then_archive_succeeds() {
     // A defect fix skips only Design; documentation and validation still run.
     sb.mpd(&["begin", "heal-me", "--fix"]);
     fill_artifacts(&sb, "heal-me");
-    for p in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let o = sb.mpd(&["gate", p, "--pass"]);
-        assert!(
-            o.status.success(),
-            "gate {p}: {}",
-            String::from_utf8_lossy(&o.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert_eq!(
         json(&sb.mpd(&["status", "--json"]))["ready_to_archive"],
         true
@@ -4061,23 +4101,19 @@ fn archived_commit_can_be_verified_against_a_local_bare_remote_without_fetch_or_
         "openspec/changes/publish-proof/manifest.json",
         "{\n  \"version\": 1,\n  \"paths\": [\"**\"],\n  \"shared_paths\": [],\n  \"publish\": {\"remote\": \"origin\", \"ref\": \"refs/heads/main\"}\n}\n",
     );
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert!(sb.mpd(&["archive", "--yes"]).status.success());
     run("git", &["add", "-A"], &sb.dir);
     run(
@@ -4160,23 +4196,19 @@ fn publish_reports_unavailable_on_detached_head_with_no_configured_target() {
         .status
         .success());
     fill_artifacts(&sb, "detached-proof");
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert!(sb.mpd(&["archive", "--yes"]).status.success());
     run("git", &["add", "-A"], &sb.dir);
     run(
@@ -4220,23 +4252,19 @@ fn closure_recover_and_abandon_via_binary() {
         .success());
     fill_artifacts(&sb, "closure-thing");
     write_thing_spec(&sb, "closure-thing");
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
 
     let archived = sb.mpd(&["archive", "--yes"]);
     assert!(
@@ -4345,23 +4373,19 @@ fn check_staged_resolves_pending_closure_and_still_blocks_unrelated_paths() {
         .success());
     fill_artifacts(&sb, "hook-scope-thing");
     write_thing_spec(&sb, "hook-scope-thing");
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert!(sb.mpd(&["archive", "--yes"]).status.success());
     assert!(sb.dir.join(".mpd/pending-closure").is_file());
 
@@ -4430,23 +4454,19 @@ fn pre_commit_accepts_exact_pending_closure_scope_and_blocks_unrelated_paths() {
         .success());
     fill_artifacts(&sb, "hook-closure-thing");
     write_thing_spec(&sb, "hook-closure-thing");
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert!(sb.mpd(&["archive", "--yes"]).status.success());
     assert!(!sb.dir.join(".mpd/current").exists());
 
@@ -4507,23 +4527,19 @@ fn drive_change_to_awaiting_commit(sb: &Sandbox, change: &str) {
         ],
         &sb.dir,
     );
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     let archived = sb.mpd(&["archive", "--yes"]);
     assert!(
         archived.status.success(),
@@ -5340,23 +5356,19 @@ fn next_reflects_pending_closure_after_archive_instead_of_stale_archive_hint() {
         .success());
     fill_artifacts(&sb, "next-closure-thing");
     write_thing_spec(&sb, "next-closure-thing");
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert!(sb.mpd(&["archive", "--yes"]).status.success());
     assert!(sb.dir.join(".mpd/pending-closure").is_file());
     assert!(!sb.dir.join(".mpd/current").exists());
@@ -5602,6 +5614,15 @@ fn actor_for_phase(phase: &str) -> &'static str {
 }
 
 fn assert_gate_ok(sb: &Sandbox, phase: &str) {
+    // The documentation phases are kind-selective (Feature only), so a strict
+    // `--fix` fixture legitimately has no Documentation/Doc Validation gate to
+    // drive. Skip a phase this change does not have rather than asserting on a
+    // gate that correctly refuses.
+    if matches!(phase, "documentation" | "doc-validation")
+        && json(&sb.mpd(&["status", "--json"]))["phase"] != phase
+    {
+        return;
+    }
     let out = sb.mpd(&["gate", phase, "--pass", "--by", actor_for_phase(phase)]);
     assert!(
         out.status.success(),
@@ -6278,9 +6299,12 @@ fn next_context_emits_the_phase_slice_and_enriched_json() {
     let j = json(&sb.mpd(&["next", "--harness", "claude-code", "--context", "--json"]));
     assert_eq!(j["phase"], "security-code");
     assert_eq!(j["artifact_path"], "security-code.md");
+    // The offered command names the delegation flags: the caller must state
+    // whether a persona actually ran, and under which model.
     assert_eq!(
         j["gate_command"],
-        "mpd gate security-code --pass --evidence security-code.md"
+        "mpd gate security-code --pass --evidence security-code.md \
+         --delegated|--self-recorded --model <id>"
     );
     // Without --context the enrichment is absent (default envelope unchanged).
     let plain = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
@@ -6852,23 +6876,19 @@ fn reach_pending_closure(sb: &Sandbox, change: &str) {
     m["paths"] = serde_json::json!(["crates/**"]);
     std::fs::write(&mpath, serde_json::to_string_pretty(&m).unwrap()).unwrap();
     fill_artifacts(sb, change);
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     let archived = sb.mpd(&["archive", "--yes", "--skip-specs"]);
     assert!(
         archived.status.success(),
@@ -7292,23 +7312,19 @@ fn introduced_by_validates_before_creating_anything_and_surfaces_downstream() {
         .success());
     fill_artifacts(&sb, "original-feature");
     write_thing_spec(&sb, "original-feature");
-    for phase in [
-        "architecture",
-        "security-plan",
-        "build",
-        "security-code",
-        "test",
-        "documentation",
-        "doc-validation",
-        "deploy",
-    ] {
-        let out = sb.mpd(&["gate", phase, "--pass"]);
-        assert!(
-            out.status.success(),
-            "{phase}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    gate_phases(
+        &sb,
+        &[
+            "architecture",
+            "security-plan",
+            "build",
+            "security-code",
+            "test",
+            "documentation",
+            "doc-validation",
+            "deploy",
+        ],
+    );
     assert!(sb.mpd(&["archive", "--yes"]).status.success());
     // Clear the pending-closure pointer so a new change can begin; the
     // archived ledger content (with `archive_closure` set) stays exactly

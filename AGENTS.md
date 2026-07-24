@@ -112,9 +112,17 @@ The ordered gates are:
 `Design Mock -> Architecture -> Design Review -> Security(plan) -> Build ->
 Security(code) -> Design Sign-off -> Test -> Documentation -> Doc Validation -> Deploy`
 
-Only Design phases may be N/A, with a recorded no-human-visible-impact rationale. A
+Design phases are N/A without `--ui`, with a recorded no-human-visible-impact rationale.
+Documentation and Doc Validation apply to a **Feature** only — a `--fix` or `--chore`
+walks Test -> Deploy, because neither changes what the durable documentation says. A
 FAIL blocks. A condition blocks archive until resolved. Material changes return to the
 earliest affected phase and invalidate downstream approval.
+
+**State how each verdict was produced.** Every `mpd gate` call takes `--delegated` (a
+distinct persona agent ran) or `--self-recorded` (you recorded a verdict on your own
+work), plus `--model <id>`. Omitting them records `UNKNOWN`. If you are not going to
+spawn the subagent, say `--self-recorded` — a skipped review you can see is worth more
+than a passed gate nobody can trust. `mpd stats` reports delegation and route compliance.
 
 ## Role discipline
 

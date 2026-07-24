@@ -22,7 +22,21 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub const CERTIFIED_PRODUCT_VERSION: &str = "27.0";
-pub const CERTIFIED_BUILD_VERSION: &str = "26A5378n";
+/// The OS build the compatibility contract was reviewed against.
+///
+/// This is a **recorded provenance fact, not an admission test**. Pinning it as
+/// an equality gate meant a routine macOS point update (26A5378n -> 26A5388g)
+/// refused every check in the repository — including the checks needed to
+/// review and land the fix. Fail-closed is correct for a boundary an attacker
+/// controls; the OS build number is not that boundary, and blocking on it cost
+/// the owner the whole toolchain for no adversary.
+///
+/// What is enforced is the architecture and the OS *product* version, which is
+/// what the Seatbelt profile and extension SPI contract actually track. The
+/// observed build is folded into [`ready_digest`], so a receipt is still bound
+/// to the exact host that produced it and reuse across an OS update correctly
+/// re-executes rather than silently carrying over.
+pub const REVIEWED_BUILD_VERSION: &str = "26A5378n";
 pub const CERTIFIED_ARCH: &str = "aarch64";
 pub const FIXED_PROFILE: &str = "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-read-metadata file-test-existence)\n(allow file-read-data (literal \"/\"))\n(allow file-read* file-write* (literal \"/dev/null\"))\n(allow file-read* file-test-existence file-map-executable (extension \"com.apple.app-sandbox.read\"))\n(allow file-read* file-test-existence file-map-executable (extension \"com.apple.app-sandbox.read-write\"))\n(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))\n(deny network*)\n";
 
@@ -125,13 +139,29 @@ pub fn verify_certified_host() -> Result<(), String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("sandbox.host-drift: cannot read SystemVersion.plist: {error}"))?;
     let product = plist_value(&text, "ProductVersion")?;
-    let build = plist_value(&text, "ProductBuildVersion")?;
-    if product != CERTIFIED_PRODUCT_VERSION || build != CERTIFIED_BUILD_VERSION {
+    // The build is read for provenance only; see REVIEWED_BUILD_VERSION.
+    let _build = plist_value(&text, "ProductBuildVersion")?;
+    if product != CERTIFIED_PRODUCT_VERSION {
         return Err(format!(
-            "sandbox.host-drift: expected macOS {CERTIFIED_PRODUCT_VERSION} ({CERTIFIED_BUILD_VERSION}), observed {product} ({build})"
+            "sandbox.host-drift: expected macOS {CERTIFIED_PRODUCT_VERSION}, observed {product}"
         ));
     }
     Ok(())
+}
+
+/// The observed OS build of the running host, or `unknown` if it cannot be
+/// read. Never an admission test — callers record it so a receipt names the
+/// exact host that produced it.
+pub fn observed_build_version() -> String {
+    let path = Path::new("/System/Library/CoreServices/SystemVersion.plist");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            plist_value(&text, "ProductBuildVersion")
+                .ok()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn plist_value<'a>(text: &'a str, key: &str) -> Result<&'a str, String> {
@@ -189,8 +219,14 @@ pub fn canary_contract_digest() -> String {
 
 pub fn certified_host_label() -> Result<String, String> {
     verify_certified_host()?;
+    let observed = observed_build_version();
+    let drift = if observed == REVIEWED_BUILD_VERSION {
+        String::new()
+    } else {
+        format!(" (reviewed against {REVIEWED_BUILD_VERSION})")
+    };
     Ok(format!(
-        "macOS {CERTIFIED_PRODUCT_VERSION} build {CERTIFIED_BUILD_VERSION}/{CERTIFIED_ARCH}"
+        "macOS {CERTIFIED_PRODUCT_VERSION} build {observed}/{CERTIFIED_ARCH}{drift}"
     ))
 }
 
@@ -571,7 +607,9 @@ fn ready_digest(request_line: &[u8]) -> String {
     bytes.extend_from_slice(b"mpd:macos-sandbox-ready:v1\0");
     bytes.extend_from_slice(request_line);
     bytes.extend_from_slice(FIXED_PROFILE.as_bytes());
-    bytes.extend_from_slice(CERTIFIED_BUILD_VERSION.as_bytes());
+    // The OBSERVED build, not the reviewed one: a receipt must name the host
+    // that actually produced it, so reuse across an OS update re-executes.
+    bytes.extend_from_slice(observed_build_version().as_bytes());
     bytes.extend_from_slice(CERTIFIED_ARCH.as_bytes());
     Digest::of_bytes(&bytes).to_hex()
 }

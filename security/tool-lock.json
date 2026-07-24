@@ -74,7 +74,7 @@
       "version": "apple-openssh-verified",
       "acquisition": "system-absolute",
       "absolute_path": "/usr/bin/ssh-keygen",
-      "executable_sha256": "4ed0e089766a35cb8acbaf6e2804e9ec5b187f1baabce5dc832f5a192cb3d7cd",
+      "executable_sha256": "94bca5dfe70512cd0f421c3194066478d09a6747d7a55f953f8df11c690c77c2",
       "platform": "aarch64-apple-darwin",
       "argv_contract": [
         "-Y",

@@ -185,6 +185,20 @@ enum Command {
         /// Explicitly reuse an exact, valid executed evidence receipt.
         #[arg(long)]
         reuse: Option<String>,
+        /// Record that a distinct persona agent was spawned to produce this
+        /// verdict. Mutually exclusive with `--self-recorded`.
+        #[arg(long, conflicts_with = "self_recorded")]
+        delegated: bool,
+        /// Record that the driving session produced this verdict itself, with no
+        /// separate persona. Honest self-recording; the ledger stops pretending
+        /// a review happened when it did not.
+        #[arg(long = "self-recorded")]
+        self_recorded: bool,
+        /// The model this persona actually ran under (e.g. `fable`, `sonnet`).
+        /// Compared against the model `mpd next` resolved for this attempt to
+        /// report route compliance.
+        #[arg(long)]
+        model: Option<String>,
         /// Bounded exact-attempt usage and review-session attestation.
         #[arg(long)]
         attestation: Option<PathBuf>,
@@ -773,6 +787,9 @@ pub fn run() -> i32 {
             exploit,
             reuse,
             attestation,
+            delegated,
+            self_recorded,
+            model,
         } => cmd_gate(
             phase,
             change,
@@ -786,6 +803,9 @@ pub fn run() -> i32 {
             exploit,
             reuse,
             attestation,
+            delegated,
+            self_recorded,
+            model,
         ),
         Command::Reconcile {
             continue_reason,
@@ -3696,6 +3716,50 @@ fn gitleaks_lane_verdict(result: Option<bool>, gitleaks_required: bool) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Build the delegation record for a gate attempt.
+///
+/// `--delegated` / `--self-recorded` are deliberately NOT defaulted: an omitted
+/// flag records nothing, and `mpd stats` reports it as UNKNOWN. Defaulting
+/// either way would manufacture exactly the fiction this field exists to
+/// remove — the historical corpus cannot distinguish a reviewed PASS from a
+/// self-recorded one, and guessing would extend that problem forward.
+///
+/// `route_honored` compares the reported model against the model `mpd next`
+/// resolved for this exact (phase, attempt), which the ledger already stores as
+/// a `BriefExpectationV1`. It is the first mechanism in the tool that can tell
+/// whether the cost policy was followed rather than merely printed.
+fn build_delegation_record(
+    ledger: &ledger::Ledger,
+    phase: Phase,
+    attempt: usize,
+    delegated: bool,
+    self_recorded: bool,
+    model: Option<&str>,
+) -> Result<Option<ledger::DelegationRecordV1>, String> {
+    if !delegated && !self_recorded && model.is_none() {
+        return Ok(None);
+    }
+    let model = model.map(|m| bounded_text(m, "gate model")).transpose()?;
+    let expected = ledger
+        .brief_expectations
+        .get(&ledger::Ledger::attempt_key(phase, attempt))
+        .map(|expectation| expectation.model.clone());
+    let route_honored = match (model.as_deref(), expected.as_deref()) {
+        (Some(actual), Some(want)) => Some(actual.eq_ignore_ascii_case(want)),
+        _ => None,
+    };
+    Ok(Some(ledger::DelegationRecordV1 {
+        schema: 1,
+        // `--delegated` asserts a spawn; anything else recorded here is the
+        // driving session speaking for itself.
+        delegated,
+        model,
+        route_honored,
+        expected_model: expected,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_gate(
     phase_slug: String,
     change: Option<String>,
@@ -3709,6 +3773,9 @@ fn cmd_gate(
     exploit: Option<String>,
     reuse: Option<String>,
     attestation: Option<PathBuf>,
+    delegated: bool,
+    self_recorded: bool,
+    model: Option<String>,
 ) -> CmdResult {
     let root = find_root()?;
     let change = resolve_change(&root, change)?;
@@ -4091,6 +4158,14 @@ fn cmd_gate(
                 completed_at_epoch_secs: completed,
                 receipt: Some(receipt),
                 persona_tuning: persona_stamp.clone(),
+                delegation: build_delegation_record(
+                    &ledger,
+                    phase,
+                    attempt,
+                    delegated,
+                    self_recorded,
+                    model.as_deref(),
+                )?,
                 candidate: strict_objective.as_ref().map(|s| s.candidate.clone()),
                 build_output: strict_objective
                     .as_ref()
@@ -4589,6 +4664,17 @@ fn cmd_gate(
         }
     }
 
+    // Who produced this verdict, and under which model. Absent when the caller
+    // said nothing — reported as UNKNOWN rather than assumed to be a review.
+    let delegation = build_delegation_record(
+        &ledger,
+        phase,
+        attempt,
+        delegated,
+        self_recorded,
+        model.as_deref(),
+    )?;
+
     let build_output = if structured_gate_ran && phase == Phase::Build {
         structured_build_output
             .ok_or_else(|| {
@@ -4638,6 +4724,7 @@ fn cmd_gate(
                 None
             },
             persona_tuning: persona_stamp,
+            delegation,
             candidate: gate_candidate.clone(),
             build_output,
             deploy_result,
@@ -4964,11 +5051,18 @@ fn extract_section(text: &str, section: &str, max_len: usize) -> Option<String> 
 /// artifact as evidence when it has one, else a bare pass. Shared by the
 /// `--context` JSON envelope and text slice.
 fn strict_gate_command(phase: Phase) -> String {
+    // The delegation flags are part of the offered command, not an afterthought:
+    // the caller must state whether a persona actually ran and under which
+    // model. Omitting them records UNKNOWN rather than a comfortable default.
+    let tail = "--delegated|--self-recorded --model <id>";
     match phase.judgment_artifact() {
         Some((filename, _)) => {
-            format!("mpd gate {} --pass --evidence {filename}", phase.slug())
+            format!(
+                "mpd gate {} --pass --evidence {filename} {tail}",
+                phase.slug()
+            )
         }
-        None => format!("mpd gate {} --pass", phase.slug()),
+        None => format!("mpd gate {} --pass {tail}", phase.slug()),
     }
 }
 
@@ -6556,28 +6650,42 @@ fn cmd_policy(command: PolicyCommand) -> CmdResult {
     match command {
         PolicyCommand::Digest { commit, json } => {
             let root = find_root()?;
+            // Two separate conditions that were previously conflated:
+            //
+            // 1. No structured `local_validation` at all -> there is genuinely no
+            //    reviewed policy to digest, and printing a default-derived digest
+            //    would be misleading evidence. Still an error.
+            // 2. A policy exists but the ACTIVATED one is broken/drifted -> this is
+            //    exactly when the owner needs the digest in order to repair or rotate
+            //    it. Deliberately NOT `preflight`, which validates active trust state
+            //    and so refused precisely when the command was most needed.
+            //
+            // `capture_subject` resolves the commit without consulting active trust
+            // state, so (2) is obtainable while (1) still fails closed.
             let cfg = Config::load(&root);
-            let local = cfg.local_validation.ok_or_else(|| {
-                "structured local_validation is absent; there is no reviewed policy to confirm"
-                    .to_string()
-            })?;
-            let report = crate::local_validation::preflight(&root, commit.as_deref(), &local)?;
-            let digest = crate::local_validation::subject_policy_digest(&root, &report.subject)?;
+            if cfg.local_validation.is_none() {
+                return Err(
+                    "structured local_validation is absent; there is no reviewed policy to confirm"
+                        .to_string(),
+                );
+            }
+            let subject = crate::local_validation::capture_subject(&root, commit.as_deref())?;
+            let digest = crate::local_validation::subject_policy_digest(&root, &subject)?;
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "schema": 1,
-                        "commit": report.subject.commit,
-                        "tree": report.subject.tree,
+                        "commit": subject.commit,
+                        "tree": subject.tree,
                         "policy_digest": digest,
                     })
                 );
             } else {
                 println!(
                     "Policy subject: {} ({})",
-                    harness::terminal_safe(&report.subject.commit),
-                    harness::terminal_safe(&report.subject.tree)
+                    harness::terminal_safe(&subject.commit),
+                    harness::terminal_safe(&subject.tree)
                 );
                 println!("Canonical policy digest: {digest}");
                 println!("\n→ pass this to: mpd policy activate --confirm-policy-digest {digest}");
@@ -8507,6 +8615,7 @@ const VALIDATOR_POLICY_CHECKS: &[&str] = &[
     "advisory-revision-tree-freshness",
     "path-safety-private-state-log-health",
     "note-codec-direct-ref-readability",
+    "attestation-verifier-tool-lock",
 ];
 
 const VALIDATOR_POLICY_EXCLUSIONS: &[&str] = &[
@@ -8731,6 +8840,28 @@ fn static_doctor_findings(
         "remove or repair unsafe clone-private state through the reviewed recovery workflow",
         || crate::local_validation::doctor_private_state_health(root),
     ));
+    // An OS update re-signs the Apple-shipped verifier. The pin stays hard, but
+    // the drift is reported here with the exact re-review edit instead of only
+    // surfacing as an opaque attestation blocker at use time.
+    findings.push(match crate::attestation::tool_lock_review_hint() {
+        None => DoctorFinding {
+            code: "attestation-verifier-tool-lock".into(),
+            severity: DoctorSeverity::Info,
+            component: "attestation".into(),
+            state: "ok".into(),
+            message: "the reviewed signature-verifier digest matches the host binary".into(),
+            fix: String::new(),
+        },
+        Some(hint) => DoctorFinding {
+            code: "attestation-verifier-tool-lock".into(),
+            severity: DoctorSeverity::Blocker,
+            component: "attestation".into(),
+            state: "drifted".into(),
+            message: hint,
+            fix: "re-review the verifier digest in attestation.rs and security/tool-lock.json"
+                .into(),
+        },
+    });
     if let Some(subject) = &subject {
         findings.push(doctor_finding(
             "note-codec-direct-ref-readability",
@@ -9755,19 +9886,19 @@ fn cmd_cache(command: CacheCommand) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        archived_closure_fallback_scope, bounded_record_hint, canonical_artifact_actor,
-        canonical_artifact_verdict, change_name_from_dated_archive_dir, check_documentation,
-        check_sections, closure_recovery_hint, current_typed_blockers, current_validation_status,
-        dated_archive_matches, doctor_expected_pending_remote, doctor_installed_deploy_health,
-        economics_budget_state, economics_provenance_state, economics_usage_coverage,
-        enforce_landing_commit_scope, enforce_prose_secret_scan, enforce_scope_drift,
-        evaluate_strict_objective_reuse, extract_section, gitleaks_lane_verdict,
-        has_unfilled_placeholder, is_phase_judgment_artifact, is_valid_date_prefix, parse_exploit,
-        receipt_failure_fact, removed_manifest_change_name, render_attestation_state,
-        require_closure_plan, resolve_runtime_head, resolve_runtime_ledger,
-        retained_candidate_for_objective_gate, revalidate_recorded_build_output,
-        runtime_doctor_findings_with_receipt, sandbox_blocker, stages_removal_of,
-        strict_actor_separation_issue, strict_gate_command, union_closure_scope,
+        archived_closure_fallback_scope, bounded_record_hint, build_delegation_record,
+        canonical_artifact_actor, canonical_artifact_verdict, change_name_from_dated_archive_dir,
+        check_documentation, check_sections, closure_recovery_hint, current_typed_blockers,
+        current_validation_status, dated_archive_matches, doctor_expected_pending_remote,
+        doctor_installed_deploy_health, economics_budget_state, economics_provenance_state,
+        economics_usage_coverage, enforce_landing_commit_scope, enforce_prose_secret_scan,
+        enforce_scope_drift, evaluate_strict_objective_reuse, extract_section,
+        gitleaks_lane_verdict, has_unfilled_placeholder, is_phase_judgment_artifact,
+        is_valid_date_prefix, parse_exploit, receipt_failure_fact, removed_manifest_change_name,
+        render_attestation_state, require_closure_plan, resolve_runtime_head,
+        resolve_runtime_ledger, retained_candidate_for_objective_gate,
+        revalidate_recorded_build_output, runtime_doctor_findings_with_receipt, sandbox_blocker,
+        stages_removal_of, strict_actor_separation_issue, strict_gate_command, union_closure_scope,
         upstream_artifact_pointers, validate_candidate_report_binding, validate_evidence,
         validate_introduced_by, validate_origin_receipt_candidate_binding,
         verify_judgment_artifact_digest, WorkflowOutcome, REQUIRED_DOC_SECTIONS,
@@ -10284,6 +10415,7 @@ mod tests {
             deploy_result: None,
             validation_receipt: None,
             judgment_artifact_sha256: None,
+            delegation: None,
         }
     }
 
@@ -11438,6 +11570,7 @@ mod tests {
             deploy_result: None,
             validation_receipt: Some(strict.validation_receipt),
             judgment_artifact_sha256: None,
+            delegation: None,
         })
     }
 
@@ -12548,10 +12681,83 @@ mod tests {
     fn strict_gate_command_uses_own_artifact_or_bare_pass() {
         assert_eq!(
             strict_gate_command(Phase::SecurityCode),
-            "mpd gate security-code --pass --evidence security-code.md"
+            "mpd gate security-code --pass --evidence security-code.md \
+             --delegated|--self-recorded --model <id>"
         );
-        // A non-judgment phase has no artifact to record.
-        assert_eq!(strict_gate_command(Phase::Build), "mpd gate build --pass");
+        // A non-judgment phase has no artifact to record, but still must state
+        // whether a persona actually ran.
+        assert_eq!(
+            strict_gate_command(Phase::Build),
+            "mpd gate build --pass --delegated|--self-recorded --model <id>"
+        );
+    }
+
+    /// Absence must stay absence. Defaulting an omitted flag either way would
+    /// manufacture the exact fiction the field exists to remove.
+    #[test]
+    fn delegation_is_unrecorded_when_the_caller_says_nothing() {
+        let ledger = ledger::Ledger::new("obs", "schema", false, ChangeKind::Feature);
+        assert!(
+            build_delegation_record(&ledger, Phase::Architecture, 1, false, false, None)
+                .unwrap()
+                .is_none(),
+            "an omitted flag must record nothing, never a default"
+        );
+    }
+
+    #[test]
+    fn self_recorded_and_delegated_are_distinguishable_in_the_ledger() {
+        let ledger = ledger::Ledger::new("obs", "schema", false, ChangeKind::Feature);
+        let delegated =
+            build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("fable"))
+                .unwrap()
+                .unwrap();
+        assert!(delegated.delegated);
+        assert_eq!(delegated.model.as_deref(), Some("fable"));
+
+        let owned =
+            build_delegation_record(&ledger, Phase::Architecture, 1, false, true, Some("fable"))
+                .unwrap()
+                .unwrap();
+        assert!(!owned.delegated);
+    }
+
+    /// Route compliance is only claimed when BOTH sides are known; an
+    /// unrecorded brief expectation must not read as a violation.
+    #[test]
+    fn route_compliance_needs_both_the_reported_and_expected_model() {
+        let mut ledger = ledger::Ledger::new("obs", "schema", false, ChangeKind::Feature);
+        let no_expectation =
+            build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("sonnet"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(no_expectation.route_honored, None);
+
+        ledger.brief_expectations.insert(
+            ledger::Ledger::attempt_key(Phase::Architecture, 1),
+            ledger::BriefExpectationV1 {
+                schema: 1,
+                phase: Phase::Architecture,
+                attempt: 1,
+                harness: "claude-code".into(),
+                model: "fable".into(),
+                subject_digest: "d".into(),
+                issued_at_epoch_secs: 0,
+            },
+        );
+        let violated =
+            build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("sonnet"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(violated.route_honored, Some(false));
+        assert_eq!(violated.expected_model.as_deref(), Some("fable"));
+
+        // Case-insensitive: a harness reporting `Fable` honored the route.
+        let honored =
+            build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("Fable"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(honored.route_honored, Some(true));
     }
 
     #[test]

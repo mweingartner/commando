@@ -64,8 +64,9 @@ pub const PIPELINE: [Phase; 11] = [
 pub struct Applicability {
     /// The change has a UI/UX surface → the Design phases run.
     pub ui: bool,
-    /// Legacy compatibility field. Documentation phases are always mandatory;
-    /// callers should set this true.
+    /// The change alters documented behavior → the Documentation phases run.
+    /// Derived from [`crate::ledger::ChangeKind::documents`]: a Feature does, a
+    /// Fix and a Chore do not.
     pub docs: bool,
 }
 
@@ -89,6 +90,10 @@ impl Phase {
     pub fn is_active(self, a: Applicability) -> bool {
         match self {
             DesignMock | DesignReview | DesignSignoff => a.ui,
+            // The documentation axis is real, not decorative: a defect fix or a
+            // refactor changes no documented behavior, so it does not pay a
+            // Documenter pass plus a two-persona deep-tier validation.
+            Documentation | DocValidation => a.docs,
             _ => true,
         }
     }
@@ -376,14 +381,31 @@ mod tests {
         assert_eq!(Phase::applicable(UI_FEATURE).len(), 11);
     }
 
+    /// A Fix or Chore skips the Documentation phases; it does not change what
+    /// the durable documentation says. Deploy remains mandatory for every kind.
     #[test]
-    fn every_change_kind_runs_documentation_validation_and_final_deploy() {
+    fn a_non_feature_skips_documentation_but_never_deploy() {
         assert_eq!(Phase::first(FIX), Architecture);
-        assert_eq!(Test.next(FIX), Documentation);
-        assert_eq!(Documentation.next(FIX), DocValidation);
-        assert_eq!(DocValidation.next(FIX), Deploy);
+        assert_eq!(Test.next(FIX), Deploy);
         assert_eq!(Deploy.next(FIX), Done);
         let applicable = Phase::applicable(FIX);
+        assert!(!applicable.contains(&Documentation));
+        assert!(!applicable.contains(&DocValidation));
+        assert!(applicable.contains(&Deploy));
+        assert_eq!(applicable.len(), 6);
+    }
+
+    /// A Feature still documents. The axis selects, it does not delete.
+    #[test]
+    fn a_feature_still_runs_documentation_and_validation() {
+        let feature = Applicability {
+            ui: false,
+            docs: true,
+        };
+        assert_eq!(Test.next(feature), Documentation);
+        assert_eq!(Documentation.next(feature), DocValidation);
+        assert_eq!(DocValidation.next(feature), Deploy);
+        let applicable = Phase::applicable(feature);
         assert!(applicable.contains(&Documentation) && applicable.contains(&DocValidation));
         assert_eq!(applicable.len(), 8);
     }

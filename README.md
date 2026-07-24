@@ -197,10 +197,33 @@ Security (code) -> Design Sign-off -> Test -> Documentation ->
 Doc Validation -> Deploy
 ```
 
-Only the three Design phases may be inapplicable, and only with a stored rationale that
-the change has no human-visible interaction impact. Documentation, Doc Validation, and
-final Deploy/readiness are mandatory. A FAIL blocks. A CONDITIONAL PASS remains open
-until every condition is resolved.
+Two axes select which phases apply:
+
+- The three **Design** phases run when the change has a UI/UX surface (`--ui`), and are
+  otherwise inapplicable with a stored no-human-visible-impact rationale.
+- The two **Documentation** phases run for a **Feature**. A `--fix` restores behavior the
+  documentation already describes and a `--chore` changes no functional behavior, so
+  neither pays a Documenter pass plus a two-persona deep-tier validation. A defect fix
+  walks Test -> Deploy.
+
+Architecture, Security (plan), Build, Security (code), Test, and final Deploy/readiness
+are mandatory for every change. A FAIL blocks. A CONDITIONAL PASS remains open until
+every condition is resolved.
+
+Each gate records **how the verdict was produced**. `mpd next` offers the flags and
+`mpd stats` reports them:
+
+```sh
+mpd gate <phase> --pass --evidence <artifact> --delegated --model fable
+mpd gate <phase> --pass --evidence <artifact> --self-recorded --model sonnet
+```
+
+`--delegated` states that a distinct persona agent ran; `--self-recorded` states that the
+driving session recorded the verdict on its own work. Omitting both records `UNKNOWN` —
+absence is never defaulted into either. `--model` is compared against the model `mpd next`
+resolved for that exact attempt, so route compliance becomes measurable rather than
+merely printed. A self-recorded PASS is honest bookkeeping; it is not an adversarial
+review, and the ledger no longer conflates the two.
 
 Strict judgment artifacts contain the required sections, exactly one `## Actor`, and
 exactly one `## Verdict` whose first nonblank line is `PASS`, `CONDITIONAL PASS`, or

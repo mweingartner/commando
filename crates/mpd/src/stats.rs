@@ -86,6 +86,70 @@ pub struct UsageCoverageStats {
     pub authenticated_attempts: usize,
 }
 
+/// Whether the adversarial property the whole pipeline assumes actually held.
+///
+/// A gate verdict recorded by the same context that did the work is not a
+/// review, however well-formed its artifact. These counters make that
+/// distinction visible for the first time; `unknown` is reported honestly
+/// rather than folded into either side.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DelegationStats {
+    pub recorded_attempts: usize,
+    pub delegated_attempts: usize,
+    pub self_recorded_attempts: usize,
+    pub unknown_attempts: usize,
+    /// Attempts carrying both a reported and an expected model.
+    pub route_checked_attempts: usize,
+    /// Of those, how many ran the model `mpd next` resolved.
+    pub route_honored_attempts: usize,
+}
+
+impl DelegationStats {
+    fn fold(&mut self, ledger: &Ledger) {
+        for event in &ledger.history {
+            match &event.record.delegation {
+                None => {
+                    self.unknown_attempts += 1;
+                }
+                Some(record) => {
+                    self.recorded_attempts += 1;
+                    if record.delegated {
+                        self.delegated_attempts += 1;
+                    } else {
+                        self.self_recorded_attempts += 1;
+                    }
+                    if let Some(honored) = record.route_honored {
+                        self.route_checked_attempts += 1;
+                        if honored {
+                            self.route_honored_attempts += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &DelegationStats) {
+        self.recorded_attempts += other.recorded_attempts;
+        self.delegated_attempts += other.delegated_attempts;
+        self.self_recorded_attempts += other.self_recorded_attempts;
+        self.unknown_attempts += other.unknown_attempts;
+        self.route_checked_attempts += other.route_checked_attempts;
+        self.route_honored_attempts += other.route_honored_attempts;
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "  delegation: {} delegated, {} self-recorded, {} unknown; route {}/{} honored\n",
+            self.delegated_attempts,
+            self.self_recorded_attempts,
+            self.unknown_attempts,
+            self.route_honored_attempts,
+            self.route_checked_attempts
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeStats {
     pub change: String,
@@ -104,6 +168,7 @@ pub struct ChangeStats {
     pub weakened_tuning_incidents: usize,
     pub active_deferrals: usize,
     pub usage_coverage: UsageCoverageStats,
+    pub delegation: DelegationStats,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -117,6 +182,7 @@ pub struct AggregateStats {
     pub failure_classes: BTreeMap<String, usize>,
     pub defect_escapes_by_originating_change: BTreeMap<String, usize>,
     pub usage_coverage: UsageCoverageStats,
+    pub delegation: DelegationStats,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,12 +224,16 @@ fn phase_measures(ledger: &Ledger) -> PhaseMeasures {
     let mut wallclock_secs = BTreeMap::new();
     let history_empty_for = |phase: Phase| !ledger.history.iter().any(|event| event.phase == phase);
     for phase in Phase::applicable(ledger.applicability()) {
-        let history_max_attempt = ledger
+        // COUNT the recorded attempts, do not take the highest attempt NUMBER.
+        // A freshness rewind resets the attempt counter, so a phase driven 3
+        // times, rewound, then driven twice more holds 5 history records whose
+        // max `attempt` is 3 — the old measure silently under-reported exactly
+        // the rework this report exists to expose.
+        let history_attempts = ledger
             .history
             .iter()
             .filter(|event| event.phase == phase)
-            .map(|event| event.record.attempt)
-            .max();
+            .count();
         let history_wallclock: u64 = ledger
             .history
             .iter()
@@ -178,9 +248,7 @@ fn phase_measures(ledger: &Ledger) -> PhaseMeasures {
                 wallclock_secs.insert(phase.slug(), record.duration_secs());
             }
         } else {
-            if let Some(attempt) = history_max_attempt {
-                attempts.insert(phase.slug(), attempt);
-            }
+            attempts.insert(phase.slug(), history_attempts);
             wallclock_secs.insert(phase.slug(), history_wallclock);
         }
     }
@@ -231,6 +299,8 @@ fn change_stats(change: String, ledger: &Ledger) -> ChangeStats {
         .filter(|deferral| deferral.is_active())
         .count();
     let applicable_attempts = ledger.history.len().max(ledger.gates.len());
+    let mut delegation = DelegationStats::default();
+    delegation.fold(ledger);
     let usage_coverage = UsageCoverageStats {
         applicable_attempts,
         reported_attempts: ledger.usage_records.len(),
@@ -268,6 +338,7 @@ fn change_stats(change: String, ledger: &Ledger) -> ChangeStats {
         weakened_tuning_incidents: weakened_history.saturating_add(weakened_brief),
         active_deferrals,
         usage_coverage,
+        delegation,
     }
 }
 
@@ -408,6 +479,7 @@ pub fn collect(root: &Path, change_filter: Option<&str>) -> StatsReport {
                     .usage_coverage
                     .authenticated_attempts
                     .saturating_add(stats.usage_coverage.authenticated_attempts);
+                aggregate.delegation.merge(&stats.delegation);
             }
             ChangeRow::Unreadable { .. } => {
                 aggregate.unreadable = aggregate.unreadable.saturating_add(1);
@@ -512,6 +584,7 @@ pub fn render_human(report: &StatsReport) -> String {
                     stats.usage_coverage.applicable_attempts,
                     stats.usage_coverage.authenticated_attempts
                 ));
+                out.push_str(&stats.delegation.render());
             }
             ChangeRow::Unreadable {
                 change,
@@ -558,6 +631,7 @@ pub fn render_human(report: &StatsReport) -> String {
         report.aggregate.usage_coverage.applicable_attempts,
         report.aggregate.usage_coverage.authenticated_attempts
     ));
+    out.push_str(&report.aggregate.delegation.render());
     if !report
         .aggregate
         .defect_escapes_by_originating_change
@@ -624,6 +698,7 @@ mod tests {
             deploy_result: None,
             validation_receipt: None,
             judgment_artifact_sha256: None,
+            delegation: None,
         }
     }
 

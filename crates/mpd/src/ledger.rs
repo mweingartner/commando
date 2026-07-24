@@ -410,10 +410,22 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
-    /// Whether a change of this kind runs the Documentation phases. All kinds
-    /// do; retained as an API boundary for older callers.
+    /// Whether a change of this kind runs the Documentation phases.
+    ///
+    /// Only a Feature changes what the durable documentation should say. A Fix
+    /// restores behavior the docs already describe, and a Chore (refactor,
+    /// tooling, perf) changes no functional behavior at all — so synthesizing a
+    /// document and then validating it with two deep-tier personas produces a
+    /// restatement, not information.
+    ///
+    /// This returned an unconditional `true` while `Applicability.docs` was
+    /// labelled a legacy field and `Phase::is_active` discarded it, so the axis
+    /// existed in the data model and did nothing. Measured over the ledgers,
+    /// Documentation and Doc Validation together recorded 80 attempts and zero
+    /// FAIL verdicts; every repeat was upstream rework, so the phases charged a
+    /// deep-tier validation pass per rewind and never once rejected a document.
     pub fn documents(self) -> bool {
-        true
+        matches!(self, ChangeKind::Feature)
     }
 
     /// A short human label.
@@ -542,6 +554,43 @@ pub struct GateRecord {
     /// fatal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judgment_artifact_sha256: Option<String>,
+    /// How this verdict was produced: by a separately spawned persona, or by the
+    /// orchestrating session recording a verdict on its own work.
+    ///
+    /// This is the ledger's most important honesty field. The whole design rests
+    /// on personas being *adversarial*, which requires that the checker and the
+    /// author be different contexts. Nothing ever recorded whether that
+    /// happened, so a self-recorded PASS and a genuinely reviewed PASS were
+    /// indistinguishable — and 62% of historical attempts closed within 30
+    /// seconds of phase entry, which is not a review.
+    ///
+    /// Absent on every legacy record. Absent is reported as `UNKNOWN`, never
+    /// silently counted as delegated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationRecordV1>,
+}
+
+/// Who actually produced a gate verdict, and under which model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationRecordV1 {
+    pub schema: u32,
+    /// True when a distinct persona agent was spawned for this attempt; false
+    /// when the driving session recorded the verdict itself.
+    pub delegated: bool,
+    /// The model the persona actually ran under, as reported by the caller.
+    /// Cooperative provenance, exactly like `by` — not authenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Whether `model` matched the model `mpd next` resolved for this exact
+    /// (phase, attempt). `None` when either side is unknown. This is the first
+    /// mechanism in the tool that can tell whether the cost policy was followed
+    /// rather than merely printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_honored: Option<bool>,
+    /// The model `mpd next` resolved for this attempt, when it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<String>,
 }
 
 /// Versioned identity of one release file observed through an opened,
@@ -2093,7 +2142,12 @@ fn serialized_ledger(ledger: &Ledger) -> io::Result<String> {
         stamped.format = LEDGER_FORMAT;
         Some(stamped)
     };
-    let mut json = serde_json::to_string_pretty(stamped.as_ref().unwrap_or(ledger))
+    // Compact, not pretty. The ledger is a machine record that only ever
+    // reaches a human through `mpd status`/`stats`/`--json`, all of which
+    // render on demand. Measured across `.mpd/state`, pretty-printing was 61%
+    // of 8.8 MB on disk — indentation, not evidence. Nothing is dropped here;
+    // this changes only the encoding, and `load` is unaffected.
+    let mut json = serde_json::to_string(stamped.as_ref().unwrap_or(ledger))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     json.push('\n');
     Ok(json)
@@ -2337,6 +2391,7 @@ mod tests {
             deploy_result: None,
             validation_receipt: None,
             judgment_artifact_sha256: None,
+            delegation: None,
         }
     }
 
@@ -2355,9 +2410,13 @@ mod tests {
 
     fn walk_to_deploy(l: &mut Ledger) {
         walk_core(l);
-        l.record(Phase::Documentation, pass("Documenter")).unwrap();
-        l.record(Phase::DocValidation, pass("Architect & Designer"))
-            .unwrap();
+        // Documentation only applies to a Feature now, so drive it only when
+        // this change's applicability actually includes it.
+        if Phase::Documentation.is_active(l.applicability()) {
+            l.record(Phase::Documentation, pass("Documenter")).unwrap();
+            l.record(Phase::DocValidation, pass("Architect & Designer"))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -2368,18 +2427,33 @@ mod tests {
         assert_eq!(l.phase, Phase::SecurityPlan);
     }
 
+    /// The documentation axis SELECTS by kind; it never removes Deploy.
+    ///
+    /// Only a Feature changes what the durable documentation says. A Fix
+    /// restores already-documented behavior and a Chore changes no functional
+    /// behavior, so neither pays a Documenter pass plus a two-persona deep-tier
+    /// validation. Deploy stays mandatory for every kind.
     #[test]
-    fn documentation_doctrine_covers_feature_fix_and_all_chore_subtypes() {
-        for kind in [ChangeKind::Feature, ChangeKind::Fix, ChangeKind::Chore] {
-            assert!(kind.documents(), "{} must run documentation", kind.label());
+    fn documentation_applies_to_features_and_deploy_applies_to_everything() {
+        let feature = Ledger::new("doctrine", "mpd", false, ChangeKind::Feature);
+        let feature_phases = Phase::applicable(feature.applicability());
+        assert!(ChangeKind::Feature.documents());
+        assert!(feature_phases.contains(&Phase::Documentation));
+        assert!(feature_phases.contains(&Phase::DocValidation));
+        assert_eq!(feature_phases.last(), Some(&Phase::Deploy));
+
+        for kind in [ChangeKind::Fix, ChangeKind::Chore] {
+            assert!(
+                !kind.documents(),
+                "{} does not alter documented behavior",
+                kind.label()
+            );
             let ledger = Ledger::new("doctrine", "mpd", false, kind);
             let phases = Phase::applicable(ledger.applicability());
-            assert!(phases.contains(&Phase::Documentation));
-            assert!(phases.contains(&Phase::DocValidation));
-            assert_eq!(phases.last(), Some(&Phase::Deploy));
+            assert!(!phases.contains(&Phase::Documentation), "{}", kind.label());
+            assert!(!phases.contains(&Phase::DocValidation), "{}", kind.label());
+            assert_eq!(phases.last(), Some(&Phase::Deploy), "{}", kind.label());
         }
-        // Configuration, dependency, and tooling changes are represented by
-        // Chore and therefore follow the same mandatory phase matrix.
     }
 
     #[test]
@@ -2666,14 +2740,10 @@ mod tests {
     }
 
     #[test]
-    fn fix_requires_documentation_validation_then_final_deploy() {
+    fn fix_goes_straight_from_test_to_the_final_deploy_gate() {
         let mut l = Ledger::new("c", "mpd", false, ChangeKind::Fix);
         walk_core(&mut l);
-        assert_eq!(l.phase, Phase::Documentation);
-        l.record(Phase::Documentation, pass("Documenter")).unwrap();
-        assert_eq!(l.phase, Phase::DocValidation);
-        l.record(Phase::DocValidation, pass("Architect & Designer"))
-            .unwrap();
+        // Test -> Deploy directly: a defect fix documents nothing new.
         assert_eq!(l.phase, Phase::Deploy);
         assert!(!l.ready_to_archive(), "{:?}", l.blocking_reasons());
         assert_eq!(l.phase, Phase::Deploy);

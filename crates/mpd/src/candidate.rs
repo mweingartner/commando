@@ -3287,6 +3287,7 @@ mod tests {
             deploy_result: None,
             validation_receipt: None,
             judgment_artifact_sha256: None,
+            delegation: None,
         }
     }
 

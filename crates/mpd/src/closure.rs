@@ -1819,12 +1819,31 @@ impl SystemScope {
     /// configured) is never counted or hashed twice, and the digest domain
     /// is order-independent by construction.
     pub fn paths(&self) -> Vec<String> {
+        let mut out = self.stable_paths();
+        out.push(self.archive_target.clone());
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The system-owned paths that do NOT move on their own.
+    ///
+    /// `archive_target` embeds `today_utc()`, so it changes at midnight UTC
+    /// with nothing in the repository having changed. Hashing it made the wall
+    /// clock a causal input to the Scope dependency: a change left open
+    /// overnight woke to a Scope digest mismatch, which rewinds to the earliest
+    /// affected phase and discards downstream approvals — pure re-work with no
+    /// corresponding difference in the subject.
+    ///
+    /// Enforcement still uses the full [`Self::paths`], which keeps the archive
+    /// target inside the authorized scope; only the DIGEST is computed over
+    /// this stable subset.
+    pub fn stable_paths(&self) -> Vec<String> {
         let mut out = vec![self.change_dir.clone(), self.ledger_path.clone()];
         out.extend(self.merged_spec_targets.iter().cloned());
         if let Some(doc) = &self.doc_target {
             out.push(doc.clone());
         }
-        out.push(self.archive_target.clone());
         out.sort();
         out.dedup();
         out
@@ -2158,7 +2177,40 @@ fn doc_safe_pattern(pattern: &str, change: &str) -> bool {
     pattern.starts_with("docs/")
         || pattern.starts_with("openspec/specs/")
         || pattern.starts_with(&format!("openspec/changes/{change}/"))
+        // The two forms mpd EMITS for itself. `active_system_scope` seeds every
+        // manifest with the bare change directory and the dated archive target,
+        // neither of which carries a trailing slash — so the docs lane could
+        // never fire on any real change, and measured over all 26 archived
+        // manifests it never did. These are EXACT equality, never `starts_with`:
+        // the trailing-slash requirement above is the deliberate guard against
+        // `openspec/changes/<change>-evil/**`, and prefix-matching these two
+        // forms would reopen exactly that hole.
+        || pattern == format!("openspec/changes/{change}")
+        || dated_archive_of(pattern, change)
         || root_markdown(pattern)
+}
+
+/// Whether `pattern` is exactly this change's dated archive target,
+/// `openspec/changes/archive/<YYYY-MM-DD>-<change>`. Exact-match only, and the
+/// date shape is checked so a crafted sibling cannot ride in on the suffix.
+fn dated_archive_of(pattern: &str, change: &str) -> bool {
+    let Some(tail) = pattern.strip_prefix("openspec/changes/archive/") else {
+        return false;
+    };
+    let Some(rest) = tail.strip_suffix(change) else {
+        return false;
+    };
+    // `rest` must be exactly `YYYY-MM-DD-`.
+    let Some(date) = rest.strip_suffix('-') else {
+        return false;
+    };
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 /// D1: is this change's *entire* declared scope (`paths ∪ shared_paths`)
@@ -2396,7 +2448,23 @@ pub fn select_gate_profile_detailed(
                 .into(),
         );
     }
-    let docs_lane = effective == RiskLevel::Low && scope_is_documentation_only(manifest, change);
+    // The docs lane follows SCOPE, not requested rigor.
+    //
+    // This was `effective == RiskLevel::Low && scope_is_documentation_only(..)`,
+    // and `effective` is the max of requested and derived — so any change the
+    // operator asked to review carefully was forced to compile and test code it
+    // did not touch. Combined with the two seeded manifest entries that could
+    // never match `doc_safe_pattern`, the lane never fired once across 26
+    // archived changes.
+    //
+    // Requested risk raises review DEPTH (which models run, how hard they look);
+    // it cannot make compiling unchanged source informative. A prose change
+    // cannot break a build, so rebuilding to prove it is theater. The predicate
+    // itself remains the fail-closed control: it is a closed allowlist over the
+    // ENTIRE declared scope, one non-doc pattern poisons it, and an undeclared
+    // tracked edit is already refused by manifest-scope enforcement — so a
+    // source change cannot reach this lane. The docs profiles still secret-scan.
+    let docs_lane = scope_is_documentation_only(manifest, change);
     let (full, docs, requires_doc_check) = match phase {
         Phase::Build => (&local.gates.build, local.gates.docs_build.as_ref(), true),
         Phase::SecurityCode => (
@@ -2404,7 +2472,13 @@ pub fn select_gate_profile_detailed(
             local.gates.docs_security_code.as_ref(),
             false,
         ),
-        Phase::Test if effective == RiskLevel::High => {
+        // The high-risk escalation applies to CODE. It used to return before the
+        // docs lane was consulted, so a prose-only change classified High still
+        // ran the heavy non-functional profile (here, a 10k-path/100MB
+        // throughput workload) against source it did not touch.
+        Phase::Test
+            if effective == RiskLevel::High && !(docs_lane && local.gates.docs_test.is_some()) =>
+        {
             return Ok(GateProfileSelection {
                 profile: local.gates.high_risk_test.clone(),
                 reason: GateProfileReason::HighRiskTest,
@@ -3016,8 +3090,19 @@ fn source_digest(
         // Receipt-bearing ledgers and local caches are deliberately excluded:
         // otherwise recording a receipt would immediately mutate its own
         // Source dependency and make it stale by self-reference.
+        // `docs/<change>.md` is the SAME class as `documentation.md`: it is
+        // required in the manifest, and it is authored at the Documentation
+        // phase — after Build, Security(code) and Test have already recorded
+        // receipts. Folding a later phase's output into Source lets writing the
+        // documentation retroactively stale those earlier receipts, which is
+        // the phase-causality violation the comment above forbids. It is
+        // excluded HERE rather than added to `change_process_artifact_paths`,
+        // because that array is also consumed by candidate pruning/overlay and
+        // the prose secret-scan lane, which must keep covering this file.
+        let published_doc = path == format!("docs/{change}.md");
         if path.starts_with(".mpd/")
             || is_change_process_artifact(change, &path)
+            || published_doc
             || !manifest.covers(&path, system)
         {
             continue;
@@ -3108,7 +3193,9 @@ pub fn capture_dependency_values(
             ("manifest.json", manifest_bytes),
             (
                 "system-scope.json",
-                serde_json::to_vec(&system.paths()).map_err(|e| e.to_string())?,
+                // `stable_paths`, not `paths`: the archive target carries
+                // today's date, and hashing it made midnight a rewind trigger.
+                serde_json::to_vec(&system.stable_paths()).map_err(|e| e.to_string())?,
             ),
         ],
     )?;
@@ -4487,6 +4574,7 @@ mod tests {
             deploy_result: None,
             validation_receipt: None,
             judgment_artifact_sha256: None,
+            delegation: None,
         }
     }
 
@@ -5270,6 +5358,45 @@ mod system_scope_tests {
         assert!(!paths.contains(&String::new()));
     }
 
+    /// The Scope digest must not move when only the calendar moves.
+    ///
+    /// `archive_target` embeds `today_utc()`. While it was hashed, a change
+    /// left open across midnight UTC woke with a Scope mismatch, and a Scope
+    /// mismatch rewinds to the earliest affected phase and discards every
+    /// downstream approval. Enforcement still sees the archive target; the
+    /// digest no longer does.
+    #[test]
+    fn the_scope_digest_ignores_the_wall_clock_but_enforcement_does_not() {
+        let scope_of = |date: &str| SystemScope {
+            change_dir: "openspec/changes/z-change".to_string(),
+            ledger_path: ".mpd/state/z-change.json".to_string(),
+            merged_spec_targets: vec!["openspec/specs/a/spec.md".to_string()],
+            doc_target: None,
+            archive_target: format!("openspec/changes/archive/{date}-z-change"),
+        };
+        let before = scope_of("2026-07-16");
+        let after = scope_of("2026-07-17");
+
+        assert_eq!(
+            before.stable_paths(),
+            after.stable_paths(),
+            "the digest input must be identical across midnight"
+        );
+        assert_ne!(
+            before.paths(),
+            after.paths(),
+            "enforcement still distinguishes the dated archive target"
+        );
+        // And the archive target is genuinely still authorized scope.
+        assert!(after
+            .paths()
+            .contains(&"openspec/changes/archive/2026-07-17-z-change".to_string()));
+        assert!(!after
+            .stable_paths()
+            .iter()
+            .any(|p| p.contains("changes/archive/")));
+    }
+
     #[test]
     fn a_coincidental_duplicate_path_is_counted_once() {
         let scope = SystemScope {
@@ -5478,8 +5605,11 @@ mod risk_classifier_tests {
             "Docs/**",
             "**/docs/x",
             "d*cs/**",
-            "openspec/changes/some-change",
+            // The change's OWN bare directory is doc-safe (exact match, and
+            // `glob_match` is segment-exact) so it no longer belongs here; a
+            // sibling that merely shares the prefix still must not qualify.
             "openspec/changes/some-change-evil/**",
+            "openspec/changes/some-change-evil",
             "docs/../crates/**",
             "docs//x",
             "docs/./x",
@@ -5803,6 +5933,13 @@ mod scope_is_documentation_only_tests {
         "openspec/specs/thing/spec.md",
         "openspec/changes/my-change/design.md",
         "openspec/changes/my-change/**",
+        // The two forms `active_system_scope` seeds into every manifest. Both
+        // are matched by EXACT equality, and `glob_match` is segment-exact, so
+        // neither can reach a `-evil` sibling: pattern segment `my-change` does
+        // not match text segment `my-change-evil`. Denying these was what kept
+        // the docs lane from ever firing on a real change.
+        "openspec/changes/my-change",
+        "openspec/changes/archive/2026-07-24-my-change",
         "README.md",
         "SECURITY.md",
         "*.md",
@@ -5823,6 +5960,8 @@ mod scope_is_documentation_only_tests {
         ".github/**",
         "openspec/schemas/**",
         "openspec/changes/other-change/**",
+        "openspec/changes/archive/2026-07-24-other-change",
+        "openspec/changes/archive/not-a-date-my-change",
         "README",
         "*",
         "**",
@@ -5831,8 +5970,10 @@ mod scope_is_documentation_only_tests {
         "Docs/**",
         "**/docs/x",
         "d*cs/**",
-        "openspec/changes/my-change",
+        // `-evil` stays denied: it is the sibling-prefix attack the trailing
+        // slash exists to stop, and no exact-equality arm admits it.
         "openspec/changes/my-change-evil/**",
+        "openspec/changes/my-change-evil",
         "docs/../crates/**",
         "docs//x",
         "docs/./x",
@@ -5852,6 +5993,34 @@ mod scope_is_documentation_only_tests {
                 "expected safe: {pattern}"
             );
         }
+    }
+
+    /// The exact manifest mpd wrote for `add-harness-first-readme-quickstart`,
+    /// a README + docs change with no source in it at all.
+    ///
+    /// Under the previous predicate the last two entries — both seeded by
+    /// `active_system_scope` itself — failed `doc_safe_pattern`, poisoning the
+    /// whole scope. A prose-only change therefore ran format, clippy, the full
+    /// workspace test suite and a release build. This is the regression that
+    /// kept the documentation lane at zero selections across 26 changes.
+    #[test]
+    fn the_real_readme_only_manifest_is_documentation_only() {
+        let change = "add-harness-first-readme-quickstart";
+        let manifest = manifest_of(vec![
+            "README.md".to_string(),
+            format!("docs/{change}.md"),
+            format!("openspec/changes/{change}"),
+            format!("openspec/changes/{change}/**"),
+            format!("openspec/changes/archive/2026-07-23-{change}"),
+        ]);
+        assert!(
+            scope_is_documentation_only(&manifest, change),
+            "a prose-only change must reach the docs lane"
+        );
+        // One source path anywhere still poisons it.
+        let mut poisoned = manifest.clone();
+        poisoned.paths.push("crates/mpd/src/cli.rs".to_string());
+        assert!(!scope_is_documentation_only(&poisoned, change));
     }
 
     #[test]
@@ -5933,6 +6102,8 @@ mod scope_is_documentation_only_tests {
             Just("openspec/specs/x/spec.md".to_string()),
             Just("openspec/changes/proptest-change/x".to_string()),
             Just("openspec/changes/proptest-change/**".to_string()),
+            Just("openspec/changes/proptest-change".to_string()),
+            Just("openspec/changes/archive/2026-07-24-proptest-change".to_string()),
             Just("README.md".to_string()),
             Just("*.md".to_string()),
         ]
@@ -5953,8 +6124,12 @@ mod scope_is_documentation_only_tests {
             Just("README".to_string()),
             Just("Docs/readme.md".to_string()),
             Just("**/docs/x".to_string()),
-            Just("openspec/changes/proptest-change".to_string()),
             Just("openspec/changes/proptest-change-evil/x".to_string()),
+            Just("openspec/changes/proptest-change-evil".to_string()),
+            // A same-shaped archive entry for a DIFFERENT change, and one whose
+            // date is not a date: both must stay denied by the exact-match arm.
+            Just("openspec/changes/archive/2026-07-24-other-change".to_string()),
+            Just("openspec/changes/archive/not-a-date-proptest-change".to_string()),
         ]
     }
 
@@ -6327,25 +6502,50 @@ mod select_gate_profile_tests {
         }
     }
 
+    /// REVERSES the former Condition 13 ("Medium/High must not widen into the
+    /// docs lane"), deliberately and with the reasoning recorded here.
+    ///
+    /// Condition 13 read requested rigor as authority over WHICH checks run.
+    /// But requested risk expresses blast radius and review depth — how hard the
+    /// personas look — and no amount of it makes compiling untouched source
+    /// informative about a prose edit. Combined with two seeded manifest
+    /// patterns that could never satisfy `doc_safe_pattern`, Condition 13 left
+    /// the documentation lane dead: it selected zero times across 26 archived
+    /// changes, so the repository's flagship cost control never once ran.
+    ///
+    /// What still holds the line, and is asserted elsewhere in this module:
+    /// the scope predicate is a fail-closed closed allowlist over the ENTIRE
+    /// declared scope (one non-doc pattern poisons it), manifest-scope
+    /// enforcement refuses an undeclared tracked edit, and every docs profile
+    /// must carry a secret scan and a doc check by KIND or selection blocks.
     #[test]
-    fn medium_or_high_effective_risk_excludes_the_docs_lane_even_for_a_pure_doc_scope() {
+    fn the_docs_lane_follows_scope_not_requested_rigor() {
         let local = policy(gates(true), full_docs_profiles());
         let manifest = doc_manifest();
-        assert_eq!(
-            select_gate_profile(
-                &local,
-                Phase::Build,
-                &manifest,
-                "my-change",
-                RiskLevel::Medium
-            )
-            .unwrap(),
-            "build",
-            "Condition 13: Medium must not widen into the docs lane"
-        );
+        for risk in [RiskLevel::Low, RiskLevel::Medium, RiskLevel::High] {
+            assert_eq!(
+                select_gate_profile(&local, Phase::Build, &manifest, "my-change", risk).unwrap(),
+                "docs-build",
+                "a prose-only scope must never compile, at any requested risk ({risk:?})"
+            );
+        }
+        // High risk must not drag a prose-only change into the heavy
+        // non-functional profile either.
         assert_eq!(
             select_gate_profile(&local, Phase::Test, &manifest, "my-change", RiskLevel::High)
                 .unwrap(),
+            "docs-test"
+        );
+        // A scope with any code in it still escalates normally.
+        assert_eq!(
+            select_gate_profile(
+                &local,
+                Phase::Test,
+                &mixed_manifest(),
+                "my-change",
+                RiskLevel::High
+            )
+            .unwrap(),
             "high"
         );
     }
