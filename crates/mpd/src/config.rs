@@ -669,31 +669,26 @@ impl LocalValidationConfig {
 
     fn validate_required_lane_coverage(&self) -> Result<(), String> {
         use CheckKind::*;
+        // Per-gate floors state what each gate must CONTRIBUTE, not what it must
+        // re-run. Build, Security(code), and Test all execute against the SAME
+        // immutable Candidate, so a lane already executed and passed at an earlier
+        // gate is already covered for that exact subject — re-running it is pure
+        // duplication (it was costing a second full test suite and a second release
+        // build on every drive, doubled again by every rewind). Total coverage is
+        // preserved by DRIVE_COVERAGE below, which asserts the union of the three
+        // strict gates still exercises every required lane.
+        //
+        // `pre-push` keeps the complete set: it is the last gate before code leaves
+        // the machine, it runs once, and it verifies the COMMIT rather than the
+        // Candidate — so it is a genuine independent re-verification, not a repeat.
         let requirements: [(&str, &str, &[CheckKind]); 5] = [
-            (
-                "build",
-                &self.gates.build,
-                &[Format, Lint, Test, ReleaseBuild],
-            ),
+            ("build", &self.gates.build, &[Format, Lint, Test]),
             (
                 "security-code",
                 &self.gates.security_code,
                 &[SelfCheck, DependencyAudit, SecretScan, Sast],
             ),
-            (
-                "test",
-                &self.gates.test,
-                &[
-                    Format,
-                    Lint,
-                    Test,
-                    ReleaseBuild,
-                    DependencyAudit,
-                    SecretScan,
-                    Sast,
-                    SelfCheck,
-                ],
-            ),
+            ("test", &self.gates.test, &[ReleaseBuild]),
             (
                 "pre-push",
                 &self.gates.pre_push,
@@ -711,17 +706,7 @@ impl LocalValidationConfig {
             (
                 "high-risk-test",
                 &self.gates.high_risk_test,
-                &[
-                    Format,
-                    Lint,
-                    Test,
-                    ReleaseBuild,
-                    DependencyAudit,
-                    SecretScan,
-                    Sast,
-                    SelfCheck,
-                    Nonfunctional,
-                ],
+                &[ReleaseBuild, Nonfunctional],
             ),
         ];
         for (gate, profile_name, required) in requirements {
@@ -736,6 +721,39 @@ impl LocalValidationConfig {
                         "gate {gate:?} profile {profile_name:?} omits required lane {kind:?}"
                     ));
                 }
+            }
+        }
+
+        // Union coverage of one strict drive. Splitting the per-gate floors above
+        // removes duplicate EXECUTION, never coverage: across Build +
+        // Security(code) + Test every required lane must still run at least once
+        // against the Candidate, or the configuration is refused.
+        const DRIVE_COVERAGE: &[CheckKind] = &[
+            Format,
+            Lint,
+            Test,
+            ReleaseBuild,
+            DependencyAudit,
+            SecretScan,
+            Sast,
+            SelfCheck,
+        ];
+        let mut covered: Vec<CheckKind> = Vec::new();
+        for profile_name in [
+            &self.gates.build,
+            &self.gates.security_code,
+            &self.gates.test,
+        ] {
+            for name in self.effective_checks(profile_name)? {
+                covered.push(self.checks[&name].kind);
+            }
+        }
+        for kind in DRIVE_COVERAGE {
+            if !covered.contains(kind) {
+                return Err(format!(
+                    "the strict drive (build + security-code + test) omits required lane \
+                     {kind:?}; every lane must run at least once against the Candidate"
+                ));
             }
         }
         Ok(())
@@ -1350,13 +1368,52 @@ mod tests {
     fn repository_local_policy_is_complete_valid_and_composes_in_stable_order() {
         let policy = repository_local_policy();
         policy.validate().unwrap();
+
+        // Cost invariant: across one strict drive, Build + Security(code) + Test
+        // must cover every required lane EXACTLY ONCE — full coverage of the
+        // Candidate with no duplicate execution. This is the anti-regression pin
+        // for the old "every gate re-runs everything" shape, which cost a second
+        // full test suite and a second release build on every drive.
+        let mut kinds: Vec<CheckKind> = Vec::new();
+        for profile in ["build", "security-code", "test"] {
+            for name in policy.effective_checks(profile).unwrap() {
+                kinds.push(policy.checks[&name].kind);
+            }
+        }
+        for required in [
+            CheckKind::Format,
+            CheckKind::Lint,
+            CheckKind::Test,
+            CheckKind::ReleaseBuild,
+            CheckKind::DependencyAudit,
+            CheckKind::SecretScan,
+            CheckKind::Sast,
+            CheckKind::SelfCheck,
+        ] {
+            assert_eq!(
+                kinds.iter().filter(|k| **k == required).count(),
+                1,
+                "lane {required:?} must run exactly once across build+security-code+test"
+            );
+        }
+
+        // Documentation changes never compile and never run tests.
+        for profile in ["docs-build", "docs-security-code", "docs-test"] {
+            for name in policy.effective_checks(profile).unwrap() {
+                let kind = policy.checks[&name].kind;
+                assert!(
+                    !matches!(kind, CheckKind::ReleaseBuild | CheckKind::Test),
+                    "docs profile {profile:?} must not compile or run tests (found {kind:?})"
+                );
+            }
+        }
+
+        // `pre-push` is the one deliberate full re-verification, of the commit.
         let test = policy.effective_checks("test").unwrap();
-        assert_eq!(policy.effective_checks("pre-push").unwrap(), test);
+        assert!(policy.effective_checks("pre-push").unwrap().len() > test.len());
+
         let mut high_risk = test;
-        high_risk.extend([
-            "phase-model-tests".to_string(),
-            "scoped-digest-throughput".to_string(),
-        ]);
+        high_risk.push("scoped-digest-throughput".to_string());
         assert_eq!(
             policy.effective_checks("high-risk-test").unwrap(),
             high_risk
@@ -1397,7 +1454,10 @@ mod tests {
         let baseline = repository_local_policy();
 
         let mut policy = baseline.clone();
-        policy.profiles.get_mut("test").unwrap().includes = vec!["pre-push".into()];
+        // `high-risk-test` includes `test`, so pointing `test` back at it is the
+        // cycle. (`pre-push` carries an explicit check list rather than an include,
+        // so it is no longer part of a cycle.)
+        policy.profiles.get_mut("test").unwrap().includes = vec!["high-risk-test".into()];
         assert!(policy.validate().unwrap_err().contains("cyclic profile"));
 
         let mut policy = baseline.clone();

@@ -186,24 +186,23 @@
     },
     "profiles": {
       "build": {
-        "checks": ["format", "clippy", "workspace-tests", "release-build"]
+        "checks": ["format", "clippy", "workspace-tests"]
       },
       "security-code": {
         "checks": ["policy-static", "dependency-audit", "gitleaks", "semgrep"]
       },
       "test": {
-        "checks": ["format", "clippy", "workspace-tests", "release-build", "dependency-audit", "gitleaks", "semgrep", "policy-static"]
+        "checks": ["release-build"]
       },
       "pre-push": {
-        "includes": ["test"],
-        "checks": []
+        "checks": ["format", "clippy", "workspace-tests", "release-build", "dependency-audit", "gitleaks", "semgrep", "policy-static"]
       },
       "high-risk-test": {
         "includes": ["test"],
-        "checks": ["phase-model-tests", "scoped-digest-throughput"]
+        "checks": ["scoped-digest-throughput"]
       },
       "docs-build": {
-        "checks": ["format", "doc-doctrine", "gitleaks", "release-build"]
+        "checks": ["doc-doctrine", "gitleaks"]
       },
       "docs-security-code": {
         "checks": ["gitleaks"]

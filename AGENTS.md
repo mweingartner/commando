@@ -44,6 +44,23 @@ classifier can only raise it, never lower it.
 
 Keep the adversarial review; cut the mechanical re-work:
 
+- **Each lane runs once per Candidate; documentation never compiles.** Build, Security(code),
+  and Test validate the SAME immutable Candidate, so the profiles are disjoint by design:
+  Build owns `format`/`clippy`/`workspace-tests`, Security(code) owns the four scans, Test
+  owns `release-build` (+ non-functional at high risk). A lane that already passed against
+  this Candidate is covered — re-running it at a later gate is duplication, not rigor, and
+  `LocalValidationConfig::validate` refuses any config that drops a lane from the drive's
+  union or re-adds one twice. `pre-push` deliberately keeps the full set: it verifies the
+  COMMIT, a genuinely different subject, once. The docs profiles carry no compile and no
+  test lane at all — a documentation change never rebuilds.
+- **Size validation to code motion.** A change confined to a bounded area gets the tests
+  covering that area; it does not need a full-workspace sweep or a release build to prove
+  it. Reserve the full profile for cross-cutting work — shared/config/policy/sandbox/security
+  code, dependency manifests, or the toolchain. Never gate on exercising an area the change
+  does not touch.
+- **Full re-validation is for defects, not routine.** Re-run the whole cycle when a real bug
+  surfaces or a security issue with a demonstrated path of access — not because prose was
+  reworded, a comment moved, or a gate was re-recorded.
 - **Editing prose after its gate still rewinds — but no longer re-executes the
   sandbox.** The change's own process prose (`design.md`/`proposal.md`/`tasks.md` and
   the judgment artifacts) is excluded from the Candidate and covered by a dedicated
