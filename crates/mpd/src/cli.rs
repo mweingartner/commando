@@ -8068,8 +8068,14 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
     let closure_plan_out: std::cell::RefCell<
         Option<Result<closure::CandidateClosurePlan, String>>,
     > = std::cell::RefCell::new(None);
+    // Only a kind that RUNS the Documentation phases can have a Doc Validation
+    // receipt: `Ledger::record` refuses an inactive phase, so for a Fix or Chore
+    // this receipt is unproducible by construction. Guarding here matches the
+    // sibling `doc_fold` guard above; without it a Fix on the strict Candidate
+    // path could never archive.
     let documentation_postimages = candidate_context
         .as_ref()
+        .filter(|_| ledger.kind.documents())
         .map(|_| {
             let doc_validation_receipt_id = ledger
                 .gates
@@ -8142,14 +8148,23 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
                 // contract violation reported through the same captured-Result
                 // channel as every other closure-plan validation failure,
                 // rather than a panic.
+                // A documenting kind MUST carry its evidence; a non-documenting
+                // kind legitimately carries none. Absence is only an internal
+                // contract violation in the former case.
                 let closure_result: Result<closure::CandidateClosurePlan, String> =
-                    match documentation_postimages.as_ref() {
-                        Some(documentation) => closure::build_candidate_closure_plan(
+                    if documentation_postimages.is_none() && ledger.kind.documents() {
+                        Err(
+                            "internal error: modern Candidate closure is missing documentation \
+                             evidence"
+                                .to_string(),
+                        )
+                    } else {
+                        closure::build_candidate_closure_plan(
                             candidate_root,
                             candidate,
                             &archive_closure,
                             phase_postimages,
-                            documentation,
+                            documentation_postimages.as_ref(),
                             &closure::DeterministicArchivePostimages {
                                 spec_writes: spec_postimages.clone(),
                                 ledger: closure::ClosureFilePostimage::regular(
@@ -8157,12 +8172,7 @@ fn cmd_archive(change: Option<String>, skip_specs: bool, yes: bool) -> CmdResult
                                     bytes.clone(),
                                 ),
                             },
-                        ),
-                        None => Err(
-                            "internal error: modern Candidate closure is missing documentation \
-                             evidence"
-                                .to_string(),
-                        ),
+                        )
                     };
                 *closure_plan_out.borrow_mut() = Some(closure_result);
             }

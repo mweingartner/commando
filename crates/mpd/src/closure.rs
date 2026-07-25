@@ -558,7 +558,12 @@ pub fn build_candidate_closure_plan(
     candidate: &crate::candidate::CandidateProjection,
     closure: &ArchiveClosure,
     phase_artifacts: &[PhaseArtifactPostimage],
-    documentation: &ReviewedDocumentationPostimages,
+    // `None` when this change's kind does not run the Documentation phases
+    // (`ChangeKind::documents()` is Feature-only), so there is no Doc Validation
+    // receipt and no durable-doc fold to claim. A Fix or Chore archives with no
+    // documentation overlay at all rather than being refused for missing
+    // evidence it can never produce.
+    documentation: Option<&ReviewedDocumentationPostimages>,
     archive: &DeterministicArchivePostimages,
 ) -> Result<CandidateClosurePlan, String> {
     validate_candidate_closure_binding(candidate_root, candidate, closure)?;
@@ -633,28 +638,30 @@ pub fn build_candidate_closure_plan(
         )?);
     }
 
-    Digest::from_hex(&documentation.doc_validation_receipt_id)
-        .map_err(|_| "Doc Validation receipt ID is not a canonical SHA-256 digest")?;
-    for document in &documentation.files {
-        validate_documentation_postimage(
-            &manifest,
-            &active_prefix,
-            &closure.archive_path,
-            document,
-        )?;
-        claim_overlay(
-            &mut overlay_claims,
-            &document.path,
-            "reviewed-documentation",
-        )?;
-        apply_postimage(&mut expected, document)?;
-        overlay_entries.push(postimage_digest_entry(
-            &format!(
-                "documentation/{}/{}",
-                documentation.doc_validation_receipt_id, document.path
-            ),
-            document,
-        )?);
+    if let Some(documentation) = documentation {
+        Digest::from_hex(&documentation.doc_validation_receipt_id)
+            .map_err(|_| "Doc Validation receipt ID is not a canonical SHA-256 digest")?;
+        for document in &documentation.files {
+            validate_documentation_postimage(
+                &manifest,
+                &active_prefix,
+                &closure.archive_path,
+                document,
+            )?;
+            claim_overlay(
+                &mut overlay_claims,
+                &document.path,
+                "reviewed-documentation",
+            )?;
+            apply_postimage(&mut expected, document)?;
+            overlay_entries.push(postimage_digest_entry(
+                &format!(
+                    "documentation/{}/{}",
+                    documentation.doc_validation_receipt_id, document.path
+                ),
+                document,
+            )?);
+        }
     }
 
     for spec in &archive.spec_writes {
@@ -4537,7 +4544,7 @@ mod tests {
             &candidate,
             &archive_closure,
             &[],
-            &documentation,
+            Some(&documentation),
             &archive,
         );
         let error =
@@ -4646,7 +4653,7 @@ mod tests {
             &candidate,
             &archive_closure,
             &phase_artifacts,
-            &documentation,
+            Some(&documentation),
             &archive,
         )
         .expect("Architecture's three files under one shared receipt id must be admitted");
@@ -4674,11 +4681,85 @@ mod tests {
             &candidate,
             &archive_closure,
             &bad_artifacts,
-            &documentation,
+            Some(&documentation),
             &archive,
         )
         .unwrap_err();
         assert!(error.contains("must be exactly one of"), "{error}");
+
+        #[cfg(unix)]
+        make_tree_removable(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A non-documenting kind archives with NO documentation overlay.
+    ///
+    /// Regression: making `ChangeKind::documents()` Feature-only made the Doc
+    /// Validation receipt unproducible for a Fix or Chore (`Ledger::record`
+    /// refuses an inactive phase), while the archive path still demanded one.
+    /// A `--fix` on the strict Candidate path could therefore never archive —
+    /// it failed with "cannot archive: Doc Validation receipt is missing", for
+    /// evidence it was structurally incapable of producing.
+    ///
+    /// This is a closure-level test on purpose: no e2e test retains a Build
+    /// Candidate (see e2e.rs), so the strict path is unreachable from there.
+    #[test]
+    #[cfg(unix)]
+    fn build_candidate_closure_plan_admits_a_change_with_no_documentation_overlay() {
+        let change = "nodocoverlay";
+        let (root, candidate) = candidate_closure_fixture(
+            "no-doc-overlay",
+            change,
+            &[&format!("openspec/changes/{change}/**")],
+        );
+        let candidate_root = PathBuf::from(&candidate.capture.clone_private_root);
+        let archive_closure = ArchiveClosure {
+            base_commit: candidate.capture.subject.base_commit.clone(),
+            archive_path: format!("openspec/changes/archive/2026-01-01-{change}"),
+            transaction_id: Digest::of_bytes(b"txn"),
+            candidate_id: Some(candidate.capture.subject.id.clone()),
+            allowed_paths: vec![format!("openspec/changes/{change}/**")],
+            system_paths: vec![format!("openspec/changes/archive/2026-01-01-{change}")],
+            post_archive_digest: Digest::of_bytes(b"post"),
+            archived_at: 1_752_000_000,
+        };
+        // A Fix: `ChangeKind::documents()` is false, so no Doc Validation
+        // receipt exists or can exist.
+        let mut ledger_doc =
+            crate::ledger::Ledger::new(change, "mpd", false, crate::ledger::ChangeKind::Fix);
+        assert!(!ledger_doc.kind.documents());
+        ledger_doc.archive_closure = Some(archive_closure.clone());
+        ledger_doc.gates.insert(
+            Phase::Build,
+            minimal_build_gate_record(candidate.capture.clone()),
+        );
+        let ledger_bytes = serde_json::to_vec(&ledger_doc).unwrap();
+        let archive = DeterministicArchivePostimages {
+            spec_writes: Vec::new(),
+            ledger: ClosureFilePostimage::regular(
+                format!(".mpd/state/{change}.json"),
+                ledger_bytes,
+            ),
+        };
+
+        let plan = build_candidate_closure_plan(
+            &candidate_root,
+            &candidate,
+            &archive_closure,
+            &[],
+            None,
+            &archive,
+        )
+        .expect("a non-documenting kind must archive without a documentation overlay");
+
+        assert!(
+            !plan
+                .entries
+                .iter()
+                .any(|entry| entry.path.starts_with("docs/")),
+            "no durable-doc entry may appear: {:?}",
+            plan.entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
 
         #[cfg(unix)]
         make_tree_removable(&root);
@@ -4727,7 +4808,7 @@ mod tests {
             &candidate,
             &archive_closure,
             &[],
-            &documentation,
+            Some(&documentation),
             &archive,
         );
         let error =
@@ -4854,7 +4935,7 @@ mod tests {
             &candidate,
             &archive_closure,
             &[],
-            &documentation,
+            Some(&documentation),
             &archive,
         );
         let error =

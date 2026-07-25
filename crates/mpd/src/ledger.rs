@@ -2142,12 +2142,14 @@ fn serialized_ledger(ledger: &Ledger) -> io::Result<String> {
         stamped.format = LEDGER_FORMAT;
         Some(stamped)
     };
-    // Compact, not pretty. The ledger is a machine record that only ever
-    // reaches a human through `mpd status`/`stats`/`--json`, all of which
-    // render on demand. Measured across `.mpd/state`, pretty-printing was 61%
-    // of 8.8 MB on disk — indentation, not evidence. Nothing is dropped here;
-    // this changes only the encoding, and `load` is unaffected.
-    let mut json = serde_json::to_string(stamped.as_ref().unwrap_or(ledger))
+    // ONE encoding, shared with the archive transaction (`cmd_archive`, which
+    // also serializes pretty). A brief attempt to compact this writer was
+    // reverted: ledgers are committed exactly once, at archive, so compaction
+    // saved almost nothing on tracked bytes, while the two writers disagreeing
+    // meant any post-archive re-save produced bytes that no longer matched
+    // `archive_closure.post_archive_digest` — the frozen coherence binding.
+    // If this is ever compacted, compact BOTH writers in the same change.
+    let mut json = serde_json::to_string_pretty(stamped.as_ref().unwrap_or(ledger))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     json.push('\n');
     Ok(json)
