@@ -2540,6 +2540,24 @@ impl Subject {
     fn attached_object_oid(&self) -> &str {
         &self.pushed_oid
     }
+
+    /// Whether two subjects name the same VALIDATED thing.
+    ///
+    /// Deliberately ignores `requested`, which is how the caller spelled the
+    /// reference (`HEAD`, a branch, a full OID) and not part of what was
+    /// validated. Full `Subject` equality was used here, and because
+    /// `read_note_envelope` validates EVERY receipt stored against the attached
+    /// object, a note written by `--commit <oid>` made `--commit HEAD` fail
+    /// with "invalid validation receipt" for the identical commit, and vice
+    /// versa — permanently, since neither could then write. The resolved
+    /// identity below is what a receipt actually attests to.
+    fn is_same_validated_subject(&self, other: &Subject) -> bool {
+        self.pushed_oid == other.pushed_oid
+            && self.pushed_kind == other.pushed_kind
+            && self.tag_chain == other.tag_chain
+            && self.commit == other.commit
+            && self.tree == other.tree
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -9061,7 +9079,7 @@ fn receipt_id(receipt: &ValidationReceiptV1) -> Result<String, String> {
 
 fn validate_receipt(receipt: &ValidationReceiptV1, subject: &Subject) -> Result<(), String> {
     if receipt.schema != VALIDATION_SCHEMA
-        || receipt.subject != *subject
+        || !receipt.subject.is_same_validated_subject(subject)
         || receipt.id != receipt_id(receipt)?
         || receipt.results.len() > 64
     {
@@ -14494,6 +14512,52 @@ mod tests {
         };
         receipt.id = receipt_id(&receipt).unwrap();
         receipt
+    }
+
+    /// A receipt attests to a resolved commit, not to how the caller spelled
+    /// the reference.
+    ///
+    /// Regression: `validate_receipt` compared whole `Subject`s, and
+    /// `read_note_envelope` validates every receipt stored against the attached
+    /// object. So a note written by `mpd validate --commit <oid>` made
+    /// `--commit HEAD` fail with "invalid validation receipt" for the identical
+    /// commit — and neither form could then write, so the note store was
+    /// permanently unreadable. Observed on this repository.
+    #[test]
+    fn a_receipt_matches_the_same_commit_however_the_caller_spelled_the_ref() {
+        let by_oid = Subject {
+            requested: "f".repeat(40),
+            pushed_oid: "f".repeat(40),
+            pushed_kind: "commit".into(),
+            tag_chain: Vec::new(),
+            commit: "f".repeat(40),
+            tree: "b".repeat(40),
+        };
+        let by_head = Subject {
+            requested: "HEAD".into(),
+            ..by_oid.clone()
+        };
+        assert!(by_oid.is_same_validated_subject(&by_head));
+
+        let receipt = test_receipt(by_oid, "build");
+        validate_receipt(&receipt, &by_head)
+            .expect("the same commit requested as HEAD must validate");
+
+        // A genuinely different commit still fails closed.
+        let other = Subject {
+            commit: "e".repeat(40),
+            pushed_oid: "e".repeat(40),
+            ..by_head.clone()
+        };
+        assert!(!other.is_same_validated_subject(&by_head));
+        assert!(validate_receipt(&receipt, &other).is_err());
+
+        // A different resolved tree for the same commit also fails closed.
+        let retreed = Subject {
+            tree: "c".repeat(40),
+            ..by_head.clone()
+        };
+        assert!(validate_receipt(&receipt, &retreed).is_err());
     }
 
     #[test]
