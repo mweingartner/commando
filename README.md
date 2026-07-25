@@ -23,27 +23,35 @@ You drive the workflow. Start with `mpd conduct`, follow every
 test the real result, and report outcomes, risks, and decisions — not command logs.
 Do not ask me to run MPD commands.
 
-SIZE THE VERIFICATION TO WHAT ACTUALLY CHANGED. Read the diff before you gate:
-- A documentation or prose-only change never compiles and never runs the test suite.
-  Gate it on the docs lane (doc checks + secret scan) and nothing else.
-- A change confined to a bounded area gets the tests covering that area. Do not run a
-  full-workspace sweep or a release build to prove a localized edit, and never gate on
-  exercising a component the change does not touch.
-- Reserve the full profile for genuinely cross-cutting work: shared/config/policy or
-  security code, dependency manifests, or the toolchain.
-- Each check runs once per Candidate. Build, Security(code) and Test validate the same
-  immutable subject, so never re-run a lane an earlier gate already passed against it.
-- Re-run the full cycle only when you find a real defect, or a security issue with a
-  demonstrated path of access. Never re-drive because prose was reworded, a comment
-  moved, an artifact was reformatted, or a gate was re-recorded.
+ACTUALLY SPAWN THE PERSONAS. This is the whole point, and it is the one thing the tool
+cannot enforce for you.
+- Each phase is a SEPARATE subagent with its own context. A verdict you record on your
+  own work is not a review, however well-formed the artifact.
+- Use the model `mpd next` resolves for the phase: Sol for Architecture, Design and
+  Doc Validation; Terra for Security, Build, Test and Documentation.
+- Record which happened, every time:
+  `mpd gate <phase> --pass --evidence <artifact> --delegated --model <id>`
+  If you did NOT spawn a separate agent, say `--self-recorded --model <id>` instead.
+  Omitting both records UNKNOWN. Do not guess, and do not claim --delegated loosely.
+- A skipped review I can see is worth more to me than a passed gate I cannot trust.
 
-KEEP THE ADVERSARIAL VALUE, CUT THE MECHANICAL REWORK:
+CLASSIFY THE CHANGE CORRECTLY — it now drives real cost:
+- `--fix` (defect) and `--chore` (refactor/tooling/perf) skip Documentation and Doc
+  Validation; they change nothing the durable docs describe. `--ui` adds the three
+  Design phases. A Feature with no UI runs eight gates, a fix runs six.
+- Declare the manifest completely before Build — every tracked file you touch. The
+  gate refuses an undeclared tracked edit, which is how unvalidated source used to ship.
+  If the scope is prose only, MPD selects the docs lane by itself and never compiles.
+
+SIZE THE VERIFICATION TO WHAT ACTUALLY CHANGED. Read the diff before you gate:
+- Each lane runs once per Candidate. Build, Security(code) and Test validate the same
+  immutable subject; never re-run a lane an earlier gate already passed against it.
+- Re-run the full cycle only for a real defect, or a security issue with a demonstrated
+  path of access. Never re-drive because prose was reworded, a comment moved, an
+  artifact was reformatted, or a gate was re-recorded.
+- Record non-blocking or comment-only findings as notes in the artifact, not as a FAIL.
 - Author the plan and its artifacts completely before gating, so you are not rewinding
   to fix wording. Strip every `<!-- -->` placeholder before you archive.
-- Record non-blocking or comment-only findings as notes in the artifact, not as a FAIL.
-- Declare every file you touch in the manifest before Build. If you edit a tracked file
-  outside it the gate will refuse — declare it or stash it. Never let an undeclared file
-  ride along; it would ship unvalidated.
 - A trivial fix that is not really a change (a typo, a hotfix) can be committed directly
   without manufacturing a change for it. The secret scan still applies to every commit.
 
@@ -61,31 +69,39 @@ not already have.
 Use MPD to deliver this outcome: [describe the outcome you want].
 
 You drive the workflow. Start with `mpd conduct`, follow every
-`mpd next --harness claude-code --context` brief, complete and gate each applicable
-phase, test the real result, and report outcomes, risks, and decisions — not command
-logs. Do not ask me to run MPD commands.
+`mpd next --harness claude-code --context` brief, complete and gate each applicable phase,
+test the real result, and report outcomes, risks, and decisions — not command logs.
+Do not ask me to run MPD commands.
+
+ACTUALLY SPAWN THE PERSONAS. This is the whole point, and it is the one thing the tool
+cannot enforce for you.
+- Each phase is a SEPARATE subagent with its own context. A verdict you record on your
+  own work is not a review, however well-formed the artifact.
+- Use the model `mpd next` resolves for the phase: Fable for Architecture, Design and
+  Doc Validation; Sonnet for Security, Build, Test and Documentation.
+- Record which happened, every time:
+  `mpd gate <phase> --pass --evidence <artifact> --delegated --model <id>`
+  If you did NOT spawn a separate agent, say `--self-recorded --model <id>` instead.
+  Omitting both records UNKNOWN. Do not guess, and do not claim --delegated loosely.
+- A skipped review I can see is worth more to me than a passed gate I cannot trust.
+
+CLASSIFY THE CHANGE CORRECTLY — it now drives real cost:
+- `--fix` (defect) and `--chore` (refactor/tooling/perf) skip Documentation and Doc
+  Validation; they change nothing the durable docs describe. `--ui` adds the three
+  Design phases. A Feature with no UI runs eight gates, a fix runs six.
+- Declare the manifest completely before Build — every tracked file you touch. The
+  gate refuses an undeclared tracked edit, which is how unvalidated source used to ship.
+  If the scope is prose only, MPD selects the docs lane by itself and never compiles.
 
 SIZE THE VERIFICATION TO WHAT ACTUALLY CHANGED. Read the diff before you gate:
-- A documentation or prose-only change never compiles and never runs the test suite.
-  Gate it on the docs lane (doc checks + secret scan) and nothing else.
-- A change confined to a bounded area gets the tests covering that area. Do not run a
-  full-workspace sweep or a release build to prove a localized edit, and never gate on
-  exercising a component the change does not touch.
-- Reserve the full profile for genuinely cross-cutting work: shared/config/policy or
-  security code, dependency manifests, or the toolchain.
-- Each check runs once per Candidate. Build, Security(code) and Test validate the same
-  immutable subject, so never re-run a lane an earlier gate already passed against it.
-- Re-run the full cycle only when you find a real defect, or a security issue with a
-  demonstrated path of access. Never re-drive because prose was reworded, a comment
-  moved, an artifact was reformatted, or a gate was re-recorded.
-
-KEEP THE ADVERSARIAL VALUE, CUT THE MECHANICAL REWORK:
+- Each lane runs once per Candidate. Build, Security(code) and Test validate the same
+  immutable subject; never re-run a lane an earlier gate already passed against it.
+- Re-run the full cycle only for a real defect, or a security issue with a demonstrated
+  path of access. Never re-drive because prose was reworded, a comment moved, an
+  artifact was reformatted, or a gate was re-recorded.
+- Record non-blocking or comment-only findings as notes in the artifact, not as a FAIL.
 - Author the plan and its artifacts completely before gating, so you are not rewinding
   to fix wording. Strip every `<!-- -->` placeholder before you archive.
-- Record non-blocking or comment-only findings as notes in the artifact, not as a FAIL.
-- Declare every file you touch in the manifest before Build. If you edit a tracked file
-  outside it the gate will refuse — declare it or stash it. Never let an undeclared file
-  ride along; it would ship unvalidated.
 - A trivial fix that is not really a change (a typo, a hotfix) can be committed directly
   without manufacturing a change for it. The secret scan still applies to every commit.
 
