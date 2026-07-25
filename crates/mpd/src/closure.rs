@@ -1765,11 +1765,7 @@ fn manifest_declares(manifest: &ChangeManifest, path: &str) -> bool {
 /// ledger is folded into scope via [`SystemScope`] at every commit-time check
 /// regardless of what the manifest declares (candidate.rs), and declaring it
 /// would needlessly trip the `.mpd/` sensitive-path risk signal.
-pub fn missing_process_scope(
-    manifest: &ChangeManifest,
-    change: &str,
-    docs_dir: &str,
-) -> Vec<String> {
+pub fn missing_process_scope(manifest: &ChangeManifest, change: &str) -> Vec<String> {
     let mut missing = Vec::new();
 
     let change_dir_manifest = format!("openspec/changes/{change}/manifest.json");
@@ -1780,10 +1776,16 @@ pub fn missing_process_scope(
         missing.push(format!("openspec/changes/{change}/**"));
     }
 
-    let doc_target = format!("{docs_dir}/{change}.md");
-    if !manifest_declares(manifest, &doc_target) {
-        missing.push(doc_target);
-    }
+    // Deliberately does NOT require `<docs_dir>/<change>.md`.
+    //
+    // Same rationale as the ledger exemption documented above: the durable-doc
+    // target is folded into scope by `SystemScope::doc_target` at every
+    // commit-time check regardless of what the manifest declares, and archive
+    // is what WRITES the file (from documentation.md's already-digest-bound
+    // bytes). Requiring the declaration bought no coverage and cost a great
+    // deal: 39 of 144 recorded reconciliations exist solely to re-affirm it
+    // ("Durable-doc manifest declaration re-affirmation; no content change"),
+    // each one a scope edit, a rewind, and a human rubber stamp.
 
     missing
 }
@@ -2157,7 +2159,11 @@ pub fn evidence_validity(
     }
 }
 
-pub const RISK_CLASSIFIER_VERSION: u32 = 2;
+// v3: repository-level reasons (`deployment-configured`,
+// `local-validation-process-hook-sandbox-policy`) removed from per-change
+// derivation. A stored v2 assessment is not comparable to a v3 one, so the
+// version is bound into the signal digest and bumped here.
+pub const RISK_CLASSIFIER_VERSION: u32 = 3;
 
 /// Whether `pattern` is a single, wildcard-stem markdown file at the
 /// repository root: exactly one path segment (no `/`), ending in the
@@ -2314,6 +2320,9 @@ pub fn classify_effective_risk(
         ),
         ("deployment", &["deploy", "install", "release", "package"]),
     ];
+    // Exact files whose change is cross-cutting by doctrine (dependency
+    // manifests and the toolchain), matched whole rather than by prefix.
+    let sensitive_files = ["cargo.toml", "cargo.lock", "rust-toolchain.toml"];
     let sensitive_roots = [
         ".githooks/",
         ".mpd/",
@@ -2333,22 +2342,46 @@ pub fn classify_effective_risk(
                 reasons.push(format!("{category}: {path}"));
             }
         }
-        if reasons.len() == before && sensitive_roots.iter().any(|root| lower.starts_with(root)) {
+        if reasons.len() == before
+            && sensitive_roots.iter().any(|root| {
+                // Either the declared path sits under a sensitive root, or it is
+                // a pattern broad enough to REACH one. `crates/**` matches no
+                // sensitive-root prefix by string comparison, yet it covers the
+                // sandbox, checks, config and git modules — so a literal
+                // `starts_with` alone would grade the entire source tree as
+                // carrying no sensitive signal.
+                lower.starts_with(root)
+                    || crate::pathmatch::glob_match(&lower, root)
+                    || crate::pathmatch::glob_may_match_descendant(&lower, root)
+            })
+            || sensitive_files
+                .iter()
+                .any(|file| lower == *file || crate::pathmatch::glob_match(&lower, file))
+        {
             reasons.push(format!("unknown-sensitive-path: {path}"));
         }
     }
-    if config.deploy.is_some()
-        || config
-            .local_validation
-            .as_ref()
-            .and_then(|local| local.deploy_output.as_ref())
-            .is_some()
-    {
-        reasons.push("deployment-configured".into());
-    }
-    if config.local_validation.is_some() {
-        reasons.push("local-validation-process-hook-sandbox-policy".into());
-    }
+    // Deliberately NO repository-level reasons here.
+    //
+    // This function derives the risk of a CHANGE, and its output must be a
+    // function of what that change touches. Two reasons used to be pushed from
+    // repository configuration alone — `deployment-configured` (config.deploy or
+    // deploy_output present) and `local-validation-process-hook-sandbox-policy`
+    // (local_validation present). Both are constants for a given repository, so
+    // in any repo that configures local validation — that is, every repo using
+    // this tool for its intended purpose — they fired on every change.
+    //
+    // Because derivation is binary (`reasons.is_empty()` -> Low, else High),
+    // one always-true reason pinned every non-documentation change at High.
+    // High is precisely the switch that escalates Security and Tester onto the
+    // DEEP model, so the owner's cost goal — best model on architecture, cheap
+    // model elsewhere — was not merely unmet but inverted: measured 19 of 19
+    // assessed changes derived High. A signal that fires 100% of the time
+    // carries no information; it only spends money.
+    //
+    // Risk now derives from the paths the change actually declares. Sensitive
+    // roots and category keywords above still raise it, and `effective` remains
+    // `max(requested, derived)`, so an operator can always ask for more rigor.
     reasons.sort();
     reasons.dedup();
     // D2: under a PROVEN documentation-only scope, every reason collected
@@ -2367,13 +2400,28 @@ pub fn classify_effective_risk(
         let mut relabeled = vec!["documentation-only-scope".to_string()];
         relabeled.extend(suppressed);
         (RiskLevel::Low, relabeled)
+    } else if !reasons.is_empty() {
+        // A real sensitive signal from the declared paths.
+        (RiskLevel::High, reasons)
+    } else if paths.is_empty() {
+        // Degenerate: the Build gate refuses an empty manifest before this
+        // matters. Unchanged from prior behavior.
+        (RiskLevel::Low, reasons)
     } else {
-        let derived = if reasons.is_empty() {
-            RiskLevel::Low
-        } else {
-            RiskLevel::High
-        };
-        (derived, reasons)
+        // Ordinary code: not prose, but nothing sensitive either.
+        //
+        // Derivation used to be BINARY — Low or High — which is why removing
+        // the two always-true repository reasons would have graded the whole
+        // source tree Low. The missing rung is Medium, and it is what makes
+        // goal 3 achievable: only High escalates Security and Tester onto the
+        // deep model (harness.rs `model_for_governed`) and only High selects
+        // the heavy `high-risk-test` profile, while Medium still gets two
+        // attempts instead of Low's one, so ordinary work is LESS likely to
+        // need a human reconciliation than it was under Low.
+        (
+            RiskLevel::Medium,
+            vec!["ordinary-code-scope: no sensitive signal in declared paths".to_string()],
+        )
     };
     let effective = requested.max(derived);
     let signal_bytes = serde_json::to_vec(&(
@@ -5300,72 +5348,71 @@ mod missing_process_scope_tests {
             owned(&["openspec/changes/my-change/**", "docs/my-change.md"]),
             Vec::new(),
         );
-        assert!(missing_process_scope(&manifest, CHANGE, "docs").is_empty());
+        assert!(missing_process_scope(&manifest, CHANGE).is_empty());
     }
 
     #[test]
     fn a_recursive_double_star_over_everything_is_always_complete() {
         let manifest = manifest_of(owned(&["**"]), Vec::new());
-        assert!(missing_process_scope(&manifest, CHANGE, "docs").is_empty());
+        assert!(missing_process_scope(&manifest, CHANGE).is_empty());
     }
 
     #[test]
     fn a_narrow_unrelated_scope_reports_both_entries_by_exact_string() {
         let manifest = manifest_of(owned(&["crates/**"]), Vec::new());
         assert_eq!(
-            missing_process_scope(&manifest, CHANGE, "docs"),
-            vec![
-                "openspec/changes/my-change/**".to_string(),
-                "docs/my-change.md".to_string(),
-            ]
+            missing_process_scope(&manifest, CHANGE),
+            vec!["openspec/changes/my-change/**".to_string()]
         );
     }
 
+    /// The durable-doc target is NO LONGER a required manifest declaration.
+    ///
+    /// `SystemScope::doc_target` folds it into scope at every commit-time check
+    /// regardless of the manifest, and archive is what writes the file. The old
+    /// requirement bought no coverage and produced 39 of 144 recorded
+    /// reconciliations — scope edits, rewinds and rubber stamps to re-affirm a
+    /// declaration for a file the tool writes itself.
     #[test]
-    fn declaring_only_the_change_dir_still_reports_the_doc_target() {
+    fn declaring_only_the_change_dir_is_complete() {
         let manifest = manifest_of(owned(&["openspec/changes/my-change/**"]), Vec::new());
-        assert_eq!(
-            missing_process_scope(&manifest, CHANGE, "docs"),
-            vec!["docs/my-change.md".to_string()]
-        );
+        assert!(missing_process_scope(&manifest, CHANGE).is_empty());
     }
 
     #[test]
     fn declaring_only_the_doc_target_still_reports_the_change_dir() {
+        // The change dir remains required; only the doc target was dropped.
         let manifest = manifest_of(owned(&["docs/my-change.md"]), Vec::new());
         assert_eq!(
-            missing_process_scope(&manifest, CHANGE, "docs"),
+            missing_process_scope(&manifest, CHANGE),
             vec!["openspec/changes/my-change/**".to_string()]
         );
     }
 
     #[test]
     fn a_shared_paths_entry_counts_as_declared() {
-        let manifest = manifest_of(
-            Vec::new(),
-            owned(&["openspec/changes/my-change/**", "docs/my-change.md"]),
-        );
-        assert!(missing_process_scope(&manifest, CHANGE, "docs").is_empty());
+        let manifest = manifest_of(Vec::new(), owned(&["openspec/changes/my-change/**"]));
+        assert!(missing_process_scope(&manifest, CHANGE).is_empty());
     }
 
+    /// The check no longer depends on `docs_dir` at all, so a custom
+    /// documentation tree cannot make it demand a different entry.
     #[test]
-    fn a_custom_docs_dir_is_honored_not_hardcoded() {
-        let manifest = manifest_of(
-            owned(&[
+    fn the_docs_directory_no_longer_affects_the_required_scope() {
+        for declared in [
+            vec![
                 "openspec/changes/my-change/**",
                 "documentation/my-change.md",
-            ]),
-            Vec::new(),
-        );
-        assert!(missing_process_scope(&manifest, CHANGE, "documentation").is_empty());
-        // The default "docs" tree is NOT what this manifest declared, so
-        // probing under the custom `docs_dir` must still report the custom
-        // target rather than silently falling back to "docs/<change>.md".
-        let manifest = manifest_of(owned(&["openspec/changes/my-change/**"]), Vec::new());
-        assert_eq!(
-            missing_process_scope(&manifest, CHANGE, "documentation"),
-            vec!["documentation/my-change.md".to_string()]
-        );
+            ],
+            vec!["openspec/changes/my-change/**", "docs/my-change.md"],
+            vec!["openspec/changes/my-change/**"],
+        ] {
+            let manifest = manifest_of(owned(&declared), Vec::new());
+            assert!(
+                missing_process_scope(&manifest, CHANGE).is_empty(),
+                "{declared:?}"
+            );
+        }
     }
 
     #[test]
@@ -5374,12 +5421,9 @@ mod missing_process_scope_tests {
         // `openspec/changes/<c>/*` matches `manifest.json` but not the
         // nested spec probe, so it must still be reported as needing the
         // recursive `**` form.
-        let manifest = manifest_of(
-            owned(&["openspec/changes/my-change/*", "docs/my-change.md"]),
-            Vec::new(),
-        );
+        let manifest = manifest_of(owned(&["openspec/changes/my-change/*"]), Vec::new());
         assert_eq!(
-            missing_process_scope(&manifest, CHANGE, "docs"),
+            missing_process_scope(&manifest, CHANGE),
             vec!["openspec/changes/my-change/**".to_string()]
         );
     }
@@ -5402,10 +5446,10 @@ mod missing_process_scope_tests {
         ) {
             let change = "proptest-change";
             let manifest = manifest_of(paths, shared_paths);
-            let missing = missing_process_scope(&manifest, change, "docs");
+            let missing = missing_process_scope(&manifest, change);
             let mut healed = manifest.clone();
             healed.paths.extend(missing);
-            prop_assert!(missing_process_scope(&healed, change, "docs").is_empty());
+            prop_assert!(missing_process_scope(&healed, change).is_empty());
         }
     }
 }
@@ -5581,22 +5625,23 @@ mod risk_classifier_tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn classifier_version_is_bumped_to_2() {
-        assert_eq!(RISK_CLASSIFIER_VERSION, 2);
+    fn classifier_version_is_bumped_to_3() {
+        assert_eq!(RISK_CLASSIFIER_VERSION, 3);
         let result = classify_effective_risk(
             &manifest("docs/readme.md"),
             &crate::config::Config::default(),
             RiskLevel::Low,
             "some-change",
         );
-        assert_eq!(result.classifier_version, 2);
+        assert_eq!(result.classifier_version, 3);
     }
 
     #[test]
     fn documentation_only_scope_on_a_deployment_configured_repo_derives_low() {
-        // The exact repro from design.md's Context: a deployment-configured
-        // repo (both synthetic signals fire under v1) with a pure docs scope
-        // must resolve derived/effective Low at requested Low.
+        // A pure docs scope resolves derived/effective Low at requested Low.
+        // Under v1/v2 this was the repro for two SYNTHETIC repository-level
+        // signals that fired on every change; v3 removed them, so there is
+        // nothing left to suppress here and the marker stands alone.
         let config = crate::config::Config {
             deploy: Some("install reviewed artifact".into()),
             ..Default::default()
@@ -5609,15 +5654,7 @@ mod risk_classifier_tests {
         );
         assert_eq!(result.derived, RiskLevel::Low);
         assert_eq!(result.effective, RiskLevel::Low);
-        assert_eq!(result.reasons[0], "documentation-only-scope");
-        assert!(
-            result
-                .reasons
-                .iter()
-                .any(|r| r == "suppressed:deployment-configured"),
-            "{:?}",
-            result.reasons
-        );
+        assert_eq!(result.reasons, vec!["documentation-only-scope".to_string()]);
     }
 
     #[test]
@@ -5701,13 +5738,29 @@ mod risk_classifier_tests {
                 RiskLevel::Low,
                 "some-change",
             );
-            assert_eq!(result.derived, RiskLevel::High, "{deny}");
-            assert_eq!(result.effective, RiskLevel::High, "{deny}");
+            // Condition 5's actual invariant: a deny pattern alongside a doc
+            // pattern must break the documentation-only predicate, so nothing
+            // is relabeled `suppressed:` and the change never takes the docs
+            // lane. Derivation is three-level under v3, so the guarantee here
+            // is "not Low"; genuinely sensitive patterns are still High.
+            assert_ne!(
+                result.derived,
+                RiskLevel::Low,
+                "{deny} must not qualify for the documentation lane"
+            );
+            assert!(
+                !result.reasons.iter().any(|r| r.starts_with("suppressed:")),
+                "{deny} must not be suppressed: {:?}",
+                result.reasons
+            );
+            // Every reason must be traceable to a declared path, never to
+            // repository configuration.
             assert!(
                 result
                     .reasons
-                    .contains(&"deployment-configured".to_string()),
-                "{deny}: {:?}",
+                    .iter()
+                    .all(|r| r.contains(deny) || r.starts_with("ordinary-code-scope")),
+                "{deny}: reasons must derive from declared paths: {:?}",
                 result.reasons
             );
             assert!(
@@ -5861,29 +5914,34 @@ mod risk_classifier_tests {
                         reason
                     );
                 }
-                let deploy_suppressed = result
+                // v3: repository configuration contributes NO reason, so a
+                // suppressed entry can only ever come from a false-cognate
+                // keyword hit on a doc path — never from `deploy` or
+                // `local_validation` being configured.
+                prop_assert!(!result
                     .reasons
                     .iter()
-                    .any(|r| r == "suppressed:deployment-configured");
-                prop_assert_eq!(deploy_suppressed, deploy_configured);
-                let lv_suppressed = result.reasons.iter().any(|r| {
-                    r == "suppressed:local-validation-process-hook-sandbox-policy"
-                });
-                prop_assert_eq!(lv_suppressed, local_validation_configured);
+                    .any(|r| r == "suppressed:deployment-configured"));
+                let lv_suppressed = result
+                    .reasons
+                    .iter()
+                    .any(|r| r == "suppressed:local-validation-process-hook-sandbox-policy");
+                prop_assert!(!lv_suppressed);
             } else {
                 prop_assert!(!any_suppressed);
+                // v3 derivation is three-level: High iff a sensitive signal
+                // fired, else Medium for ordinary code, else Low for an empty
+                // scope. Repository configuration never appears as a reason.
                 prop_assert_eq!(
                     result.derived == RiskLevel::High,
-                    !result.reasons.is_empty()
+                    result.reasons.iter().any(|r| !r.starts_with("ordinary-code-scope"))
                 );
-                let deploy_raw = result
+                prop_assert!(!result
                     .reasons
-                    .contains(&"deployment-configured".to_string());
-                prop_assert_eq!(deploy_raw, deploy_configured);
-                let lv_raw = result
+                    .contains(&"deployment-configured".to_string()));
+                prop_assert!(!result
                     .reasons
-                    .contains(&"local-validation-process-hook-sandbox-policy".to_string());
-                prop_assert_eq!(lv_raw, local_validation_configured);
+                    .contains(&"local-validation-process-hook-sandbox-policy".to_string()));
             }
         }
 

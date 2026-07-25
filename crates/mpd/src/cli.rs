@@ -1226,8 +1226,13 @@ fn print_conduct_contract(name: &str) {
     println!("    break if brief.phase == \"done\"");
     println!("    # spawn the persona at brief.model, fill brief.artifact_path, do the work");
     println!(
-        "    mpd gate <phase> --pass --evidence <artifact_path>        \
+        "    mpd gate <phase> --pass --evidence <artifact_path> \\\n\
+         \x20     --delegated|--self-recorded --model <id>            \
          # strict checks auto-apply from ledger.strict"
+    );
+    println!(
+        "    # --delegated only if a SEPARATE persona agent actually ran; otherwise\n    \
+         # --self-recorded. Omitting both records UNKNOWN."
     );
     println!("  mpd archive --yes");
     println!("\nStarted {name:?} under the strict tier. Next: mpd next");
@@ -3724,7 +3729,7 @@ fn gitleaks_lane_verdict(result: Option<bool>, gitleaks_required: bool) -> Resul
 /// remove — the historical corpus cannot distinguish a reviewed PASS from a
 /// self-recorded one, and guessing would extend that problem forward.
 ///
-/// `route_honored` compares the reported model against the model `mpd next`
+/// `route_claimed` compares the reported model against the model `mpd next`
 /// resolved for this exact (phase, attempt), which the ledger already stores as
 /// a `BriefExpectationV1`. It is the first mechanism in the tool that can tell
 /// whether the cost policy was followed rather than merely printed.
@@ -3744,7 +3749,7 @@ fn build_delegation_record(
         .brief_expectations
         .get(&ledger::Ledger::attempt_key(phase, attempt))
         .map(|expectation| expectation.model.clone());
-    let route_honored = match (model.as_deref(), expected.as_deref()) {
+    let route_claimed = match (model.as_deref(), expected.as_deref()) {
         (Some(actual), Some(want)) => Some(actual.eq_ignore_ascii_case(want)),
         _ => None,
     };
@@ -3754,7 +3759,7 @@ fn build_delegation_record(
         // driving session speaking for itself.
         delegated,
         model,
-        route_honored,
+        route_claimed,
         expected_model: expected,
     }))
 }
@@ -4291,8 +4296,7 @@ fn cmd_gate(
                     // candidate and only surfaces as a cryptic late `mpd
                     // archive` failure. Refuse here, before the candidate is
                     // even captured, with the exact entries to add.
-                    let scope_gaps =
-                        closure::missing_process_scope(&live_manifest, &change, cfg.docs_dir());
+                    let scope_gaps = closure::missing_process_scope(&live_manifest, &change);
                     if !scope_gaps.is_empty() {
                         return Ok(gate_blocked(&format!(
                             "Build gate refused: manifest.json is missing required process-scope path(s): {}. Add them to openspec/changes/{change}/manifest.json \"paths\" and re-run the Build gate.",
@@ -12741,7 +12745,7 @@ mod tests {
             build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("sonnet"))
                 .unwrap()
                 .unwrap();
-        assert_eq!(no_expectation.route_honored, None);
+        assert_eq!(no_expectation.route_claimed, None);
 
         ledger.brief_expectations.insert(
             ledger::Ledger::attempt_key(Phase::Architecture, 1),
@@ -12759,7 +12763,7 @@ mod tests {
             build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("sonnet"))
                 .unwrap()
                 .unwrap();
-        assert_eq!(violated.route_honored, Some(false));
+        assert_eq!(violated.route_claimed, Some(false));
         assert_eq!(violated.expected_model.as_deref(), Some("fable"));
 
         // Case-insensitive: a harness reporting `Fable` honored the route.
@@ -12767,7 +12771,7 @@ mod tests {
             build_delegation_record(&ledger, Phase::Architecture, 1, true, false, Some("Fable"))
                 .unwrap()
                 .unwrap();
-        assert_eq!(honored.route_honored, Some(true));
+        assert_eq!(honored.route_claimed, Some(true));
     }
 
     #[test]

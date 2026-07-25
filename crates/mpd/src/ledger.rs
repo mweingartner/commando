@@ -180,7 +180,15 @@ impl RiskLevel {
     pub fn attempt_limit(self) -> usize {
         match self {
             Self::Low => 1,
-            Self::Medium => 2,
+            // Medium matches High deliberately. Risk selects DEPTH — which
+            // models run and which test profile — and the doctrine is explicit
+            // that High is "a depth escalation, not an attempt-limit
+            // tightening". Once classifier v3 correctly moved ordinary code
+            // from High down to Medium, a 3->2 attempt budget would have
+            // silently traded model cost for reconciliation friction, and
+            // friction is the owner's primary complaint: 143 of 144 recorded
+            // reconciliations were `--continue` rubber stamps, not decisions.
+            Self::Medium => 3,
             Self::High => 3,
         }
     }
@@ -582,12 +590,16 @@ pub struct DelegationRecordV1 {
     /// Cooperative provenance, exactly like `by` — not authenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Whether `model` matched the model `mpd next` resolved for this exact
-    /// (phase, attempt). `None` when either side is unknown. This is the first
-    /// mechanism in the tool that can tell whether the cost policy was followed
-    /// rather than merely printed.
+    /// Whether the reported `model` matched the model `mpd next` resolved for
+    /// this exact (phase, attempt). `None` when either side is unknown.
+    ///
+    /// Named `claimed`, not `honored`, because it is NOT verification: both
+    /// operands originate with the caller — the harness reads the resolved
+    /// model off `mpd next` and types it back in — and nothing in this process
+    /// observes which model actually ran. It detects drift and carelessness,
+    /// not dishonesty. Treat it exactly like `by`: cooperative provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_honored: Option<bool>,
+    pub route_claimed: Option<bool>,
     /// The model `mpd next` resolved for this attempt, when it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_model: Option<String>,

@@ -100,8 +100,9 @@ pub struct DelegationStats {
     pub unknown_attempts: usize,
     /// Attempts carrying both a reported and an expected model.
     pub route_checked_attempts: usize,
-    /// Of those, how many ran the model `mpd next` resolved.
-    pub route_honored_attempts: usize,
+    /// Of those, how many CLAIMED the model `mpd next` resolved. Cooperative
+    /// provenance, not verification: nothing observes which model actually ran.
+    pub route_claimed_attempts: usize,
 }
 
 impl DelegationStats {
@@ -118,10 +119,10 @@ impl DelegationStats {
                     } else {
                         self.self_recorded_attempts += 1;
                     }
-                    if let Some(honored) = record.route_honored {
+                    if let Some(claimed) = record.route_claimed {
                         self.route_checked_attempts += 1;
-                        if honored {
-                            self.route_honored_attempts += 1;
+                        if claimed {
+                            self.route_claimed_attempts += 1;
                         }
                     }
                 }
@@ -135,16 +136,16 @@ impl DelegationStats {
         self.self_recorded_attempts += other.self_recorded_attempts;
         self.unknown_attempts += other.unknown_attempts;
         self.route_checked_attempts += other.route_checked_attempts;
-        self.route_honored_attempts += other.route_honored_attempts;
+        self.route_claimed_attempts += other.route_claimed_attempts;
     }
 
     fn render(&self) -> String {
         format!(
-            "  delegation: {} delegated, {} self-recorded, {} unknown; route {}/{} honored\n",
+            "  delegation: {} delegated, {} self-recorded, {} unknown; route {}/{} claimed\n",
             self.delegated_attempts,
             self.self_recorded_attempts,
             self.unknown_attempts,
-            self.route_honored_attempts,
+            self.route_claimed_attempts,
             self.route_checked_attempts
         )
     }

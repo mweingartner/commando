@@ -182,6 +182,33 @@ const PASSING_TEST_CMD: &str = "echo 'test result: ok. 3 passed; 0 failed; 0 ign
 /// True only when actually inside the validation sandbox: the marker alone is
 /// not trusted (an ambient variable must not silently skip coverage in
 /// uncontained runs); the denied-read canary corroborates it.
+/// Narrow the fixture-wide `"**"` scope to a documentation-only one, which
+/// derives risk Low (attempt limit 1) under classifier v3.
+fn narrow_to_documentation_scope(sb: &Sandbox, change: &str) {
+    sb.write(
+        &format!("openspec/changes/{change}/manifest.json"),
+        &format!(
+            "{{\n  \"version\": 1,\n  \"paths\": [\"docs/**\", \"openspec/changes/{change}/**\"],\n  \"shared_paths\": []\n}}\n"
+        ),
+    );
+}
+
+/// Replace the fixture-wide `"**"` scope `Sandbox::mpd` seeds after `begin`
+/// with an ordinary, non-sensitive code scope.
+///
+/// `"**"` claims the whole repository — including `security/`, `.mpd/` and
+/// `.githooks/` — so under risk-classifier v3 it correctly derives High. Tests
+/// that assert standard-tier model routing, attempt budgets, or Medium risk
+/// must therefore declare a scope that means what they intend.
+fn narrow_to_ordinary_code_scope(sb: &Sandbox, change: &str) {
+    sb.write(
+        &format!("openspec/changes/{change}/manifest.json"),
+        &format!(
+            "{{\n  \"version\": 1,\n  \"paths\": [\"src/lib.rs\", \"openspec/changes/{change}/**\"],\n  \"shared_paths\": []\n}}\n"
+        ),
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn nested_in_validation_sandbox() -> bool {
     std::env::var_os("MPD_SANDBOXED").is_some() && std::fs::read("/private/etc/hosts").is_err()
@@ -2093,7 +2120,7 @@ fn documentation_only_scope_resolves_low_on_a_deployment_configured_repo_but_mix
     assert_eq!(risk["requested"], "low", "{risk}");
     assert_eq!(risk["derived"], "low", "{risk}");
     assert_eq!(risk["effective"], "low", "{risk}");
-    assert_eq!(risk["classifier_version"], 2, "{risk}");
+    assert_eq!(risk["classifier_version"], 3, "{risk}");
     let reasons: Vec<&str> = risk["reasons"]
         .as_array()
         .unwrap()
@@ -2101,8 +2128,10 @@ fn documentation_only_scope_resolves_low_on_a_deployment_configured_repo_but_mix
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(reasons.contains(&"documentation-only-scope"), "{reasons:?}");
+    // v3 removed the repository-level reasons entirely, so a docs scope has
+    // nothing to suppress — `deployment-configured` is never collected at all.
     assert!(
-        reasons.contains(&"suppressed:deployment-configured"),
+        !reasons.iter().any(|r| r.contains("deployment-configured")),
         "{reasons:?}"
     );
 
@@ -2126,7 +2155,12 @@ fn documentation_only_scope_resolves_low_on_a_deployment_configured_repo_but_mix
         !reasons.contains(&"documentation-only-scope"),
         "{reasons:?}"
     );
-    assert!(reasons.contains(&"deployment-configured"), "{reasons:?}");
+    // v3: the reason is the sensitive PATH the mixed scope declared, never a
+    // repository-configuration constant.
+    assert!(
+        reasons.iter().any(|r| r.contains("crates/**")),
+        "{reasons:?}"
+    );
 }
 
 /// design.md's self-widening risk: a documentation-only change widens its
@@ -2317,9 +2351,12 @@ fn strict_build_gate_refuses_and_then_accepts_missing_process_scope_entries() {
         err.contains(&format!("openspec/changes/{change}/**")),
         "must name the missing change-dir entry: {err}"
     );
+    // The durable-doc target is deliberately NOT a required declaration: it is
+    // folded into scope by `SystemScope::doc_target` and archive is what writes
+    // it. Requiring it produced 39 of 144 recorded reconciliations.
     assert!(
-        err.contains(&format!("docs/{change}.md")),
-        "must name the missing durable-doc entry: {err}"
+        !err.contains(&format!("docs/{change}.md")),
+        "the durable-doc target must not be demanded: {err}"
     );
     assert_eq!(
         json(&sb.mpd(&["status", "--json"]))["phase"],
@@ -2776,6 +2813,8 @@ fn artifact_budget_warns_without_blocking_next() {
     let sb = Sandbox::new("artifact-budget");
     sb.mpd(&["init"]);
     sb.mpd(&["begin", "long-contract"]);
+    // Derived risk must stay Low; the fixture's "**" scope now derives High.
+    narrow_to_documentation_scope(&sb, "long-contract");
     sb.write(
         "openspec/changes/long-contract/design.md",
         &"word ".repeat(1100),
@@ -2828,6 +2867,8 @@ fn excess_attempt_requires_one_shot_reconciliation() {
     let sb = Sandbox::new("reconcile");
     sb.mpd(&["init"]);
     sb.mpd(&["begin", "retry-change"]);
+    // Base limit 1 requires derived Low; the fixture's "**" now derives High.
+    narrow_to_documentation_scope(&sb, "retry-change");
     assert!(sb
         .mpd(&["gate", "architecture", "--fail", "--class", "product"])
         .status
@@ -3617,6 +3658,7 @@ fn next_reports_harness_specific_models() {
     let sb = Sandbox::new("models");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "add-x"]);
+    narrow_to_ordinary_code_scope(&sb, "add-x");
 
     // Architecture is the deep-cognition tier.
     let cc = json(&sb.mpd(&["next", "--harness", "claude-code", "--json"]));
@@ -6474,6 +6516,8 @@ fn strict_next_surfaces_human_decision_at_the_attempt_limit() {
     let sb = Sandbox::new("strict-next-halt");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "limit", "--strict", "--fix", "--risk", "low"]);
+    // Derived risk must stay Low; the fixture's "**" scope now derives High.
+    narrow_to_documentation_scope(&sb, "limit");
     author_architecture_verdict(&sb, "limit", "FAIL");
     let fail = sb.mpd(&[
         "gate",
@@ -6529,6 +6573,8 @@ fn persona_config_weakening_survives_reset_before_gate() {
     let sb = Sandbox::new("pt-toctou");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "thing"]);
+    // Derived risk must stay Low; the fixture's "**" scope now derives High.
+    narrow_to_documentation_scope(&sb, "thing");
     make_manifest_ready(&sb, "thing");
     assert!(sb
         .mpd(&[
@@ -6621,6 +6667,8 @@ fn untuned_next_records_risk_once_then_leaves_the_ledger_byte_identical() {
     let sb = Sandbox::new("pt-inert");
     sb.mpd(&["init", "--test", PASSING_TEST_CMD]);
     sb.mpd(&["begin", "thing"]);
+    // Derived risk must stay Low; the fixture's "**" scope now derives High.
+    narrow_to_documentation_scope(&sb, "thing");
     let path = sb.dir.join(".mpd/state/thing.json");
     let before = ledger_json(&sb, "thing");
     sb.mpd(&["next"]);
