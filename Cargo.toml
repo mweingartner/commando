@@ -17,7 +17,7 @@ serde_yaml_ng = "0.10"
 clap = { version = "4", features = ["derive"] }
 proptest = "1"
 sha2 = "0.10"
-nix = { version = "0.30", features = ["fs", "process", "resource", "signal"] }
+nix = { version = "0.31", features = ["fs", "process", "resource", "signal"] }
 
 [profile.release]
 strip = true
